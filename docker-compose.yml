@@ -1,0 +1,158 @@
+networks:
+  rustarchon-net:
+
+volumes:
+  postgres-data:
+  dataprotection-keys:
+  rabbitmq-data:
+
+services:
+  postgres:
+    image: postgres:17
+    environment:
+      POSTGRES_USER: rustarchon
+      # Same reasoning as rabbitmq below - POSTGRES_PASSWORD is the exact name this image requires, so
+      # .env just uses that name directly.
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+    ports:
+      # Host-loopback only (never 0.0.0.0) - lets the .NET projects run/debug natively in Visual
+      # Studio against this container instead of also running in Docker themselves. See README.
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    networks:
+      - rustarchon-net
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U rustarchon"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  rabbitmq:
+    image: rabbitmq:4-management
+    # RabbitMQ derives its node identity (rabbit@<hostname>) from the container hostname, which Docker
+    # otherwise randomizes on every recreation - without pinning this, a recreated container boots as
+    # a brand-new, empty node sitting right next to its own old data on the rabbitmq-data volume below,
+    # rather than finding it. Confirmed by hand: without this line, `docker compose up -d
+    # --force-recreate rabbitmq` silently loses every durable queue and message even with the volume
+    # mounted - the volume alone is not sufficient. See README.
+    hostname: rabbitmq
+    environment:
+      # No RustArchon-specific rename here - RABBITMQ_DEFAULT_USER/PASS are the exact names this image
+      # requires, so .env just uses those names directly instead of inventing parallel ones to map.
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_DEFAULT_USER:-guest}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_DEFAULT_PASS:-guest}
+    ports:
+      # Both host-loopback only (never 0.0.0.0). 5672 (AMQP) is what lets the .NET projects run/debug
+      # natively in Visual Studio against this container - see README. 15672 is the management UI.
+      - "127.0.0.1:5672:5672"
+      - "127.0.0.1:15672:15672"
+    volumes:
+      # Durable queues/exchanges and persistent messages (e.g. EmailRequested) live on disk under
+      # /var/lib/rabbitmq (RabbitMQ's Mnesia database) - without this volume, recreating this
+      # container (docker compose down, an image bump, anything short of a plain restart) silently
+      # wipes every durable queue and every message still sitting in it. See README.
+      - rabbitmq-data:/var/lib/rabbitmq
+    networks:
+      - rustarchon-net
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "check_running"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # Never publishes a port to the host - reachable only from rustarchon-panel/rustarchon-worker on
+  # rustarchon-net. This, not just the InternalApiKey header check, is what actually keeps
+  # /internal/... unreachable from outside Docker. See README.
+  rustarchon-api:
+    build:
+      context: .
+      dockerfile: RustArchon.Api/Dockerfile
+    environment:
+      ASPNETCORE_ENVIRONMENT: Development
+      ConnectionStrings__DefaultConnection: "Host=postgres;Port=5432;Database=RustArchon;Username=rustarchon;Password=${POSTGRES_PASSWORD:-postgres}"
+      RabbitMq__Host: rabbitmq
+      RUSTARCHON_JWT_SECRET_KEY: ${RUSTARCHON_JWT_SECRET_KEY:?RUSTARCHON_JWT_SECRET_KEY must be set in .env}
+      CorsSettings__BlazorServerUrl: "http://localhost:8080"
+      DataProtection__KeyPath: /keys
+      # These six are passed straight through with no rename - RustArchon.Api reads each of these
+      # exact names directly (see Program.cs), not a Section__Key-mapped equivalent. The RABBITMQ_
+      # pair additionally matches the rabbitmq service's own required names above, not a
+      # RustArchon-specific one - see RabbitMqOptions's remarks.
+      RUSTARCHON_INTERNAL_API_KEY: ${RUSTARCHON_INTERNAL_API_KEY:?RUSTARCHON_INTERNAL_API_KEY must be set in .env}
+      RUSTARCHON_INVITATION_CODES_ENABLED: ${RUSTARCHON_INVITATION_CODES_ENABLED:-true}
+      RUSTARCHON_ADMIN_EMAIL: ${RUSTARCHON_ADMIN_EMAIL:-}
+      RUSTARCHON_ADMIN_CODE: ${RUSTARCHON_ADMIN_CODE:-}
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_DEFAULT_USER:-guest}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_DEFAULT_PASS:-guest}
+    volumes:
+      - dataprotection-keys:/keys
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    networks:
+      - rustarchon-net
+
+  # Needs outbound internet/LAN access to reach arbitrary Rust servers' WebRCON endpoints, unlike
+  # every other service here, which only ever talks to the others on rustarchon-net.
+  rustarchon-worker:
+    build:
+      context: .
+      dockerfile: RustArchon.Worker/Dockerfile
+    environment:
+      DOTNET_ENVIRONMENT: Development
+      RabbitMq__Host: rabbitmq
+      Api__BaseUrl: "http://rustarchon-api:8080"
+      # Passed straight through, same names RustArchon.Api and (for the internal key) the Blazor web
+      # app also read - see InternalApiOptions's/RabbitMqOptions's remarks.
+      RUSTARCHON_INTERNAL_API_KEY: ${RUSTARCHON_INTERNAL_API_KEY:?RUSTARCHON_INTERNAL_API_KEY must be set in .env}
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_DEFAULT_USER:-guest}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_DEFAULT_PASS:-guest}
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+      rustarchon-api:
+        condition: service_started
+    networks:
+      - rustarchon-net
+
+  # The AGPL-licensed app itself (sign-up, servers, console, admin) - see README/NOTICE.md.
+  # Publishes a port to the host, same as rustarchon-web below - fronting both behind real
+  # panel./www. subdomains is a reverse-proxy/DNS step not yet built (see README).
+  rustarchon-panel:
+    build:
+      context: .
+      dockerfile: RustArchon.Panel/Dockerfile
+    environment:
+      ASPNETCORE_ENVIRONMENT: Development
+      ConnectionStrings__DefaultConnection: "Host=postgres;Port=5432;Database=RustArchon_Identity;Username=rustarchon;Password=${POSTGRES_PASSWORD:-postgres}"
+      RUSTARCHON_JWT_SECRET_KEY: ${RUSTARCHON_JWT_SECRET_KEY:?RUSTARCHON_JWT_SECRET_KEY must be set in .env}
+      ApiBaseUrl: "http://rustarchon-api:8080"
+      MarketingBaseUrl: "http://localhost:8081"
+      RUSTARCHON_INTERNAL_API_KEY: ${RUSTARCHON_INTERNAL_API_KEY:?RUSTARCHON_INTERNAL_API_KEY must be set in .env}
+    ports:
+      - "8080:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rustarchon-api:
+        condition: service_started
+    networks:
+      - rustarchon-net
+
+  # The marketing site (home/features/pricing/contact) - a separate, non-AGPL app (see
+  # RustArchon.Web/README.md) with no database and no API calls of its own; it only needs to know
+  # where to point its Login/Sign Up/Get Started links.
+  rustarchon-web:
+    build:
+      context: .
+      dockerfile: RustArchon.Web/Dockerfile
+    environment:
+      ASPNETCORE_ENVIRONMENT: Development
+      PanelBaseUrl: "http://localhost:8080"
+    ports:
+      - "8081:8080"
+    networks:
+      - rustarchon-net

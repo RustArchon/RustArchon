@@ -1,0 +1,258 @@
+# RustArchon
+
+A web-based RCON client for [Rust](https://rust.facepunch.com/) game servers, built on the
+[JumpStart](https://github.com/cyberknet/JumpStart) framework.
+
+## License
+
+RustArchon is licensed under [AGPL-3.0-or-later](LICENSE). It depends on JumpStart, which is a
+separate project under its own GPL-3.0-or-later license - see [`NOTICE.md`](NOTICE.md) for how the
+two combine and why that's permitted. Not affiliated with Facepunch Studios; Rust is a trademark of
+Facepunch Studios Ltd.
+
+## Solution layout
+
+Each project below is its own GitHub repository under the [RustArchon
+org](https://github.com/RustArchon), wired into this one (the umbrella repo) as a git submodule -
+see "Cloning this repo" below. `RustArchon.Web` and `RustArchon.Panel` used to be a single Blazor
+project; they're split because they carry different licenses (see "License" above) and are deployed
+as two separate apps on two separate subdomains.
+
+```
+RustArchon/  (this repo - umbrella: RustArchon.slnx, docker-compose.yml, .env.example, docs)
+├── RustArchon.Web/        Marketing site (home/features/pricing/contact) - www.rustarchon.com.
+│                          NOT AGPL (see RustArchon.Web/README.md). No database, no API clients, no
+│                          Identity - it only links out to RustArchon.Panel for sign-up/login.
+├── RustArchon.Panel/      The actual product - sign-up, login, servers, console, invitation-code
+│                          admin - panel.rustarchon.com. Owns the ASP.NET Core Identity database;
+│                          everything else (servers, tenants, roles) goes through generated API
+│                          clients calling RustArchon.Api.
+├── RustArchon.Api/        The RESTful API - RustServer entity, repository, controller, JWT
+│                          bearer auth, and multi-tenant data isolation.
+├── RustArchon.Shared/     DTOs shared between RustArchon.Panel and RustArchon.Api (RustServerDto,
+│                          CreateRustServerDto, UpdateRustServerDto).
+├── RustArchon.Rcon/       A Rust WebRCON client library - not RustArchon-specific business logic,
+│                          just "how to talk to a Rust server's RCON" (connect, send commands, parse
+│                          chat/console/player-list/ban-list/plugin-list responses, detect Oxide vs.
+│                          Carbon). Has no dependency on anything else in this solution.
+├── RustArchon.Messaging/  MassTransit message contracts shared between RustArchon.Api and
+│                          RustArchon.Worker (RabbitMQ is the transport - see docker-compose.yml).
+├── RustArchon.Worker/     The persistent-connection host - one RustArchon.Rcon client per server
+│                          this instance owns, publishing captured frames/status/heartbeats via
+│                          RustArchon.Messaging. Horizontally scalable; see its own remarks.
+└── JumpStart/             Submodule pointing at github.com/cyberknet/JumpStart - a separate
+                           project under its own GPL-3.0-or-later license (see NOTICE.md), not part
+                           of RustArchon's own AGPL codebase.
+```
+
+`RustArchon.Panel`/`.Api`/`.Shared` reach JumpStart via a plain `ProjectReference` to
+`../JumpStart/JumpStart/JumpStart.csproj` (not a NuGet package), so changes to the framework are
+picked up on the next build with no repack/publish step - this is also why those three repos can't
+be built standalone from their own individual clones; you need this umbrella repo's submodule layout.
+`RustArchon.Web`/`.Messaging`/`.Rcon` have no such dependency and build standalone just fine.
+
+### Cloning this repo
+
+```bash
+git clone --recurse-submodules https://github.com/RustArchon/RustArchon.git
+```
+
+Forgot `--recurse-submodules`, or pulled a change that added/moved one? `git submodule update --init
+--recursive` from the repo root fills in every submodule (including `JumpStart/`) after the fact.
+
+## How it works
+
+- **Sign up** (`Account/Register`) creates an ASP.NET Core Identity user, same as any JumpStart app.
+  Immediately after, `NewTenantBootstrapper` (Blazor) mints a short-lived identity assertion and calls
+  `POST /api/account-bootstrap/ensure-tenant` on the API, which:
+  1. Creates a new `Tenant` for the user (named "`{email}`'s Organization" by default).
+  2. Adds a `UserTenant` membership.
+  3. Creates a tenant-scoped `Owner` role granting `RustServer.Get/List/Create/Update/Delete`.
+  4. Assigns the user to that role, within that tenant.
+
+  This is best-effort and idempotent (a user who already belongs to a tenant is a no-op), mirroring
+  JumpStart's own `DemoNewUserBootstrapper` pattern - see its remarks in
+  `RustArchon.Panel/Services/NewTenantBootstrapper.cs`.
+
+- **Add a server** (`/servers`) calls `RustServersController`, a standard
+  `ApiControllerBase<RustServer, ...>` - every action is automatically scoped to the caller's tenant
+  and gated by an `[EntityAuthorize]` permission claim (`RustServer.Create`, etc.), which the Owner
+  role granted above satisfies.
+
+- **RCON passwords are never stored in plaintext.** `RustServersController` encrypts the password via
+  `IRconCredentialProtector` (ASP.NET Core Data Protection) before it is ever persisted, and
+  `RustServerDto` (the read model) doesn't expose it at all.
+
+Everything else - JWT issuance/exchange, tenant isolation, permission checks - is JumpStart itself;
+nothing here re-implements it. See JumpStart's `docs/` for the full mechanism (start with
+`core-concepts.md`, `multi-tenancy.md`, and `entity-authorization.md`).
+
+## Running locally
+
+Prerequisites: .NET 10 SDK, PostgreSQL. For a quick local instance:
+
+```bash
+docker run --name rustarchon-postgres -e POSTGRES_PASSWORD=postgres -p 5432:5432 -d postgres:17
+```
+
+The default `appsettings.Development.json` connection strings already point at `localhost:5432` with
+the `postgres`/`postgres` default credentials above - override them (or the
+`ConnectionStrings__DefaultConnection` environment variable) if you're pointing at a different
+instance. `RustArchon.Api` and `RustArchon.Panel` use two separate databases (`RustArchon` and
+`RustArchon_Identity`) on the same PostgreSQL server; both are created automatically by
+`dotnet ef database update`/the `Database.Migrate()` call in each `Program.cs` - you don't need to
+create either database by hand first. `RustArchon.Web` has no database at all.
+
+```bash
+# 1. API first
+cd RustArchon.Api
+dotnet ef database update
+dotnet run
+# Swagger at https://localhost:7130/swagger
+
+# 2. The Panel app, in another terminal
+cd RustArchon.Panel
+dotnet ef database update
+dotnet run
+# https://localhost:7199
+
+# 3. The marketing site, in a third terminal (optional - only Panel is needed to exercise the product)
+cd RustArchon.Web
+dotnet run
+# https://localhost:7099
+```
+
+Both `RustArchon.Api` and `RustArchon.Panel`'s `Program.cs` files also call `Database.Migrate()` on
+startup as a development convenience, so the explicit `dotnet ef database update` step above is
+optional once you've run each project at least once - see the comments in each `Program.cs` before
+relying on this in anything beyond a single-instance deployment.
+
+### Sign-up is invitation-gated by default
+
+Registration requires a valid invitation code unless `RUSTARCHON_INVITATION_CODES_ENABLED` is set to
+`false` - this is the soft-launch gate, see `InvitationCodeOptions`/`InvitationsController`. On a
+fresh database there are no codes and no accounts yet, so nobody - including the person meant to
+become the platform admin - can register through the normal flow. `AdminInvitationSeeder` solves
+this: set both of the following in `.env` (see `.env.example`) before first startup:
+
+- `RUSTARCHON_ADMIN_EMAIL` - your own email.
+- `RUSTARCHON_ADMIN_CODE` - any code string you choose.
+
+Both are read by `RustArchon.Api` directly by that exact name (see `Program.cs`) - no config-section
+rename in between, so the same name works whether it reaches the app via Docker Compose or a plain
+`appsettings.Development.json` entry for native debugging.
+
+On startup, `RustArchon.Api` seeds a single-use invitation code with that exact value, bound to that
+email (so it's useless to anyone else even if it leaks). Register at `/Account/Register` with that
+email/code pair and you'll end up an Owner of your own tenant (the normal sign-up flow already does
+this) *and* a platform admin able to manage further invitation codes at `/Admin/InvitationCodes` -
+your email already satisfies the `PlatformAdmin` policy, so no separate "create admin" step exists.
+Seeding is idempotent (safe to leave configured indefinitely) and never touches a code that's already
+been redeemed.
+
+Register an account in RustArchon.Panel, then go to **Servers** to add your first Rust server (host,
+RCON port - Rust's default is `28016` - and RCON password).
+
+## Docker
+
+The whole stack (`rustarchon-web`, `rustarchon-panel`, `rustarchon-api`, `rustarchon-worker`,
+PostgreSQL, RabbitMQ) is defined in `docker-compose.yml` at the repo root. The build context for every
+service is this repo's own root - JumpStart is a submodule mounted inside it (see "Cloning this repo"
+above), so unlike before the split into separate repos, Docker never needs to see anything outside
+this one directory.
+
+```bash
+git submodule update --init --recursive   # if you didn't clone with --recurse-submodules
+cp .env.example .env                       # then fill in real values - see the comments in .env.example
+docker compose up --build
+```
+
+`rustarchon-web` (`http://localhost:8081`) and `rustarchon-panel` (`http://localhost:8080`) are the
+two services published to the host - the API and RabbitMQ's AMQP port are reachable only from other
+containers on the compose network, and the RabbitMQ management UI is bound to `127.0.0.1:15672` only.
+Fronting both published ports behind real `www.`/`panel.` subdomains with TLS is a reverse-proxy step
+not yet built - see "Before deploying this anywhere real" below. Both databases and the RabbitMQ
+topology are created automatically on first start; there's no manual setup step beyond the `.env` file
+above.
+
+**RabbitMQ durability needs two things, not one.** The `rabbitmq-data` volume alone isn't enough to
+survive the container being recreated (`docker compose down`, an image bump, anything short of a
+plain restart) - RabbitMQ's node identity is derived from the container hostname, which Docker
+randomizes on every recreation by default. Without pinning it, a recreated container boots as a
+brand-new, empty node sitting right next to its own old data on the volume, rather than finding it -
+confirmed by hand while building the email-queue feature, not just reasoned about. `hostname:
+rabbitmq` in `docker-compose.yml`'s `rabbitmq` service is what fixes this; don't remove it.
+
+### Debugging from Visual Studio
+
+Docker Compose orchestrator support lets you `F5` straight into a running container with breakpoints,
+while `docker compose up` brings up everything else (Postgres, RabbitMQ, the other two app
+containers) alongside it. This repo ships working `Dockerfile`s for all three app projects, but not
+the Visual-Studio-specific orchestrator project file, since that's IDE-generated and version-specific
+rather than something to hand-author. To wire it up:
+
+1. Open `RustArchon.slnx` in Visual Studio.
+2. Right-click each of `RustArchon.Web`, `RustArchon.Panel`, `RustArchon.Api`, and `RustArchon.Worker`
+   → **Add** → **Container Orchestrator Support** → **Docker Compose** → **Linux**. Visual Studio
+   detects the existing `Dockerfile` in each project and, after the first project, offers to add the
+   rest into the same `docker-compose` project rather than creating a separate one each time - accept
+   that.
+3. Visual Studio generates its own `docker-compose.override.yml` for debug-specific settings
+   (remote debugger injection, `ASPNETCORE_ENVIRONMENT=Development`, etc.) alongside the
+   `docker-compose.yml` already here - it's expected for both to coexist.
+4. Set the generated `docker-compose` project as the startup project and `F5` as usual.
+
+I couldn't verify any of this end-to-end myself - Docker isn't available in the environment that
+built this - so treat the compose file and Dockerfiles as carefully-written but untested until you've
+run `docker compose up --build` at least once yourself.
+
+## Before deploying this anywhere real
+
+A few things were deliberately left as local-development defaults and need attention first:
+
+- **JWT `SecretKey`** in both `appsettings.Development.json` files is a placeholder. Generate a real
+  32+ character secret per environment and keep it out of source control (user-secrets, environment
+  variables, or a secrets manager) - it must be identical in both projects.
+- **Data Protection key ring** (used to encrypt RCON passwords) is persisted to disk - a local
+  `App_Data/dataprotection-keys` folder outside Docker, a named volume (`dataprotection-keys`) inside
+  it - rather than left at .NET's default per-machine profile, so recreating the container doesn't
+  invalidate every stored password. This covers exactly one `RustArchon.Api` instance/volume, though:
+  running **more than one instance** still requires moving to a shared, durable store all instances
+  can reach (a database, blob storage, etc. - see the comment in `RustArchon.Api/Program.cs`), since a
+  local disk volume isn't shared across instances the way it needs to be.
+  See [ASP.NET Core Data Protection key storage providers](https://learn.microsoft.com/aspnet/core/security/data-protection/implementation/key-storage-providers).
+- **Email delivery** is queued, not immediate: RustArchon.Panel's `IEmailSender<ApplicationUser>`
+  (`QueuedEmailSender`) doesn't send anything itself - it calls `RustArchon.Api`'s internal `/internal/email`
+  endpoint, which publishes an `EmailRequested` message that a `RustArchon.Worker` instance picks up
+  and sends (`EmailRequestedConsumer`), with MassTransit retrying a failed send before giving up. No
+  real mail provider is wired up yet, though: the Worker's `IEmailDeliveryProvider` is still
+  `NoOpEmailDeliveryProvider`, which just logs what it would have sent. Until that's replaced,
+  registration/password-reset links are only visible in `RustArchon.Worker`'s console output (search
+  for "Would send email") - swap that one DI registration for a real provider (SMTP, SendGrid, etc.)
+  before production.
+- **CORS/JWT issuer-audience values, and the Web↔Panel cross-links,** currently point at `localhost`
+  ports - update `CorsSettings:BlazorServerUrl` (API), `ApiBaseUrl` (Panel), `MarketingBaseUrl`
+  (Panel), and `PanelBaseUrl` (Web) for your real hostnames.
+- **RustArchon.Web has no way to know if a visitor already has a RustArchon.Panel session** - it
+  always shows Log In/Sign Up regardless. Real cross-subdomain SSO between the two is a known gap,
+  not built.
+
+## What's not built yet
+
+Sign-up and server registration are complete. The always-on WebRCON capture pipeline (every
+registered server gets a persistent connection, with full history even while nobody's watching) is
+under construction. What exists so far:
+
+- **`RustArchon.Rcon`** - a standalone Rust WebRCON client library (connect, send commands, parse
+  chat/console/player-list/ban-list/plugin-list responses, detect Oxide vs. Carbon). No dependency on
+  anything else in this solution - it doesn't know RustArchon exists.
+- **`RustArchon.Worker`** - holds one `RustArchon.Rcon` client per server it owns, publishing captured
+  frames/connection status/heartbeats as `RustArchon.Messaging` contracts over RabbitMQ. Horizontally
+  scalable (see its own remarks on the queue-based ownership mechanism).
+
+Neither is wired up to `RustArchon.Api` or the UI yet - the Worker can talk WebRCON and publish what
+it captures, but nothing on the API/database/UI side consumes any of it yet (no `RconEvent` history
+table, no SignalR live tail, no console page, no credential-handoff endpoint telling the Worker which
+servers to actually connect to). Also not yet built: a command console/log viewer, and any UI for
+renaming a tenant or inviting teammates into it (the framework-level `TenantsController`/
+`ITenantsApiClient` already supports the latter - see JumpStart's `docs/multi-tenancy.md`).

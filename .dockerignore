@@ -1,0 +1,14 @@
+**/.git
+**/.vs
+**/.vscode
+**/bin
+**/obj
+**/node_modules
+
+# JumpStart-specific generated output - large, irrelevant to building JumpStart.csproj itself.
+JumpStart/_site
+JumpStart/api
+JumpStart/docs
+
+# RustArchon-specific local artifacts that shouldn't be baked into an image.
+**/App_Data

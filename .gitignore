@@ -1,0 +1,57 @@
+## .NET / Visual Studio
+
+bin/
+obj/
+*.user
+*.suo
+.vs/
+.vscode/
+.claude/
+
+## Build results
+
+[Dd]ebug/
+[Dd]ebugPublic/
+[Rr]elease/
+[Rr]eleases/
+x64/
+x86/
+[Ww][Ii][Nn]32/
+[Aa][Rr][Mm]/
+[Aa][Rr][Mm]64/
+bld/
+[Bb]in/
+[Oo]bj/
+[Ll]og/
+[Ll]ogs/
+
+## User-specific files
+
+*.rsuser
+*.userosscache
+*.sln.docstates
+
+## ASP.NET Core
+
+wwwroot/lib/**/*.map
+appsettings.*.local.json
+
+## EF Core
+
+*.mdf
+*.ldf
+
+## Secrets - never commit real secrets; use dotnet user-secrets or environment variables instead
+
+*.pfx
+secrets.json
+
+## Docker Compose - .env holds real local secrets; .env.example is the checked-in template
+
+.env
+
+## Data Protection key ring - local dev copy of RustArchon.Api's real encryption keys (used to
+## protect stored RCON passwords). Never commit this - see App_Data volume mount in docker-compose.yml.
+
+App_Data/
+

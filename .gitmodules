@@ -1,0 +1,24 @@
+[submodule "RustArchon.Web"]
+	path = RustArchon.Web
+	url = https://github.com/RustArchon/RustArchon.Web.git
+[submodule "RustArchon.Panel"]
+	path = RustArchon.Panel
+	url = https://github.com/RustArchon/RustArchon.Panel.git
+[submodule "RustArchon.Api"]
+	path = RustArchon.Api
+	url = https://github.com/RustArchon/RustArchon.Api.git
+[submodule "RustArchon.Worker"]
+	path = RustArchon.Worker
+	url = https://github.com/RustArchon/RustArchon.Worker.git
+[submodule "RustArchon.Shared"]
+	path = RustArchon.Shared
+	url = https://github.com/RustArchon/RustArchon.Shared.git
+[submodule "RustArchon.Messaging"]
+	path = RustArchon.Messaging
+	url = https://github.com/RustArchon/RustArchon.Messaging.git
+[submodule "RustArchon.Rcon"]
+	path = RustArchon.Rcon
+	url = https://github.com/RustArchon/RustArchon.Rcon.git
+[submodule "JumpStart"]
+	path = JumpStart
+	url = https://github.com/cyberknet/JumpStart.git
