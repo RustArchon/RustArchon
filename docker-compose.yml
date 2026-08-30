@@ -4,6 +4,7 @@ networks:
 volumes:
   postgres-data:
   dataprotection-keys:
+  dataprotection-keys-session:
   rabbitmq-data:
 
 services:
@@ -132,6 +133,16 @@ services:
       ApiBaseUrl: "http://rustarchon-api:8080"
       MarketingBaseUrl: "http://localhost:8081"
       RUSTARCHON_INTERNAL_API_KEY: ${RUSTARCHON_INTERNAL_API_KEY:?RUSTARCHON_INTERNAL_API_KEY must be set in .env}
+      # Shared with rustarchon-web below - same volume, same path, same ApplicationName in code -
+      # so RustArchon.Web can decrypt the cookie this issues. See both Program.cs files.
+      DataProtection__SessionKeyPath: /keys-session
+      # Left unset here (both services are still plain "localhost" ports locally, which already
+      # share cookies across ports as the same hostname - no Domain attribute needed). A real
+      # deployment sets this to .rustarchon.com via an environment override, not by editing this
+      # file - see the README's cross-app session section.
+      CookieDomain: ${COOKIE_DOMAIN:-}
+    volumes:
+      - dataprotection-keys-session:/keys-session
     ports:
       - "8080:8080"
     depends_on:
@@ -144,7 +155,9 @@ services:
 
   # The marketing site (home/features/pricing/contact) - a separate, non-AGPL app (see
   # RustArchon.Web/README.md) with no database and no API calls of its own; it only needs to know
-  # where to point its Login/Sign Up/Get Started links.
+  # where to point its Login/Sign Up/Get Started links, plus read-only access to the same session
+  # cookie rustarchon-panel issues (see DataProtection__SessionKeyPath above and both Program.cs
+  # files) so its nav can show "Dashboard" instead of "Log In"/"Sign Up" when one exists.
   rustarchon-web:
     build:
       context: .
@@ -152,6 +165,9 @@ services:
     environment:
       ASPNETCORE_ENVIRONMENT: Development
       PanelBaseUrl: "http://localhost:8080"
+      DataProtection__SessionKeyPath: /keys-session
+    volumes:
+      - dataprotection-keys-session:/keys-session
     ports:
       - "8081:8080"
     networks:

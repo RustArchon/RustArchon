@@ -233,9 +233,36 @@ A few things were deliberately left as local-development defaults and need atten
 - **CORS/JWT issuer-audience values, and the Web↔Panel cross-links,** currently point at `localhost`
   ports - update `CorsSettings:BlazorServerUrl` (API), `ApiBaseUrl` (Panel), `MarketingBaseUrl`
   (Panel), and `PanelBaseUrl` (Web) for your real hostnames.
-- **RustArchon.Web has no way to know if a visitor already has a RustArchon.Panel session** - it
-  always shows Log In/Sign Up regardless. Real cross-subdomain SSO between the two is a known gap,
-  not built.
+- **`COOKIE_DOMAIN`** must be set to `.rustarchon.com` (the leading dot matters - it covers the
+  parent domain and every subdomain) once Web and Panel are actually fronted by their real `www.`/
+  `panel.` subdomains - see "Cross-app session (SSO)" below. Leave it unset for any plain-port/
+  single-hostname deployment, local or otherwise.
+
+### Cross-app session (SSO)
+
+RustArchon.Web can tell whether a visitor already has an active RustArchon.Panel session (shows
+"Dashboard" instead of "Log In"/"Sign Up", and redirects an already-authenticated visitor away from
+its home page) via a **real shared cookie**, not a lightweight hint: Panel's Identity cookie gets
+`Domain=.rustarchon.com` in production (`CookieDomain` config - empty locally, where
+`localhost:5100`/`:5200` already share cookies as the same hostname on different ports), and both
+apps point `AddDataProtection()` at the same physical key storage with the same `ApplicationName`
+(`"RustArchon.Session"`) so Web can decrypt and validate the cookie Panel issued. Web registers just
+enough cookie authentication to populate `HttpContext.User`/Blazor's cascading auth state - no
+database, no `Microsoft.AspNetCore.Identity.EntityFrameworkCore` package, no sign-in/sign-out logic
+of its own; Panel remains the only place a session is ever created or destroyed.
+
+The shared key storage is `DataProtection:SessionKeyPath` in both apps - defaults to
+`App_Data/dataprotection-keys-session/` at this repo's own root (a sibling of both `RustArchon.Web/`
+and `RustArchon.Panel/`) for native dev, or the `dataprotection-keys-session` named volume in
+`docker-compose.yml`. This is a **separate key ring from `RustArchon.Api`'s own** `/keys` volume
+(used for RCON password encryption, a different purpose entirely) - the two are never meant to
+overlap, and use different `ApplicationName`s so they couldn't even if pointed at the same folder.
+
+If this ever silently stops working (Web always shows Log In even when Panel is clearly signed in),
+it fails safe, not loud - check that both apps' `DataProtection:SessionKeyPath` actually resolve to
+the same physical location, and that Panel's `AddIdentityCookies()` default cookie name
+(`.AspNetCore.Identity.Application`, verified empirically rather than assumed while building this)
+hasn't changed out from under `RustArchon.Web/Program.cs`'s hardcoded match for it.
 
 ## What's not built yet
 
