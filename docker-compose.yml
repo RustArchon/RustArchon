@@ -62,6 +62,23 @@ services:
       timeout: 5s
       retries: 10
 
+  # Backs RustArchon.Api's platform-settings cache (see PlatformSettingsCache) - never a durable
+  # source of truth on its own, Postgres (the PlatformSetting table) always is. No volume: losing this
+  # container's data on recreation just means every setting is re-read from Postgres on the next
+  # request, exactly like a cold cache after a restart.
+  valkey:
+    image: valkey/valkey:8
+    ports:
+      # Host-loopback only, same reasoning as postgres/rabbitmq above.
+      - "127.0.0.1:6379:6379"
+    networks:
+      - rustarchon-net
+    healthcheck:
+      test: ["CMD", "valkey-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
   # Never publishes a port to the host - reachable only from rustarchon-panel/rustarchon-worker on
   # rustarchon-net. This, not just the InternalApiKey header check, is what actually keeps
   # /internal/... unreachable from outside Docker. See README.
@@ -73,6 +90,7 @@ services:
       ASPNETCORE_ENVIRONMENT: Development
       ConnectionStrings__DefaultConnection: "Host=postgres;Port=5432;Database=RustArchon;Username=rustarchon;Password=${POSTGRES_PASSWORD:-postgres}"
       RabbitMq__Host: rabbitmq
+      Valkey__ConnectionString: "valkey:6379"
       RUSTARCHON_JWT_SECRET_KEY: ${RUSTARCHON_JWT_SECRET_KEY:?RUSTARCHON_JWT_SECRET_KEY must be set in .env}
       CorsSettings__BlazorServerUrl: "http://localhost:8080"
       DataProtection__KeyPath: /keys
@@ -81,6 +99,10 @@ services:
       # pair additionally matches the rabbitmq service's own required names above, not a
       # RustArchon-specific one - see RabbitMqOptions's remarks.
       RUSTARCHON_INTERNAL_API_KEY: ${RUSTARCHON_INTERNAL_API_KEY:?RUSTARCHON_INTERNAL_API_KEY must be set in .env}
+      # Only ever consulted once, the very first time the API seeds the PlatformSetting table (see
+      # PlatformSettingsRegistry) - a fresh deployment's initial "require invitation codes?" value.
+      # Changing it after that first startup does nothing; use the platform-settings admin page
+      # instead. See ADR note in PlatformSettingsRegistry.cs.
       RUSTARCHON_INVITATION_CODES_ENABLED: ${RUSTARCHON_INVITATION_CODES_ENABLED:-true}
       RUSTARCHON_ADMIN_EMAIL: ${RUSTARCHON_ADMIN_EMAIL:-}
       RUSTARCHON_ADMIN_CODE: ${RUSTARCHON_ADMIN_CODE:-}
@@ -92,6 +114,8 @@ services:
       postgres:
         condition: service_healthy
       rabbitmq:
+        condition: service_healthy
+      valkey:
         condition: service_healthy
     networks:
       - rustarchon-net

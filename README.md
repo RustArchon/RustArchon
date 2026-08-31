@@ -129,11 +129,14 @@ relying on this in anything beyond a single-instance deployment.
 
 ### Sign-up is invitation-gated by default
 
-Registration requires a valid invitation code unless `RUSTARCHON_INVITATION_CODES_ENABLED` is set to
-`false` - this is the soft-launch gate, see `InvitationCodeOptions`/`InvitationsController`. On a
-fresh database there are no codes and no accounts yet, so nobody - including the person meant to
-become the platform admin - can register through the normal flow. `AdminInvitationSeeder` solves
-this: set both of the following in `.env` (see `.env.example`) before first startup:
+Registration requires a valid invitation code by default - this is the soft-launch gate, a real
+platform setting (see `PlatformSettingsRegistry`/`InvitationsController`), toggled from the
+platform-settings admin page rather than an environment variable. `RUSTARCHON_INVITATION_CODES_ENABLED`
+still exists, but only as that setting's *initial* value the very first time the API seeds it - not an
+ongoing switch. On a fresh database there are no codes and no accounts yet, so nobody - including the
+person meant to become the platform admin - can register through the normal flow.
+`AdminInvitationSeeder` solves this: set both of the following in `.env` (see `.env.example`) before
+first startup:
 
 - `RUSTARCHON_ADMIN_EMAIL` - your own email.
 - `RUSTARCHON_ADMIN_CODE` - any code string you choose.
@@ -156,7 +159,7 @@ RCON port - Rust's default is `28016` - and RCON password).
 ## Docker
 
 The whole stack (`rustarchon-web`, `rustarchon-panel`, `rustarchon-api`, `rustarchon-worker`,
-PostgreSQL, RabbitMQ) is defined in `docker-compose.yml` at the repo root. The build context for every
+PostgreSQL, RabbitMQ, Valkey) is defined in `docker-compose.yml` at the repo root. The build context for every
 service is this repo's own root - JumpStart is a submodule mounted inside it (see "Cloning this repo"
 above), so unlike before the split into separate repos, Docker never needs to see anything outside
 this one directory.
