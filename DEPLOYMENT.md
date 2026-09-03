@@ -98,7 +98,10 @@ echo '<your-PAT>' | docker login ghcr.io -u <your-github-username> --password-st
 
 ## 5. Configure `.env`
 
+Back in `/opt/rustarchon` (the clone from step 3 - `cd` there again if this is a new shell session):
+
 ```bash
+cd /opt/rustarchon
 cp .env.example .env
 ```
 
@@ -127,7 +130,11 @@ Then edit `.env` and set real values - **do not deploy with the `.env.example` p
 
 ## 6. Bring the stack up
 
+Still in `/opt/rustarchon` (`cd` there again if this is a new shell session - all `docker compose`
+commands from here on assume it, since that's where `docker-compose.yml`/`.prod.yml`/`.env` live):
+
 ```bash
+cd /opt/rustarchon
 docker compose -f docker-compose.yml -f docker-compose.prod.yml pull
 docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d
 docker compose ps
