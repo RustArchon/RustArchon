@@ -11,12 +11,23 @@ point real users at it.
 This deployment pulls prebuilt images from `ghcr.io/rustarchon/` rather than building from source on
 the LXC - `.github/workflows/publish-images.yml` builds and pushes `rustarchon-api`/`-panel`/`-worker`/
 `-web` on every push to this repo's own `main` (i.e. once a "bump submodules" PR merges here - see that
-workflow's own remarks for why it's gated on that specific branch, not each submodule's). **The very
-first time that workflow runs**, go set each package's visibility by hand once (org → Packages →
-package → Package settings → Change visibility): public for `rustarchon-api`/`-panel`/`-worker`
-(their source is already public, an AGPL repo - see the main README's License section), private for
-`rustarchon-web` (the one proprietary, non-AGPL project in this org). GHCR packages default to private
-on first publish regardless of what the workflow intends, and nothing re-checks this later.
+workflow's own remarks for why it's gated on that specific branch, not each submodule's).
+
+**Two one-time setup steps that whole workflow depends on**, neither of which it can do for itself:
+
+- **A `SUBMODULES_PAT` repo secret.** `RustArchon.Web` is a private repo (the one proprietary,
+  non-AGPL project in this org); the workflow's default `GITHUB_TOKEN` can't clone it as a submodule,
+  which fails the checkout step for *every* matrix leg, not just `rustarchon-web`'s own - confirmed by
+  hand, the very first run failed exactly this way in under 20 seconds, before any image ever started
+  building. Create a fine-grained PAT (GitHub Settings → Developer settings → Personal access tokens →
+  Fine-grained tokens) scoped to this org's repos with `Contents: Read-only`, then add it as this
+  repo's own Actions secret named `SUBMODULES_PAT` (Settings → Secrets and variables → Actions → New
+  repository secret).
+- **Package visibility**, set by hand once **after** the first successful run (org → Packages →
+  package → Package settings → Change visibility): public for `rustarchon-api`/`-panel`/`-worker`
+  (their source is already public, an AGPL repo - see the main README's License section), private for
+  `rustarchon-web`. GHCR packages default to private on first publish regardless of what the workflow
+  intends, and nothing re-checks this later.
 
 ## 1. Create the LXC
 
