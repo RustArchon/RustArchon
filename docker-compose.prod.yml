@@ -1,0 +1,26 @@
+# Overlay for deployments that pull the pre-built images .github/workflows/publish-images.yml
+# publishes to ghcr.io, instead of building from source on the target machine (no SDK/submodule
+# checkout needed there at all - see DEPLOYMENT.md). Use alongside docker-compose.yml, never alone:
+#
+#   docker compose -f docker-compose.yml -f docker-compose.prod.yml pull
+#   docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d
+#
+# postgres/rabbitmq/valkey need no override here - they already reference public images directly, not
+# a local `build:`. rustarchon-web is included the same way as the other three even though its own
+# package is private (see the publish workflow's remarks) - docker-compose still needs to know where
+# to pull it from; only *who's allowed to* differs, enforced by ghcr.io itself, not by this file.
+#
+# `build:` stays defined in docker-compose.yml underneath this override - harmless, since plain
+# `docker compose up -d` (no `--build` flag) always prefers a resolvable `image:` over rebuilding.
+services:
+  rustarchon-api:
+    image: ghcr.io/rustarchon/rustarchon-api:latest
+
+  rustarchon-worker:
+    image: ghcr.io/rustarchon/rustarchon-worker:latest
+
+  rustarchon-panel:
+    image: ghcr.io/rustarchon/rustarchon-panel:latest
+
+  rustarchon-web:
+    image: ghcr.io/rustarchon/rustarchon-web:latest

@@ -170,11 +170,17 @@ cp .env.example .env                       # then fill in real values - see the 
 docker compose up --build
 ```
 
+That builds every image from source locally. `.github/workflows/publish-images.yml` also publishes
+`rustarchon-api`/`-panel`/`-worker`/`-web` to `ghcr.io/rustarchon/` on every push to this repo's own
+`main` - a deployment that doesn't need to iterate on source (see [DEPLOYMENT.md](DEPLOYMENT.md)) can
+pull those instead of building, via the `docker-compose.prod.yml` overlay.
+
 `rustarchon-web` (`http://localhost:8081`) and `rustarchon-panel` (`http://localhost:8080`) are the
 two services published to the host - the API and RabbitMQ's AMQP port are reachable only from other
 containers on the compose network, and the RabbitMQ management UI is bound to `127.0.0.1:15672` only.
 Fronting both published ports behind real `www.`/`panel.` subdomains with TLS is a reverse-proxy step
-not yet built - see "Before deploying this anywhere real" below. Both databases and the RabbitMQ
+done outside this compose file - see "Before deploying this anywhere real" below, and
+[DEPLOYMENT.md](DEPLOYMENT.md) for a concrete Proxmox-LXC-plus-Cloudflare-Tunnel runbook. Both databases and the RabbitMQ
 topology are created automatically on first start; there's no manual setup step beyond the `.env` file
 above.
 
@@ -205,9 +211,17 @@ rather than something to hand-author. To wire it up:
    `docker-compose.yml` already here - it's expected for both to coexist.
 4. Set the generated `docker-compose` project as the startup project and `F5` as usual.
 
-I couldn't verify any of this end-to-end myself - Docker isn't available in the environment that
-built this - so treat the compose file and Dockerfiles as carefully-written but untested until you've
-run `docker compose up --build` at least once yourself.
+Verified end-to-end by hand with a real `docker compose up --build` - five real bugs turned up that
+way and got fixed: `RustArchon.Web`'s `Dockerfile` still assumed the old per-project build context;
+`RustArchon.Panel`'s `Dockerfile` never copied `RustArchon.Messaging` even though `RustArchon.Shared`
+needs it; `rustarchon-web`'s compose service was missing `ApiBaseUrl` entirely (silently defaulting to
+`https://localhost:7130`, unreachable inside the container); Npgsql logged a harmless-but-noisy missing
+`libgssapi_krb5.so.2` warning on every Postgres connection; and, the significant one -
+`RustArchon.Panel`/`RustArchon.Web`'s published output was silently missing `_framework/blazor.web.js`
+entirely (breaking all Blazor interactivity) because publishing framework-dependent, with
+`--no-restore`, inside this Dockerfile's layer-caching pattern skips recomputing static web assets
+against the real source. Both now publish self-contained instead, which sidesteps it - see the two
+Dockerfiles' own comments for the full explanation.
 
 ## Before deploying this anywhere real
 
@@ -244,8 +258,8 @@ A few things were deliberately left as local-development defaults and need atten
 ### Cross-app session (SSO)
 
 RustArchon.Web can tell whether a visitor already has an active RustArchon.Panel session (shows
-"Dashboard" instead of "Log In"/"Sign Up", and redirects an already-authenticated visitor away from
-its home page) via a **real shared cookie**, not a lightweight hint: Panel's Identity cookie gets
+"Dashboard" instead of "Log In"/"Sign Up" in the nav) via a **real shared cookie**, not a lightweight
+hint: Panel's Identity cookie gets
 `Domain=.rustarchon.com` in production (`CookieDomain` config - empty locally, where
 `localhost:5100`/`:5200` already share cookies as the same hostname on different ports), and both
 apps point `AddDataProtection()` at the same physical key storage with the same `ApplicationName`
