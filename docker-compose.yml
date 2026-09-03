@@ -10,6 +10,7 @@ volumes:
 services:
   postgres:
     image: postgres:17
+    restart: unless-stopped
     environment:
       POSTGRES_USER: rustarchon
       # Same reasoning as rabbitmq below - POSTGRES_PASSWORD is the exact name this image requires, so
@@ -31,6 +32,7 @@ services:
 
   rabbitmq:
     image: rabbitmq:4-management
+    restart: unless-stopped
     # RabbitMQ derives its node identity (rabbit@<hostname>) from the container hostname, which Docker
     # otherwise randomizes on every recreation - without pinning this, a recreated container boots as
     # a brand-new, empty node sitting right next to its own old data on the rabbitmq-data volume below,
@@ -68,6 +70,7 @@ services:
   # request, exactly like a cold cache after a restart.
   valkey:
     image: valkey/valkey:8
+    restart: unless-stopped
     ports:
       # Host-loopback only, same reasoning as postgres/rabbitmq above.
       - "127.0.0.1:6379:6379"
@@ -86,13 +89,21 @@ services:
     build:
       context: .
       dockerfile: RustArchon.Api/Dockerfile
+    restart: unless-stopped
     environment:
-      ASPNETCORE_ENVIRONMENT: Development
+      # Defaults to Production - override in .env (e.g. ASPNETCORE_ENVIRONMENT=Development) only for
+      # local compose-based testing, never for a real deployment (Development leaks full exception
+      # details and skips UseHsts/UseExceptionHandler - see each project's Program.cs).
+      ASPNETCORE_ENVIRONMENT: ${ASPNETCORE_ENVIRONMENT:-Production}
       ConnectionStrings__DefaultConnection: "Host=postgres;Port=5432;Database=RustArchon;Username=rustarchon;Password=${POSTGRES_PASSWORD:-postgres}"
       RabbitMq__Host: rabbitmq
       Valkey__ConnectionString: "valkey:6379"
       RUSTARCHON_JWT_SECRET_KEY: ${RUSTARCHON_JWT_SECRET_KEY:?RUSTARCHON_JWT_SECRET_KEY must be set in .env}
-      CorsSettings__BlazorServerUrl: "http://localhost:8080"
+      # Must be the exact public URL a browser loads RustArchon.Panel from - the CORS check compares
+      # this against the browser's Origin header, not against wherever this container itself is
+      # reachable from. Defaults to the plain-port local URL; set PANEL_PUBLIC_URL in .env once Panel
+      # is fronted by a real hostname (e.g. a Cloudflare Tunnel) - see README/DEPLOYMENT.md.
+      CorsSettings__BlazorServerUrl: ${PANEL_PUBLIC_URL:-http://localhost:8080}
       DataProtection__KeyPath: /keys
       # These six are passed straight through with no rename - RustArchon.Api reads each of these
       # exact names directly (see Program.cs), not a Section__Key-mapped equivalent. The RABBITMQ_
@@ -126,8 +137,9 @@ services:
     build:
       context: .
       dockerfile: RustArchon.Worker/Dockerfile
+    restart: unless-stopped
     environment:
-      DOTNET_ENVIRONMENT: Development
+      DOTNET_ENVIRONMENT: ${DOTNET_ENVIRONMENT:-Production}
       RabbitMq__Host: rabbitmq
       Api__BaseUrl: "http://rustarchon-api:8080"
       # Passed straight through, same names RustArchon.Api and (for the internal key) the Blazor web
@@ -145,17 +157,23 @@ services:
 
   # The AGPL-licensed app itself (sign-up, servers, console, admin) - see README/NOTICE.md.
   # Publishes a port to the host, same as rustarchon-web below - fronting both behind real
-  # panel./www. subdomains is a reverse-proxy/DNS step not yet built (see README).
+  # panel./www. subdomains is a reverse-proxy step (e.g. a Cloudflare Tunnel) done outside this file;
+  # see DEPLOYMENT.md.
   rustarchon-panel:
     build:
       context: .
       dockerfile: RustArchon.Panel/Dockerfile
+    restart: unless-stopped
     environment:
-      ASPNETCORE_ENVIRONMENT: Development
+      ASPNETCORE_ENVIRONMENT: ${ASPNETCORE_ENVIRONMENT:-Production}
       ConnectionStrings__DefaultConnection: "Host=postgres;Port=5432;Database=RustArchon_Identity;Username=rustarchon;Password=${POSTGRES_PASSWORD:-postgres}"
       RUSTARCHON_JWT_SECRET_KEY: ${RUSTARCHON_JWT_SECRET_KEY:?RUSTARCHON_JWT_SECRET_KEY must be set in .env}
+      # Container-to-container - unlike CorsSettings__BlazorServerUrl/MarketingBaseUrl below, nothing
+      # outside this compose network ever calls this URL directly, so it's never the public hostname.
       ApiBaseUrl: "http://rustarchon-api:8080"
-      MarketingBaseUrl: "http://localhost:8081"
+      # The public URL a browser reaches RustArchon.Web at - used for the "Home"/brand-mark cross-link.
+      # See CorsSettings__BlazorServerUrl above for the same PANEL_PUBLIC_URL/WEB_PUBLIC_URL reasoning.
+      MarketingBaseUrl: ${WEB_PUBLIC_URL:-http://localhost:8081}
       RUSTARCHON_INTERNAL_API_KEY: ${RUSTARCHON_INTERNAL_API_KEY:?RUSTARCHON_INTERNAL_API_KEY must be set in .env}
       # Shared with rustarchon-web below - same volume, same path, same ApplicationName in code -
       # so RustArchon.Web can decrypt the cookie this issues. See both Program.cs files.
@@ -186,9 +204,16 @@ services:
     build:
       context: .
       dockerfile: RustArchon.Web/Dockerfile
+    restart: unless-stopped
     environment:
-      ASPNETCORE_ENVIRONMENT: Development
-      PanelBaseUrl: "http://localhost:8080"
+      ASPNETCORE_ENVIRONMENT: ${ASPNETCORE_ENVIRONMENT:-Production}
+      # The public URL a browser reaches RustArchon.Panel at - "Log In"/"Sign Up"/"Get Started" links.
+      PanelBaseUrl: ${PANEL_PUBLIC_URL:-http://localhost:8080}
+      # Container-to-container, same reasoning as rustarchon-panel's own ApiBaseUrl above - this was
+      # missing entirely until PlansApiClient (the pricing page) needed it; without it this falls back
+      # to its own appsettings.json default (https://localhost:7130), which resolves to nothing inside
+      # this container.
+      ApiBaseUrl: "http://rustarchon-api:8080"
       DataProtection__SessionKeyPath: /keys-session
     volumes:
       - dataprotection-keys-session:/keys-session
