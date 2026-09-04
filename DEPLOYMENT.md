@@ -146,8 +146,9 @@ latest published `:latest` tag for `rustarchon-api`/`-panel`/`-worker`/`-web` fr
 rather than building anything locally - see `docker-compose.prod.yml`'s own remarks for why plain `up
 -d` (no `--build`) is what makes that stick.
 
-All seven services (`postgres`, `rabbitmq`, `valkey`, `rustarchon-api`, `rustarchon-worker`,
-`rustarchon-panel`, `rustarchon-web`) should show `running` (the three infra ones `healthy`). Databases,
+All eight services (`postgres`, `rabbitmq`, `valkey`, `rustarchon-api`, `rustarchon-worker`,
+`rustarchon-panel`, `rustarchon-web`, plus `watchtower` - see the update note below) should show
+`running` (the three infra ones `healthy`). Databases,
 tables, and RabbitMQ's queue topology are all created automatically on first start - there's no manual
 migration step. `restart: unless-stopped` on every service means the whole stack comes back on its own
 after an LXC reboot or a Docker daemon restart, as long as `systemctl enable docker` from step 2 stuck
@@ -155,9 +156,17 @@ after an LXC reboot or a Docker daemon restart, as long as `systemctl enable doc
 
 If something doesn't come up, `docker compose logs -f <service>` is the first place to look.
 
-**To update later**, once a new commit has landed on the umbrella repo's `main` (which re-runs the
-publish workflow): re-run the same `pull` + `up -d` pair above - Compose only recreates containers
-whose image digest actually changed.
+**Updates are automatic.** The `watchtower` service (see `docker-compose.prod.yml`) polls ghcr.io once
+an hour and recreates any of the four app containers whose `:latest` tag now points at a new digest -
+so a merge to the umbrella repo's `main`, which re-runs the publish workflow, reaches this host on its
+own within the hour. It deliberately only touches the four RustArchon services, never `postgres`,
+`rabbitmq` or `valkey` (see that file's own remarks for why those stay manual).
+
+To force an update immediately rather than waiting for the next poll, re-run the same `pull` + `up -d`
+pair above - Compose only recreates containers whose image digest actually changed. `docker compose
+logs watchtower` shows what it has been doing, including whether it can actually see the private
+`rustarchon-web` package (if that one silently never updates while the other three do, the
+`docker login` from step 4 is what to check).
 
 ## 7. Point the Cloudflare Tunnel at it
 
