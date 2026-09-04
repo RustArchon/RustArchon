@@ -163,10 +163,23 @@ own within the hour. It deliberately only touches the four RustArchon services, 
 `rabbitmq` or `valkey` (see that file's own remarks for why those stay manual).
 
 To force an update immediately rather than waiting for the next poll, re-run the same `pull` + `up -d`
-pair above - Compose only recreates containers whose image digest actually changed. `docker compose
-logs watchtower` shows what it has been doing, including whether it can actually see the private
-`rustarchon-web` package (if that one silently never updates while the other three do, the
-`docker login` from step 4 is what to check).
+pair above - Compose only recreates containers whose image digest actually changed.
+
+To see what watchtower has been doing:
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.prod.yml logs watchtower
+```
+
+Both `-f` flags matter here: `watchtower` is defined in `docker-compose.prod.yml`, so plain `docker
+compose logs watchtower` reads only `docker-compose.yml` and fails with `no such service`. (`docker
+compose ps` does list it either way - it finds running containers by project label rather than from
+the file, which makes the mismatch look stranger than it is.) `docker logs rustarchon-watchtower-1`
+also works, using the container name instead of the service name.
+
+That log is also where you'd see whether it can actually reach the private `rustarchon-web` package -
+if that one silently never updates while the other three do, the `docker login` from step 4, and the
+`~/.docker/config.json` mount that depends on it, are what to check.
 
 ## 7. Point the Cloudflare Tunnel at it
 
