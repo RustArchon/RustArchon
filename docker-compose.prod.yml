@@ -46,22 +46,34 @@ services:
   watchtower:
     image: containrrr/watchtower
     restart: unless-stopped
+    # List form, not the `KEY: value` mapping form, specifically for WATCHTOWER_NOTIFICATION_URL at
+    # the bottom: a bare key is omitted from the container entirely when the variable isn't set,
+    # whereas `${VAR:-}` interpolation would pass an empty string that watchtower then tries to parse
+    # as a shoutrrr URL. Compose resolves bare keys from .env exactly like interpolated ones - the two
+    # differ only in the unset case. (Confirmed both behaviors with `docker compose config`.)
     environment:
       # Once per hour, in seconds. Anything much tighter mostly just burns ghcr.io rate limit -
       # nothing here is latency-sensitive, since the publish workflow itself takes a few minutes
       # after a merge anyway.
-      WATCHTOWER_POLL_INTERVAL: 3600
+      - WATCHTOWER_POLL_INTERVAL=3600
       # Only containers explicitly labelled above, never everything on the host. Without this,
-      # watchtower's default is *every* running container, which here would also mean postgres,
+      # watchtower's default is *every* running container (it says so on startup: "Checking all
+      # containers (except explicitly disabled with label)"), which here would also mean postgres,
       # rabbitmq and valkey - all three pinned to a major tag (postgres:17, rabbitmq:4-management,
       # valkey/valkey:8) that does keep receiving minor/patch updates. Restarting a database
       # unattended at 3am to pick one up is a materially different risk from recreating a stateless
       # app container, and rabbitmq in particular is fussy about recreation (see its hostname pin in
       # docker-compose.yml). Those stay a deliberate, manual `docker compose pull <service>`.
-      WATCHTOWER_LABEL_ENABLE: "true"
+      - WATCHTOWER_LABEL_ENABLE=true
       # Delete the superseded image after a successful update - without this the LXC's disk slowly
       # fills with orphaned layers, one set per update, forever.
-      WATCHTOWER_CLEANUP: "true"
+      - WATCHTOWER_CLEANUP=true
+      # Optional: a shoutrrr URL to notify on update (see .env.example). Nothing else is needed to
+      # turn notifications on - watchtower infers the notifier from the URL scheme and logs "Using
+      # notifications: <type>" at startup; the separate WATCHTOWER_NOTIFICATIONS setting is only for
+      # its older per-service flags. Confirmed against watchtower 1.7.1: a gotify:// URL alone both
+      # selects the notifier and gets delivered.
+      - WATCHTOWER_NOTIFICATION_URL
     volumes:
       # How watchtower inspects and recreates containers - it talks to the Docker daemon directly,
       # not over the network, which is also why it needs no rustarchon-net membership.
