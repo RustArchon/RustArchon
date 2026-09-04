@@ -44,7 +44,14 @@ services:
   # step 6 otherwise describes. That pair still works and is still the way to force an immediate
   # update; this just means not having to remember to run it.
   watchtower:
-    image: containrrr/watchtower
+    # nickfedor/watchtower, not the original containrrr/watchtower - the latter is effectively
+    # unmaintained, and its last release (1.7.1) ships a Docker client that speaks API v1.25, below
+    # the v1.40 minimum a current Docker Engine accepts. It doesn't degrade, it just dies: every
+    # cycle logs "client version 1.25 is too old" and exits 1, so the container sits in a restart
+    # loop doing nothing. Confirmed on the deployment host and reproduced locally. This fork is a
+    # drop-in - same flags, same env vars, same labels - on a current API (1.22.0 / API v1.55 at time
+    # of writing), verified including WATCHTOWER_LABEL_ENABLE actually scoping the scan.
+    image: nickfedor/watchtower:latest
     restart: unless-stopped
     # List form, not the `KEY: value` mapping form, specifically for WATCHTOWER_NOTIFICATION_URL at
     # the bottom: a bare key is omitted from the container entirely when the variable isn't set,
@@ -70,9 +77,8 @@ services:
       - WATCHTOWER_CLEANUP=true
       # Optional: a shoutrrr URL to notify on update (see .env.example). Nothing else is needed to
       # turn notifications on - watchtower infers the notifier from the URL scheme and logs "Using
-      # notifications: <type>" at startup; the separate WATCHTOWER_NOTIFICATIONS setting is only for
-      # its older per-service flags. Confirmed against watchtower 1.7.1: a gotify:// URL alone both
-      # selects the notifier and gets delivered.
+      # notifications: <type>" at startup (and "Using no notifications" when this is unset); the
+      # separate WATCHTOWER_NOTIFICATIONS setting is only for its older per-service flags.
       - WATCHTOWER_NOTIFICATION_URL
     volumes:
       # How watchtower inspects and recreates containers - it talks to the Docker daemon directly,
