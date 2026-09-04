@@ -12,15 +12,64 @@
 #
 # `build:` stays defined in docker-compose.yml underneath this override - harmless, since plain
 # `docker compose up -d` (no `--build` flag) always prefers a resolvable `image:` over rebuilding.
+#
+# The watchtower service at the bottom is the reason each app service also carries a
+# `com.centurylinklabs.watchtower.enable` label here rather than in docker-compose.yml: both the
+# published images and the thing watching them are deployment-only concerns, and a local
+# build-from-source run has nothing to poll ghcr.io for.
 services:
   rustarchon-api:
     image: ghcr.io/rustarchon/rustarchon-api:latest
+    labels:
+      com.centurylinklabs.watchtower.enable: "true"
 
   rustarchon-worker:
     image: ghcr.io/rustarchon/rustarchon-worker:latest
+    labels:
+      com.centurylinklabs.watchtower.enable: "true"
 
   rustarchon-panel:
     image: ghcr.io/rustarchon/rustarchon-panel:latest
+    labels:
+      com.centurylinklabs.watchtower.enable: "true"
 
   rustarchon-web:
     image: ghcr.io/rustarchon/rustarchon-web:latest
+    labels:
+      com.centurylinklabs.watchtower.enable: "true"
+
+  # Polls ghcr.io hourly and recreates any of the four app containers above whose :latest tag now
+  # points at a new digest - so a merge to the umbrella repo's main (which re-runs the publish
+  # workflow) reaches this host on its own, without the manual `pull` + `up -d` pair DEPLOYMENT.md's
+  # step 6 otherwise describes. That pair still works and is still the way to force an immediate
+  # update; this just means not having to remember to run it.
+  watchtower:
+    image: containrrr/watchtower
+    restart: unless-stopped
+    environment:
+      # Once per hour, in seconds. Anything much tighter mostly just burns ghcr.io rate limit -
+      # nothing here is latency-sensitive, since the publish workflow itself takes a few minutes
+      # after a merge anyway.
+      WATCHTOWER_POLL_INTERVAL: 3600
+      # Only containers explicitly labelled above, never everything on the host. Without this,
+      # watchtower's default is *every* running container, which here would also mean postgres,
+      # rabbitmq and valkey - all three pinned to a major tag (postgres:17, rabbitmq:4-management,
+      # valkey/valkey:8) that does keep receiving minor/patch updates. Restarting a database
+      # unattended at 3am to pick one up is a materially different risk from recreating a stateless
+      # app container, and rabbitmq in particular is fussy about recreation (see its hostname pin in
+      # docker-compose.yml). Those stay a deliberate, manual `docker compose pull <service>`.
+      WATCHTOWER_LABEL_ENABLE: "true"
+      # Delete the superseded image after a successful update - without this the LXC's disk slowly
+      # fills with orphaned layers, one set per update, forever.
+      WATCHTOWER_CLEANUP: "true"
+    volumes:
+      # How watchtower inspects and recreates containers - it talks to the Docker daemon directly,
+      # not over the network, which is also why it needs no rustarchon-net membership.
+      - /var/run/docker.sock:/var/run/docker.sock
+      # Read-only, and the whole reason `docker login ghcr.io` (DEPLOYMENT.md step 4) has to have
+      # happened on this host: rustarchon-web's package is private, so an unauthenticated watchtower
+      # would silently never see updates for that one service while happily updating the other three.
+      # Note this only works when that login actually wrote credentials into config.json - a Docker
+      # install with an OS credential helper stores them in a keychain instead, leaving config.json
+      # with nothing usable in it. A headless LXC normally has no helper, so it lands in the file.
+      - ~/.docker/config.json:/config.json:ro
