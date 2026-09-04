@@ -53,6 +53,13 @@ services:
     # of writing), verified including WATCHTOWER_LABEL_ENABLE actually scoping the scan.
     image: nickfedor/watchtower:latest
     restart: unless-stopped
+    # Without this, notification titles carry the container's randomly-generated hostname (a hex id
+    # that changes every recreation), which tells you nothing about which machine reported. Matches
+    # how watchtower is set up on the other hosts in this fleet, each named for the machine it runs
+    # on (`--hostname pi5` and so on) - so every alert says where it came from. Watchtower also has a
+    # --notifications-hostname flag that changes only the title without touching the container's
+    # actual hostname; this is the same result, kept in the same shape as everywhere else.
+    hostname: rustarchon
     # List form, not the `KEY: value` mapping form, specifically for WATCHTOWER_NOTIFICATION_URL at
     # the bottom: a bare key is omitted from the container entirely when the variable isn't set,
     # whereas `${VAR:-}` interpolation would pass an empty string that watchtower then tries to parse
