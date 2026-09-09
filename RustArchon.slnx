@@ -5,8 +5,8 @@
     <File Path="docker-compose.yml" />
   </Folder>
   <Folder Name="/Tests/">
-    <Project Path="RustArchon.Api.Tests/RustArchon.Api.Tests.csproj" />
     <Project Path="RustArchon.Api.IntegrationTests/RustArchon.Api.IntegrationTests.csproj" />
+    <Project Path="RustArchon.Api.Tests/RustArchon.Api.Tests.csproj" />
   </Folder>
   <Project Path="JumpStart/JumpStart/JumpStart.csproj" />
   <Project Path="RustArchon.Api/RustArchon.Api.csproj" />
