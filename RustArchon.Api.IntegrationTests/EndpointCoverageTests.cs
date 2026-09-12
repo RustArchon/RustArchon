@@ -61,6 +61,10 @@ public class EndpointCoverageTests(ApiFactory factory) : IClassFixture<ApiFactor
         // willing to create one. The token is the credential: 256 unguessable bits, revealing only
         // an Organization's name to whoever already has the link.
         "InvitationAcceptance.Peek",
+
+        // The platform's own name and public site URL - the nav bar (and the login page it renders
+        // on) needs this before anyone is signed in. See PublicBrandingController.
+        "PublicBranding.Get",
     };
 
     /// <summary>

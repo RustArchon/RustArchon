@@ -67,7 +67,8 @@ services:
   # Backs RustArchon.Api's platform-settings cache (see PlatformSettingsCache) - never a durable
   # source of truth on its own, Postgres (the PlatformSetting table) always is. No volume: losing this
   # container's data on recreation just means every setting is re-read from Postgres on the next
-  # request, exactly like a cold cache after a restart.
+  # request, exactly like a cold cache after a restart. RustArchon.Panel also reads directly from this
+  # same container (see SiteBrandingService/ValkeyCache) - not a separate cache of its own.
   valkey:
     image: valkey/valkey:8
     restart: unless-stopped
@@ -171,9 +172,11 @@ services:
       # Container-to-container - unlike CorsSettings__BlazorServerUrl/MarketingBaseUrl below, nothing
       # outside this compose network ever calls this URL directly, so it's never the public hostname.
       ApiBaseUrl: "http://rustarchon-api:8080"
-      # The public URL a browser reaches RustArchon.Web at - used for the "Home"/brand-mark cross-link.
-      # See CorsSettings__BlazorServerUrl above for the same PANEL_PUBLIC_URL/WEB_PUBLIC_URL reasoning.
-      MarketingBaseUrl: ${WEB_PUBLIC_URL:-http://localhost:8081}
+      # Same Valkey container rustarchon-api already uses, not a separate one - SiteBrandingService
+      # reads the SiteName/SiteUrl settings straight out of it (see Infrastructure/ValkeyCache.cs),
+      # rather than the old MarketingBaseUrl env var this replaced, which pointed at RustArchon.Web
+      # directly and had no way to reflect an admin's own change to either setting.
+      Valkey__ConnectionString: "valkey:6379"
       RUSTARCHON_INTERNAL_API_KEY: ${RUSTARCHON_INTERNAL_API_KEY:?RUSTARCHON_INTERNAL_API_KEY must be set in .env}
       # Shared with rustarchon-web below - same volume, same path, same ApplicationName in code -
       # so RustArchon.Web can decrypt the cookie this issues. See both Program.cs files.
@@ -192,6 +195,8 @@ services:
         condition: service_healthy
       rustarchon-api:
         condition: service_started
+      valkey:
+        condition: service_healthy
     networks:
       - rustarchon-net
 

@@ -51,6 +51,7 @@ public class OrganizationMemberServiceTests
         return new OrganizationMemberService(
             context,
             new RoleRepository(context, null, validator),
+            userContext,
             NullLogger<OrganizationMemberService>.Instance);
     }
 
@@ -282,6 +283,41 @@ public class OrganizationMemberServiceTests
             .Where(ut => ut.UserId == member).Select(ut => ut.IsActive).SingleAsync());
     }
 
+    /// <summary>
+    /// The rule this covers is unconditional, unlike the last-owner one above: even with a second
+    /// active owner in the organization, self-suspension still refuses.
+    /// </summary>
+    [Fact]
+    public async Task RefusesToSuspendYourself_EvenWithAnotherOwnerPresent()
+    {
+        await using var context = CreateContext();
+        var ownerRoleId = await SeedOwnerRoleAsync(context);
+        var first = await AddMemberAsync(context, ownerRoleId);
+        await AddMemberAsync(context, ownerRoleId);
+
+        var refused = await Assert.ThrowsAsync<MemberManagementException>(
+            () => CreateService(context, first).SetActiveAsync(_tenantId, first, active: false));
+
+        Assert.Contains("own access", refused.Message, StringComparison.OrdinalIgnoreCase);
+
+        Assert.True(await context.Set<UserTenant>()
+            .Where(ut => ut.UserId == first).Select(ut => ut.IsActive).SingleAsync());
+    }
+
+    /// <summary>Restoring your own access is never dangerous, so it is not gated by the self-check.</summary>
+    [Fact]
+    public async Task RestoringYourselfIsNotRefused()
+    {
+        await using var context = CreateContext();
+        var ownerRoleId = await SeedOwnerRoleAsync(context);
+        var owner = await AddMemberAsync(context, ownerRoleId, active: false);
+
+        await CreateService(context, owner).SetActiveAsync(_tenantId, owner, active: true);
+
+        Assert.True(await context.Set<UserTenant>()
+            .Where(ut => ut.UserId == owner).Select(ut => ut.IsActive).SingleAsync());
+    }
+
     [Fact]
     public async Task RefusesToRemoveTheLastOwner()
     {
@@ -293,6 +329,25 @@ public class OrganizationMemberServiceTests
             () => CreateService(context, owner).RemoveAsync(_tenantId, owner));
 
         Assert.True(await context.Set<UserTenant>().AnyAsync(ut => ut.UserId == owner));
+    }
+
+    /// <summary>
+    /// Unconditional, exactly like <see cref="RefusesToSuspendYourself_EvenWithAnotherOwnerPresent"/>:
+    /// a second active owner does not make removing yourself through self-service acceptable.
+    /// </summary>
+    [Fact]
+    public async Task RefusesToRemoveYourself_EvenWithAnotherOwnerPresent()
+    {
+        await using var context = CreateContext();
+        var ownerRoleId = await SeedOwnerRoleAsync(context);
+        var first = await AddMemberAsync(context, ownerRoleId);
+        await AddMemberAsync(context, ownerRoleId);
+
+        var refused = await Assert.ThrowsAsync<MemberManagementException>(
+            () => CreateService(context, first).RemoveAsync(_tenantId, first));
+
+        Assert.Contains("remove yourself", refused.Message, StringComparison.OrdinalIgnoreCase);
+        Assert.True(await context.Set<UserTenant>().AnyAsync(ut => ut.UserId == first));
     }
 
     /// <summary>

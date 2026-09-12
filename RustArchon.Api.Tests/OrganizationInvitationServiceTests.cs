@@ -10,7 +10,6 @@ using JumpStart.Authorization.Repositories;
 using JumpStart.Data;
 using JumpStart.MultiTenant.Services;
 using JumpStart.Repositories;
-using MassTransit;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Logging.Abstractions;
@@ -18,7 +17,6 @@ using Moq;
 using RustArchon.Api.Administration;
 using RustArchon.Api.Data;
 using RustArchon.Api.Infrastructure;
-using RustArchon.Messaging.Contracts;
 
 namespace RustArchon.Api.Tests;
 
@@ -58,7 +56,7 @@ public class OrganizationInvitationServiceTests
     }
 
     private OrganizationInvitationService CreateService(
-        ApiDbContext context, Guid actingAs, Mock<IPublishEndpoint>? publisher = null)
+        ApiDbContext context, Guid actingAs, Mock<ICommunicationPublisher>? communicationPublisher = null)
     {
         var resolver = new PermissionResolver(context);
 
@@ -82,7 +80,7 @@ public class OrganizationInvitationServiceTests
             invitations,
             resolver,
             evaluator,
-            (publisher ?? new Mock<IPublishEndpoint>()).Object,
+            (communicationPublisher ?? new Mock<ICommunicationPublisher>()).Object,
             configuration,
             NullLogger<OrganizationInvitationService>.Instance);
     }
@@ -224,29 +222,43 @@ public class OrganizationInvitationServiceTests
         await SeedTenantAsync(context);
 
         var inviter = Guid.NewGuid();
-        var publisher = new Mock<IPublishEndpoint>();
+        var communicationPublisher = new Mock<ICommunicationPublisher>();
 
-        EmailRequested? sent = null;
+        string? templateCode = null;
+        IReadOnlyDictionary<string, string>? tokens = null;
+        string? toAddress = null;
+        Guid? tenantIdSent = null;
 
-        publisher
-            .Setup(p => p.Publish(It.IsAny<EmailRequested>(), It.IsAny<CancellationToken>()))
-            .Callback<EmailRequested, CancellationToken>((message, _) => sent = message)
-            .Returns(Task.CompletedTask);
+        communicationPublisher
+            .Setup(p => p.QueueTemplatedAsync(
+                It.IsAny<string>(), It.IsAny<IReadOnlyDictionary<string, string>>(), It.IsAny<string>(),
+                It.IsAny<Guid?>(), It.IsAny<Guid?>(), It.IsAny<string?>(), It.IsAny<CancellationToken>()))
+            .Callback<string, IReadOnlyDictionary<string, string>, string, Guid?, Guid?, string?, CancellationToken>(
+                (code, sentTokens, to, _, tenantId, _, _) =>
+                {
+                    templateCode = code;
+                    tokens = sentTokens;
+                    toAddress = to;
+                    tenantIdSent = tenantId;
+                })
+            .ReturnsAsync(Guid.NewGuid());
 
-        await CreateService(context, inviter, publisher)
+        await CreateService(context, inviter, communicationPublisher)
             .InviteAsync(_tenantId, inviter, "newcomer@example.com", null);
 
-        Assert.NotNull(sent);
-        Assert.Equal("newcomer@example.com", sent.To);
-        Assert.Contains("Acme", sent.Subject, StringComparison.Ordinal);
+        Assert.Equal("newcomer@example.com", toAddress);
+        Assert.Equal(_tenantId, tenantIdSent);
+        Assert.Equal(EmailTemplateRegistry.Codes.OrganizationInvitation, templateCode);
 
         var token = await context.Set<TenantInvitation>()
             .AcrossAllTenants()
             .Select(i => i.Token)
             .SingleAsync();
 
-        Assert.Contains("https://panel.example.com/Organization/Invitations/Accept", sent.HtmlBody, StringComparison.Ordinal);
-        Assert.Contains(token, sent.HtmlBody, StringComparison.Ordinal);
+        Assert.NotNull(tokens);
+        Assert.Equal("Acme", tokens["OrganizationName"]);
+        Assert.Contains("https://panel.example.com/Organization/Invitations/Accept", tokens["InviteLink"], StringComparison.Ordinal);
+        Assert.Contains(token, tokens["InviteLink"], StringComparison.Ordinal);
     }
 
     /// <summary>
