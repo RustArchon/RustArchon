@@ -148,6 +148,11 @@ services:
       RUSTARCHON_INTERNAL_API_KEY: ${RUSTARCHON_INTERNAL_API_KEY:?RUSTARCHON_INTERNAL_API_KEY must be set in .env}
       RABBITMQ_DEFAULT_USER: ${RABBITMQ_DEFAULT_USER:-guest}
       RABBITMQ_DEFAULT_PASS: ${RABBITMQ_DEFAULT_PASS:-guest}
+      # Deployment-level kill switch, independent of whatever email provider is configured on the
+      # platform settings page - set to true on a test/staging deployment so it can keep a real
+      # provider configured there (to exercise that UI end to end) without risking a real send. See
+      # RustArchon.Worker's EmailDeliveryOptions for what this does and why it exists.
+      RUSTARCHON_SUPPRESS_EMAIL_DELIVERY: ${RUSTARCHON_SUPPRESS_EMAIL_DELIVERY:-false}
     depends_on:
       rabbitmq:
         condition: service_healthy
