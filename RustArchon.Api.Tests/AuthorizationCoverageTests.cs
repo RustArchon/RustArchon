@@ -29,12 +29,15 @@ public class AuthorizationCoverageTests
     /// </summary>
     /// <remarks>
     /// Each is a decision, listed so a reviewer sees it. Registration and invitation redemption both
-    /// run before an account exists; the public plan list is what the marketing site renders.
+    /// run before an account exists; the public plan list is what the marketing site renders; the
+    /// public branding endpoint is the platform's own name/URL, which a nav bar (and the login page it
+    /// renders on) needs before anyone is signed in.
     /// </remarks>
     private static readonly string[] DeliberatelyAnonymous =
     [
         "InvitationsController",
-        "PublicPlansController"
+        "PublicPlansController",
+        "PublicBrandingController"
     ];
 
     /// <summary>

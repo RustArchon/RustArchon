@@ -47,6 +47,12 @@ public class EndpointCoverageTests(ApiFactory factory) : IClassFixture<ApiFactor
         "Invitations.GetStatus",
         "Invitations.Redeem",
 
+        // Checks a code without consuming it, so registration can refuse a bad one before creating
+        // anything and spend a good one only once the account exists. Anonymous for the same reason
+        // as Redeem: the caller has no account yet, that being the point. It reveals only whether a
+        // code the caller already holds would work.
+        "Invitations.Validate",
+
         // The pricing page, for visitors who are not signed in.
         "PublicPlans.GetActive",
 
@@ -55,6 +61,10 @@ public class EndpointCoverageTests(ApiFactory factory) : IClassFixture<ApiFactor
         // willing to create one. The token is the credential: 256 unguessable bits, revealing only
         // an Organization's name to whoever already has the link.
         "InvitationAcceptance.Peek",
+
+        // The platform's own name and public site URL - the nav bar (and the login page it renders
+        // on) needs this before anyone is signed in. See PublicBrandingController.
+        "PublicBranding.Get",
     };
 
     /// <summary>
