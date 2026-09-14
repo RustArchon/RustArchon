@@ -6,6 +6,8 @@ volumes:
   dataprotection-keys:
   dataprotection-keys-session:
   rabbitmq-data:
+  garage-meta:
+  garage-data:
 
 services:
   postgres:
@@ -83,6 +85,62 @@ services:
       timeout: 5s
       retries: 10
 
+  # --- Garage (S3-compatible object storage, https://garagehq.deuxfleurs.fr) -------------------------
+  # Backs the theming feature's uploaded package assets (CSS/images/fonts) - a theme package is a small
+  # file tree, not a single value, so it doesn't fit Postgres/Valkey the way every other piece of
+  # platform config does. Picked over MinIO: MinIO's open-source repo was archived in February 2026
+  # (no longer maintained, no security patches) after stripping admin features out of the free edition
+  # in 2025. Garage is AGPL-3.0 (same family as this project) and built by a nonprofit collective
+  # (Deuxfleurs) rather than a company with an enterprise tier to protect.
+  #
+  # Single-node/replication_factor=1 here, same as every other backing store in this stack - see
+  # garage.toml's own remarks on the metadata-durability caveat that configuration carries, and why
+  # that's a property of this deployment (one Proxmox cluster) rather than something a different tool
+  # would avoid.
+  #
+  # Requires a one-time manual bootstrap after first `up` - assigning this node a cluster layout, then
+  # creating a bucket and an access key - before it will durably accept reads/writes. See README/
+  # DEPLOYMENT.md; nothing here automates that safely, the same way RUSTARCHON_ADMIN_CODE's bootstrap
+  # and the ghcr.io login in DEPLOYMENT.md are also one-time manual steps.
+  garage:
+    image: dxflrs/garage:v2.3.0
+    restart: unless-stopped
+    environment:
+      # Read by Garage in preference to the (absent) rpc_secret/admin_token keys in garage.toml - see
+      # that file's own remarks. Generate both with `openssl rand -hex 32`.
+      #
+      # Deliberately `:-` (a soft empty default), not `:?` (Compose's hard-required marker), unlike
+      # RUSTARCHON_JWT_SECRET_KEY/RUSTARCHON_INTERNAL_API_KEY below. Compose validates every `:?`
+      # variable across the *entire* file before running any command at all, for any service - so a
+      # `:?` here would fail `docker compose exec postgres ...` or `docker compose ps`, not just an
+      # attempt to actually start `garage`. Theming is optional (the rest of this stack runs fine
+      # without it - see S3ObjectStorage's own remarks on lazily constructing its client for exactly
+      # this reason); the compose file itself has to stay usable for everything else regardless of
+      # whether anyone has ever bootstrapped Garage. Leaving these blank just means `garage` itself
+      # won't come up healthy if you do start it - a normal, contained failure of one optional service,
+      # not a reason the whole file should refuse to parse.
+      GARAGE_RPC_SECRET: ${GARAGE_RPC_SECRET:-}
+      GARAGE_ADMIN_TOKEN: ${GARAGE_ADMIN_TOKEN:-}
+    volumes:
+      - ./garage.toml:/etc/garage.toml:ro
+      - garage-meta:/var/lib/garage/meta
+      - garage-data:/var/lib/garage/data
+    ports:
+      # Host-loopback only, same reasoning as postgres/rabbitmq/valkey above - lets RustArchon.Api run
+      # natively in Visual Studio against this container instead of also running in Docker itself.
+      # 3901 (RPC) is deliberately not published - nothing outside this container ever needs to reach
+      # it, not even the `garage` CLI bootstrap below (that runs inside the container via `docker
+      # compose exec`, in the same network namespace).
+      - "127.0.0.1:3900:3900"
+      - "127.0.0.1:3903:3903"
+    networks:
+      - rustarchon-net
+    healthcheck:
+      test: ["CMD", "/garage", "status"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
   # Never publishes a port to the host - reachable only from rustarchon-panel/rustarchon-worker on
   # rustarchon-net. This, not just the InternalApiKey header check, is what actually keeps
   # /internal/... unreachable from outside Docker. See README.
@@ -120,6 +178,16 @@ services:
       RUSTARCHON_ADMIN_CODE: ${RUSTARCHON_ADMIN_CODE:-}
       RABBITMQ_DEFAULT_USER: ${RABBITMQ_DEFAULT_USER:-guest}
       RABBITMQ_DEFAULT_PASS: ${RABBITMQ_DEFAULT_PASS:-guest}
+      # Theming feature's object storage (see the garage service below and IObjectStorage's remarks).
+      # Deliberately no `:?required` guard, unlike the secrets above - nothing at Api startup actually
+      # calls Garage (IObjectStorage has no connection check at construction), so a deployment that
+      # hasn't set these up yet still starts fine; only an actual theme upload/fetch would fail until
+      # they're set. Container-to-container URL, same pattern as Valkey/RabbitMQ above - never a public
+      # endpoint.
+      GARAGE_S3_ENDPOINT: ${GARAGE_S3_ENDPOINT:-http://garage:3900}
+      GARAGE_S3_ACCESS_KEY: ${GARAGE_S3_ACCESS_KEY:-}
+      GARAGE_S3_SECRET_KEY: ${GARAGE_S3_SECRET_KEY:-}
+      GARAGE_S3_BUCKET: ${GARAGE_S3_BUCKET:-rustarchon-themes}
     volumes:
       - dataprotection-keys:/keys
     depends_on:

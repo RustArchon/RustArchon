@@ -24,6 +24,7 @@ bld/
 [Oo]bj/
 [Ll]og/
 [Ll]ogs/
+TestResults/
 
 ## User-specific files
 
@@ -54,4 +55,9 @@ secrets.json
 ## protect stored RCON passwords). Never commit this - see App_Data volume mount in docker-compose.yml.
 
 App_Data/
+
+## Editor backup/swap files
+
+*~
+*.un~
 

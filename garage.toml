@@ -1,0 +1,32 @@
+# Config for the `garage` service in docker-compose.yml - see that service's own comments for why
+# Garage (over MinIO, whose open-source repo was archived in Feb 2026, and over storing this in
+# Postgres/Valkey instead). Committed to the repo since it holds no secrets: rpc_secret/admin_token/
+# metrics_token all come from GARAGE_RPC_SECRET/GARAGE_ADMIN_TOKEN env vars instead (see
+# docker-compose.yml/.env.example) - Garage reads those in preference to a value written here, and
+# this file is version-controlled in an AGPL repo, unlike RustArchon's own .env.
+#
+# Full reference: https://garagehq.deuxfleurs.fr/documentation/reference-manual/configuration/
+
+metadata_dir = "/var/lib/garage/meta"
+data_dir = "/var/lib/garage/data"
+
+# sqlite is Garage's recommended engine for a single-node/low-traffic deployment like this one - see
+# their own docs. LMDB is the alternative for heavier multi-node use, not needed here.
+db_engine = "sqlite"
+
+# Every other backing store in this stack (postgres, rabbitmq, valkey) is a single instance too - see
+# their own comments below. Garage's own docs flag replication_factor = 1 as having a metadata-
+# durability soft spot, but that's a property of running on one Proxmox cluster, not something a
+# different tool would avoid - mitigated the same way as postgres-data/dataprotection-keys: back up
+# the garage-meta and garage-data volumes together, never one without the other.
+replication_factor = 1
+
+rpc_bind_addr = "[::]:3901"
+rpc_public_addr = "127.0.0.1:3901"
+
+[s3_api]
+s3_region = "garage"
+api_bind_addr = "[::]:3900"
+
+[admin]
+api_bind_addr = "[::]:3903"
