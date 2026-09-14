@@ -251,6 +251,10 @@ services:
       # directly and had no way to reflect an admin's own change to either setting.
       Valkey__ConnectionString: "valkey:6379"
       RUSTARCHON_INTERNAL_API_KEY: ${RUSTARCHON_INTERNAL_API_KEY:?RUSTARCHON_INTERNAL_API_KEY must be set in .env}
+      # Read by Register.razor to recognize the platform's own bootstrap-admin sign-up (the same
+      # value RustArchon.Api's AccountBootstrapController/AdminInvitationSeeder already key off of) -
+      # see Register.razor's own remarks for why that one registration skips email confirmation.
+      RUSTARCHON_ADMIN_EMAIL: ${RUSTARCHON_ADMIN_EMAIL:-}
       # Shared with rustarchon-web below - same volume, same path, same ApplicationName in code -
       # so RustArchon.Web can decrypt the cookie this issues. See both Program.cs files.
       DataProtection__SessionKeyPath: /keys-session

@@ -15,6 +15,16 @@
       <PrivateAssets>all</PrivateAssets>
     </PackageReference>
     <PackageReference Include="Microsoft.EntityFrameworkCore.InMemory" Version="10.0.10" />
+    <!-- Real Postgres (via a throwaway Testcontainers instance), not InMemory or Sqlite, for
+         RustServerRepositoryTests - ExecuteUpdateAsync (which TryApplyConnectionStatusAsync relies on)
+         has no translation on the InMemory provider at all (throws InvalidOperationException), and
+         Sqlite's own ExecuteUpdateAsync translator turns out to reject this exact query shape (confirmed
+         by hand: the identical query passes against real Postgres, so it's a Sqlite-provider gap, not a
+         real bug) - only a real relational provider matching what production actually runs on is
+         trustworthy here. -->
+    <PackageReference Include="Testcontainers.PostgreSql" Version="4.2.0" />
+    <!-- Version-pinned to match RustArchon.Api's own reference exactly. -->
+    <PackageReference Include="Npgsql.EntityFrameworkCore.PostgreSQL" Version="10.0.3" />
     <PackageReference Include="Microsoft.NET.Test.Sdk" Version="18.8.1" />
     <PackageReference Include="xunit" Version="2.9.3" />
     <PackageReference Include="xunit.runner.visualstudio" Version="3.1.5">
