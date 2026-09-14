@@ -146,15 +146,40 @@ latest published `:latest` tag for `rustarchon-api`/`-panel`/`-worker`/`-web` fr
 rather than building anything locally - see `docker-compose.prod.yml`'s own remarks for why plain `up
 -d` (no `--build`) is what makes that stick.
 
-All eight services (`postgres`, `rabbitmq`, `valkey`, `rustarchon-api`, `rustarchon-worker`,
+All nine services (`postgres`, `rabbitmq`, `valkey`, `garage`, `rustarchon-api`, `rustarchon-worker`,
 `rustarchon-panel`, `rustarchon-web`, plus `watchtower` - see the update note below) should show
-`running` (the three infra ones `healthy`). Databases,
+`running` (the four infra ones `healthy`). Databases,
 tables, and RabbitMQ's queue topology are all created automatically on first start - there's no manual
 migration step. `restart: unless-stopped` on every service means the whole stack comes back on its own
 after an LXC reboot or a Docker daemon restart, as long as `systemctl enable docker` from step 2 stuck
 (confirm with `systemctl is-enabled docker`).
 
 If something doesn't come up, `docker compose logs -f <service>` is the first place to look.
+
+**One more one-time step: bootstrap Garage.** Unlike Postgres/RabbitMQ/Valkey, a fresh Garage node
+doesn't accept durable reads/writes until it's given a cluster layout, and needs a bucket and an
+access key created before `IObjectStorage` (RustArchon.Api) has anything to authenticate with. Run
+this once, right after the first `up -d` above:
+
+```bash
+docker compose exec garage /garage status
+# copy the node ID it prints (the one column showing "NO ROLE ASSIGNED")
+
+docker compose exec garage /garage layout assign -z local -c 1G <node-id>
+docker compose exec garage /garage layout apply --version 1
+
+docker compose exec garage /garage bucket create rustarchon-themes
+docker compose exec garage /garage key create rustarchon-api
+docker compose exec garage /garage bucket allow --read --write --owner rustarchon-themes --key rustarchon-api
+```
+
+The last command prints the access key ID and secret key exactly once - save them into `.env` as
+`GARAGE_S3_ACCESS_KEY`/`GARAGE_S3_SECRET_KEY`, then recreate `rustarchon-api` (`docker compose up -d
+rustarchon-api`) to pick them up. `-z local -c 1G` names an arbitrary zone and capacity for this
+single node; neither matters
+much for a one-node cluster, but the zone name is worth keeping consistent if this ever grows a
+second node in a different physical location. Re-running any of these commands is safe - `bucket
+create`/`key create` on an existing name and `bucket allow` with the same permissions are all no-ops.
 
 **Updates are automatic.** The `watchtower` service (see `docker-compose.prod.yml`) polls ghcr.io once
 an hour and recreates any of the four app containers whose `:latest` tag now points at a new digest -
@@ -232,6 +257,12 @@ Carried over from the main README's "Before deploying this anywhere real" - stil
   `CryptographicException` from `RconCredentialProtector.Unprotect`, and that server's connection just
   breaks silently until someone re-enters its password. Restoring a backup of one without the matching
   backup of the other reintroduces the exact same problem.
+- **Same rule for `garage-meta` and `garage-data`.** `garage-meta` holds the object index (which
+  bucket/key owns which uploaded file); `garage-data` holds the actual bytes. Restoring either volume
+  alone leaves Garage's index referencing data that isn't there, or data nothing indexes - the same
+  kind of mismatch as `dataprotection-keys`/`postgres-data` above. This is also the practical
+  mitigation for the single-node metadata-durability caveat noted in `garage.toml`'s own remarks -
+  regular backups, not live replication.
 - **The main README's "What's not built yet" section predates most of what's now running** (server
   registration, live console/chat, player history, Stats/Control tabs, pricing plans) - it's worth a
   pass to bring current, but hasn't been refreshed as part of this deployment work.
