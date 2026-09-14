@@ -223,18 +223,27 @@ container's own port, not the host-published one) instead.
 
 ## 8. First login
 
-`RequireConfirmedAccount = true` is on, and no real email provider is wired up yet (see "Known gaps"
-below) - so the confirmation link your own registration sends doesn't arrive by email. Get it from the
-Worker's log instead:
+Register at `https://panel.yourdomain.com/Account/Register` with the exact `RUSTARCHON_ADMIN_EMAIL`/
+`RUSTARCHON_ADMIN_CODE` pair from your `.env`. This one registration - and only this one, matched by
+email against `RUSTARCHON_ADMIN_EMAIL` - skips email confirmation entirely and signs you straight in
+(see `Register.razor`'s own remarks): without that, a fresh deployment would have no way to reach
+Platform Settings and configure real email delivery in the first place, since reaching it requires
+being signed in as an admin, and signing in requires a confirmed email. You'll end up both the Owner of
+your own tenant (the normal sign-up flow) and a platform admin in one step.
+
+Every other registration - an invited teammate, a real customer - still goes through normal email
+confirmation, and `RequireConfirmedAccount = true` is on. Until you configure a real provider under
+Admin → Platform Settings, no real email goes anywhere; confirmation/reset links only ever reach
+`rustarchon-worker`'s log:
 
 ```bash
 docker compose logs rustarchon-worker | grep "Would send email"
 ```
 
-Register at `https://panel.yourdomain.com/Account/Register` with the exact `RUSTARCHON_ADMIN_EMAIL`/
-`RUSTARCHON_ADMIN_CODE` pair from your `.env`, then paste the confirmation link from that log line into
-your browser. You'll end up both the Owner of your own tenant (the normal sign-up flow) and a platform
-admin (your email already matches `RUSTARCHON_ADMIN_EMAIL`) in one step.
+That line includes the full subject and body (the confirmation link is in there) - copy it straight
+into a browser. Once a real provider is configured and its "send a test email" button on Platform
+Settings comes back successful, this stops being necessary for anyone but you'll always be able to
+fall back to it if email delivery ever breaks.
 
 ## Known gaps
 
