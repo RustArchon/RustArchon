@@ -188,6 +188,12 @@ services:
       GARAGE_S3_ACCESS_KEY: ${GARAGE_S3_ACCESS_KEY:-}
       GARAGE_S3_SECRET_KEY: ${GARAGE_S3_SECRET_KEY:-}
       GARAGE_S3_BUCKET: ${GARAGE_S3_BUCKET:-rustarchon-themes}
+      # Stripe Checkout and Stripe Tax (both outbound only - creating a session, calculating tax - so
+      # this never needs rustarchon-api to be publicly reachable; see StripeCheckoutService's and
+      # StripeTaxService's remarks). A restricted key scoped to "Checkout Sessions: Write" and
+      # "Tax Calculations & Transactions: Write" only. No :?required guard, same reasoning as
+      # GARAGE_S3_* above - nothing at Api startup calls Stripe.
+      STRIPE_SECRET_KEY: ${STRIPE_SECRET_KEY:-}
     volumes:
       - dataprotection-keys:/keys
     depends_on:
@@ -263,6 +269,11 @@ services:
       # deployment sets this to .rustarchon.com via an environment override, not by editing this
       # file - see the README's cross-app session section.
       CookieDomain: ${COOKIE_DOMAIN:-}
+      # Verifies the /webhooks/stripe route's inbound signature - see StripeWebhookHandler's remarks
+      # for why this Panel, not rustarchon-api, receives Stripe's webhook at all. Not the Stripe secret
+      # key itself (that's rustarchon-api's STRIPE_SECRET_KEY, above) - this one can only verify a
+      # payload came from Stripe, never call Stripe's API.
+      STRIPE_WEBHOOK_SECRET: ${STRIPE_WEBHOOK_SECRET:-}
     volumes:
       - dataprotection-keys-session:/keys-session
     ports:
