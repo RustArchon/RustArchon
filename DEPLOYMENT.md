@@ -259,12 +259,13 @@ different services, and no new Cloudflare Tunnel route needed:
    exactly as unreachable from outside Docker as it already is.
 2. In the Stripe dashboard, add a webhook endpoint pointing at
    `https://panel.yourdomain.com/webhooks/stripe` (your `PANEL_PUBLIC_URL`, already tunnelled - nothing
-   new to route) subscribed to **both** `checkout.session.completed` (records a successful payment) and
-   `payment_intent.payment_failed` (records a decline on the Payment Ledger report - see
-   `StripeWebhookHandler`'s remarks; skip this one and failed charges simply won't show up anywhere).
-   Stripe gives you a signing secret (`whsec_...`) the moment you save it - set that as
-   **`STRIPE_WEBHOOK_SECRET`** on `rustarchon-panel` in your `.env`. This is the one that verifies
-   Stripe's signature; it can never call Stripe's API.
+   new to route) subscribed to **all three**: `checkout.session.completed` (records a successful
+   payment), `payment_intent.payment_failed` (records a decline on the Payment Ledger report), and
+   `charge.dispute.created` (records a chargeback the moment it happens and unlocks the chargeback
+   packet page for it - see `StripeWebhookHandler`'s remarks; skip this one and a dispute is invisible
+   until you notice it manually in Stripe's own dashboard). Stripe gives you a signing secret
+   (`whsec_...`) the moment you save it - set that as **`STRIPE_WEBHOOK_SECRET`** on `rustarchon-panel`
+   in your `.env`. This is the one that verifies Stripe's signature; it can never call Stripe's API.
 3. `docker compose up -d rustarchon-api rustarchon-panel` to pick up both.
 
 Leave both unset and the feature is simply not offered - `IStripeCheckoutService`/`StripeWebhookHandler`
