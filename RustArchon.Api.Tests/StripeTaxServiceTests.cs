@@ -4,7 +4,7 @@ using System;
 using System.Threading.Tasks;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Logging.Abstractions;
-using Microsoft.Extensions.Options;
+using Moq;
 using RustArchon.Api.Billing;
 using RustArchon.Api.Data;
 
@@ -24,7 +24,7 @@ public class StripeTaxServiceTests
         new(new DbContextOptionsBuilder<ApiDbContext>().UseInMemoryDatabase(_dbName).Options);
 
     private static StripeTaxService CreateService(ApiDbContext context) => new(
-        context, Options.Create(new StripeOptions()), NullLogger<StripeTaxService>.Instance);
+        context, Mock.Of<IStripeCredentialProvider>(), NullLogger<StripeTaxService>.Instance);
 
     [Fact]
     public async Task ATenantWithNoBillingAddressOnFileGetsNoTaxCalculatedAtAll()

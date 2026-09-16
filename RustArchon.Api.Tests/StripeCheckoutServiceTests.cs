@@ -5,7 +5,7 @@ using System.Threading;
 using System.Threading.Tasks;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Logging.Abstractions;
-using Microsoft.Extensions.Options;
+using Moq;
 using RustArchon.Api.Billing;
 using RustArchon.Api.Data;
 using RustArchon.Shared.DTOs;
@@ -28,7 +28,7 @@ public class StripeCheckoutServiceTests
         new(new DbContextOptionsBuilder<ApiDbContext>().UseInMemoryDatabase(_dbName).Options);
 
     private static StripeCheckoutService CreateService(ApiDbContext context) => new(
-        context, Options.Create(new StripeOptions()), NullLogger<StripeCheckoutService>.Instance);
+        context, Mock.Of<IStripeCredentialProvider>(), NullLogger<StripeCheckoutService>.Instance);
 
     private static Invoice NewInvoice(Guid tenantId, InvoiceStatus status, decimal total, decimal paid = 0m) => new()
     {

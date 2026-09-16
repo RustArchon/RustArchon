@@ -248,15 +248,15 @@ fall back to it if email delivery ever breaks.
 ## Stripe payments (optional)
 
 Lets a customer pay an open invoice online instead of you recording payment by hand - see
-`IStripeCheckoutService`/`StripeWebhookHandler`'s own remarks for the full design. Two keys, two
-different services, and no new Cloudflare Tunnel route needed:
+`IStripeCheckoutService`/`StripeWebhookHandler`'s own remarks for the full design. Both credentials are
+set from Admin → Platform Settings → Payments, not `.env` - see `StripeCredentialProvider`'s own remarks
+for why this one deliberately isn't environment configuration the way most of this file is:
 
-1. **`STRIPE_SECRET_KEY`** (a restricted key, scoped to `Checkout Sessions: Write` **and**
+1. **Stripe secret key** (a restricted key, scoped to `Checkout Sessions: Write` **and**
    `Tax Calculations & Transactions: Write` - the second is needed even if you never touch tax
    yourself, since `StripeTaxService` shares this same key; see the README/chat history for exactly how
-   to create one) goes on `rustarchon-api` in your `.env`. This is outbound-only (creating a Checkout
-   Session, calculating tax), so it never needs `rustarchon-api` to be publicly reachable - it stays
-   exactly as unreachable from outside Docker as it already is.
+   to create one) goes in the "Stripe secret key" field. Encrypted at rest, the same as the email
+   provider's own API key on that page.
 2. In the Stripe dashboard, add a webhook endpoint pointing at
    `https://panel.yourdomain.com/webhooks/stripe` (your `PANEL_PUBLIC_URL`, already tunnelled - nothing
    new to route) subscribed to **all three**: `checkout.session.completed` (records a successful
@@ -264,9 +264,14 @@ different services, and no new Cloudflare Tunnel route needed:
    `charge.dispute.created` (records a chargeback the moment it happens and unlocks the chargeback
    packet page for it - see `StripeWebhookHandler`'s remarks; skip this one and a dispute is invisible
    until you notice it manually in Stripe's own dashboard). Stripe gives you a signing secret
-   (`whsec_...`) the moment you save it - set that as **`STRIPE_WEBHOOK_SECRET`** on `rustarchon-panel`
-   in your `.env`. This is the one that verifies Stripe's signature; it can never call Stripe's API.
-3. `docker compose up -d rustarchon-api rustarchon-panel` to pick up both.
+   (`whsec_...`) the moment you save it - that goes in the "Stripe webhook signing secret" field on the
+   same page. This is the one that verifies Stripe's signature; it can never call Stripe's API.
+3. Both take effect immediately - no restart, no `docker compose up` needed, since RustArchon.Panel's
+   webhook route fetches the current value on every delivery rather than caching it at startup.
+
+Where Checkout sends the browser back to after payment is a separate setting, "Panel base URL" under
+Admin → Platform Settings → General - seeded once from `CorsSettings:BlazorServerUrl` the first time
+this Api starts, then yours to change without touching `.env` at all if the two ever need to differ.
 
 Leave both unset and the feature is simply not offered - `IStripeCheckoutService`/`StripeWebhookHandler`
 fail cleanly (a 400/"can't be paid right now", never a startup crash) rather than requiring this before
