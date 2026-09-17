@@ -1,0 +1,70 @@
+name: Promote a release to :latest
+
+# Publishing a GitHub Release is the one deliberate "ship this" action in this repo - see
+# publish-images.yml, which tags every ordinary main push edge/sha-<short> and nothing more. This
+# workflow never builds anything itself: it takes the exact image already built and tagged for the
+# release's own target commit and adds vX.Y.Z (and, for a real release rather than a pre-release,
+# latest) to it - the same digest, just more names pointing at it, via `docker buildx imagetools
+# create` rather than a rebuild. That's deliberate: it's the only way to guarantee the thing being
+# promoted is byte-for-byte what was actually tested as edge, not a fresh build from source that could
+# differ (a moved base image, a floating package version resolving differently) even from the identical
+# commit.
+#
+# The deployment host's watchtower only watches :latest (see docker-compose.prod.yml), so a plain
+# release is the actual production-deploy trigger here, not the git push that built edge in the first
+# place. Marking a release as a pre-release tags vX.Y.Z without touching latest at all - an escape
+# hatch for cutting a version without deploying it, at zero added pipeline complexity, if that's ever
+# needed later.
+#
+# See RELEASE_CHECKLIST.md for the human side of this: testing edge, then drafting a release with its
+# target set to the exact commit that was tested (not just "whatever main is now").
+on:
+  release:
+    types: [published]
+
+jobs:
+  promote:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      matrix:
+        service: [api, panel, worker, web]
+    steps:
+      # Checked out at the release's own tag, not main - the whole point is promoting whatever commit
+      # the release actually targeted, which may not be main's current tip.
+      - name: Check out at the release tag
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.release.tag_name }}
+
+      # docker/metadata-action's type=sha,format=short (see publish-images.yml) produces the same
+      # 7-character abbreviated form `git rev-parse --short HEAD` does by default - this has to match
+      # exactly, since it's how the source tag below is found.
+      - name: Compute the tested commit's short SHA
+        id: sha
+        run: echo "short=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Log in to ghcr.io
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # lowercase org name hardcoded rather than derived from github.repository_owner - GHCR requires
+      # an all-lowercase image path, and this org's actual name (RustArchon) isn't - same reasoning as
+      # publish-images.yml's own remarks.
+      - name: Promote the already-built image
+        run: |
+          IMAGE="ghcr.io/rustarchon/rustarchon-${{ matrix.service }}"
+          SOURCE="$IMAGE:sha-${{ steps.sha.outputs.short }}"
+          TAGS="--tag $IMAGE:${{ github.event.release.tag_name }}"
+          if [ "${{ github.event.release.prerelease }}" != "true" ]; then
+            TAGS="$TAGS --tag $IMAGE:latest"
+          fi
+          docker buildx imagetools create $TAGS "$SOURCE"
