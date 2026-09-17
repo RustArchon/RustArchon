@@ -1,3 +1,6 @@
+See [QUICKSTART.md](QUICKSTART.md) for the minimum steps to stand up a new deployment, and
+[DEPLOYMENT.md](DEPLOYMENT.md) for a fuller runbook and every customization available once it's up.
+
 ## Setting up Admin Access
 
 To set up admin access in development mode:

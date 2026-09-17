@@ -156,10 +156,13 @@ after an LXC reboot or a Docker daemon restart, as long as `systemctl enable doc
 
 If something doesn't come up, `docker compose logs -f <service>` is the first place to look.
 
-**One more one-time step: bootstrap Garage.** Unlike Postgres/RabbitMQ/Valkey, a fresh Garage node
-doesn't accept durable reads/writes until it's given a cluster layout, and needs a bucket and an
-access key created before `IObjectStorage` (RustArchon.Api) has anything to authenticate with. Run
-this once, right after the first `up -d` above:
+**One more one-time step, and treat it as mandatory rather than optional: bootstrap Garage.** Unlike
+Postgres/RabbitMQ/Valkey, a fresh Garage node doesn't accept durable reads/writes until it's given a
+cluster layout, and needs a bucket and an access key created before `IObjectStorage` (RustArchon.Api)
+has anything to authenticate with. `DefaultThemeSeeder`'s own remarks describe skipping this as a graceful
+no-op (no seeded theme row, nothing else affected) - in practice, skip it and the platform's built-in
+theme never gets seeded or activated, which shows up as real errors rather than just a missing catalog
+entry. Do this before first login, not after. Run it once, right after the first `up -d` above:
 
 ```bash
 docker compose exec garage /garage status
@@ -250,32 +253,48 @@ fall back to it if email delivery ever breaks.
 Lets a customer pay an open invoice online instead of you recording payment by hand - see
 `IStripeCheckoutService`/`StripeWebhookHandler`'s own remarks for the full design. Both credentials are
 set from Admin → Platform Settings → Payments, not `.env` - see `StripeCredentialProvider`'s own remarks
-for why this one deliberately isn't environment configuration the way most of this file is:
+for why this one deliberately isn't environment configuration the way most of this file is.
 
-1. **Stripe secret key** (a restricted key, scoped to `Checkout Sessions: Write` **and**
-   `Tax Calculations & Transactions: Write` - the second is needed even if you never touch tax
-   yourself, since `StripeTaxService` shares this same key; see the README/chat history for exactly how
-   to create one) goes in the "Stripe secret key" field. Encrypted at rest, the same as the email
-   provider's own API key on that page.
-2. In the Stripe dashboard, add a webhook endpoint pointing at
-   `https://panel.yourdomain.com/webhooks/stripe` (your `PANEL_PUBLIC_URL`, already tunnelled - nothing
-   new to route) subscribed to **all three**: `checkout.session.completed` (records a successful
-   payment), `payment_intent.payment_failed` (records a decline on the Payment Ledger report), and
-   `charge.dispute.created` (records a chargeback the moment it happens and unlocks the chargeback
-   packet page for it - see `StripeWebhookHandler`'s remarks; skip this one and a dispute is invisible
-   until you notice it manually in Stripe's own dashboard). Stripe gives you a signing secret
-   (`whsec_...`) the moment you save it - that goes in the "Stripe webhook signing secret" field on the
-   same page. This is the one that verifies Stripe's signature; it can never call Stripe's API.
-3. Both take effect immediately - no restart, no `docker compose up` needed, since RustArchon.Panel's
-   webhook route fetches the current value on every delivery rather than caching it at startup.
+**1. Create a restricted API key.** In the Stripe Dashboard: **Developers → API keys → Create
+restricted key**. Give it a name that identifies this deployment (e.g. `rustarchon-prod`) and grant
+exactly two permissions - **Checkout Sessions: Write** and **Tax Calculations & Transactions: Write**
+(the second is needed even if you never touch tax yourself, since `StripeTaxService` shares this same
+key). Leave every other resource at "None." Copy the value Stripe shows exactly once (`rk_test_...` in
+test mode, `rk_live_...` in live mode) into the "Stripe secret key" field. Encrypted at rest, the same
+as the email provider's own API key on that page.
+
+**2. Add a webhook endpoint.** In the Stripe Dashboard: **Developers → Webhooks → Add endpoint**,
+pointing at `https://panel.yourdomain.com/webhooks/stripe` (your `PANEL_PUBLIC_URL`, already tunnelled -
+nothing new to route; this is the Panel's own route, not the Api, since the Api is never reachable from
+outside the Docker network - see `StripeWebhookHandler`'s remarks). Stripe's event picker is a search
+box over individual event names, not a category checkbox - there's no single "all charge disputes"
+toggle. RustArchon currently *acts* on three: `checkout.session.completed` (records a successful
+payment), `payment_intent.payment_failed` (records a decline on the Payment Ledger report), and
+`charge.dispute.created` (records a chargeback the moment it happens and unlocks the chargeback packet
+page for it - skip this one and a dispute is invisible until you notice it manually in Stripe's own
+dashboard). It's worth also subscribing to the rest of the `charge.dispute.*` family now (`closed`,
+`funds_reinstated`, `funds_withdrawn`, `updated`) even though nothing acts on those yet, so you don't
+have to come back and re-edit this endpoint's event list as that handling is added later.
+
+Save the endpoint, then open it back up and click **reveal** next to **Signing secret** (`whsec_...`) -
+that goes in the "Stripe webhook signing secret" field. This is the one that verifies Stripe's
+signature; it can never call Stripe's API. Both fields take effect immediately - no restart, no
+`docker compose up` needed, since RustArchon.Panel's webhook route and RustArchon.Api's Stripe services
+fetch the current value live on every call rather than caching it at startup.
+
+**Testing locally**, without a real public URL or a dashboard endpoint: the
+[Stripe CLI](https://docs.stripe.com/stripe-cli) can forward events straight to a local Panel instance -
+`stripe listen --forward-to <panel-url>/webhooks/stripe` - which prints its own temporary signing secret
+for the session, used the same way as a dashboard endpoint's `whsec_...`.
 
 Where Checkout sends the browser back to after payment is a separate setting, "Panel base URL" under
 Admin → Platform Settings → General - seeded once from `CorsSettings:BlazorServerUrl` the first time
 this Api starts, then yours to change without touching `.env` at all if the two ever need to differ.
 
-Leave both unset and the feature is simply not offered - `IStripeCheckoutService`/`StripeWebhookHandler`
-fail cleanly (a 400/"can't be paid right now", never a startup crash) rather than requiring this before
-the rest of the platform works.
+Leaving both unset is a supported, intentional state - the feature is simply not offered, and
+`IStripeCheckoutService`/`StripeWebhookHandler` fail cleanly (a 400/"can't be paid right now") rather
+than crashing, whether the reason is an unpayable invoice or a deployment that just hasn't configured
+Stripe yet.
 
 **Sales tax is separate and per-Organization.** Even with the key scoped correctly, `StripeTaxService`
 calculates nothing for an Organization with no billing address on file (`Organization` page in the
@@ -294,6 +313,60 @@ retries automatically the moment you register. Set **`ComplianceNotificationEmai
 settings page (Billing category) to get a once-daily digest of which jurisdictions are currently blocking
 an invoice this way - leave it blank to skip the digest entirely. A site admin also sees a banner in the
 Panel whenever at least one invoice is blocked.
+
+## Platform Settings reference
+
+Everything below lives at Admin → Platform Settings, grouped the same way the page groups them
+(`PlatformSettingsRegistry` is the source of truth if this ever drifts). All of it is seeded with a
+working default on first `rustarchon-api` startup - nothing here blocks the platform from running, the
+way the required `.env` values above do. Settings not mentioned in "First login" above are genuinely
+optional tuning, safe to leave at their defaults indefinitely.
+
+**General**
+
+- **Site name** - the nav bar wordmark, every page title's suffix, and the `{{SiteName}}` placeholder
+  available to every email. Defaults to "RustArchon."
+- **Site URL** - the public marketing address the nav brand links to, and the `{{SiteUrl}}` email
+  placeholder. Distinct from "Panel base URL" below - this one is what's worth putting in front of a
+  reader, the same address regardless of which environment sent the email.
+- **Panel base URL** - this deployment's own Panel address, used purely as infrastructure (where
+  Stripe Checkout redirects the browser back to). Seeded once from `PANEL_PUBLIC_URL`
+  (`CorsSettings:BlazorServerUrl`) the first time the Api starts; edit here afterward if the two ever
+  need to differ.
+
+**Registration**
+
+- **Require invitation codes to register** - the soft-launch gate; on by default. Disable once you're
+  ready to open registration to everyone. Replaces the old `RUSTARCHON_INVITATION_CODES_ENABLED`
+  environment variable, which is now read only as this row's one-time seed value and otherwise ignored.
+- **Default plan for new sign-ups** - which Plan a brand-new Organization starts on. Leave unset (the
+  default) to always use whichever active Plan is currently cheapest.
+
+**Billing**
+
+- **Payment terms (days)** - how long after an invoice is issued it falls due; every "past due" figure
+  on every receivables report is measured from this. Defaults to 14.
+- **Payment due soon reminder (days before due)** - how far ahead of the due date the "payment coming
+  due" reminder goes out. Defaults to 14.
+- **Suspension grace period (days)** - how many days an Organization stays past due, still unpaid,
+  before its servers are suspended. Defaults to 7.
+- **Tax compliance notification address** - see "Nexus/tax registration" above. Blank (the default)
+  skips the digest entirely.
+
+**Payments** - see "Stripe payments (optional)" above for both fields and the full Dashboard walkthrough.
+
+**Email**
+
+- **Email service provider** - `Smtp`, `Resend`, or `SendGrid`; picks which of the fields below are
+  shown and actually used. Defaults to SMTP.
+- **API key** - shown only when the provider above isn't SMTP. Encrypted at rest.
+- **SMTP host/port/uses TLS/username/password** - shown only while the provider is SMTP. Port defaults
+  to 587 (STARTTLS); password is encrypted at rest and never shown again once set.
+- **From address / From name** - the sender identity on every email RustArchon sends, including this
+  page's own test send.
+- **Default language** - which language an email falls back to when the recipient's own preferred
+  language has no translation for the template being sent. Blank behaves the same as the template
+  system's own seed culture.
 
 ## Known gaps
 
