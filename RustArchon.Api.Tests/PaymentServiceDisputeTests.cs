@@ -135,4 +135,131 @@ public class PaymentServiceDisputeTests(PostgresFixture postgres) : IClassFixtur
 
         Assert.Null(result);
     }
+
+    [Fact]
+    public async Task ADisputeClosedLostRecordsTheOutcomeWithoutTouchingTheInvoice()
+    {
+        await using var context = CreateContext();
+        var (invoiceId, paymentId, providerPaymentId) = await SeedPaidInvoiceAsync(context);
+        var service = CreateService(context);
+        var disputeId = $"dp_test_{Guid.NewGuid():N}";
+        await service.RecordDisputeAsync(providerPaymentId, disputeId, "fraudulent", null);
+
+        var result = await service.RecordDisputeClosedAsync(disputeId, "lost");
+
+        Assert.NotNull(result);
+        Assert.Equal("lost", result!.DisputeStatus);
+        Assert.NotNull(result.DisputeClosedOn);
+
+        // Still fully reopened - a lost dispute has no more money to move, so nothing here changes.
+        var invoice = await context.Set<Invoice>().SingleAsync(i => i.Id == invoiceId);
+        Assert.Equal(InvoiceStatus.Open, invoice.Status);
+        var payment = await context.Set<Payment>().SingleAsync(p => p.Id == paymentId);
+        Assert.Equal(PaymentStatus.Disputed, payment.Status);
+    }
+
+    [Fact]
+    public async Task TheSameDisputeClosedEventRedeliveredDoesNotReRecordIt()
+    {
+        await using var context = CreateContext();
+        var (_, _, providerPaymentId) = await SeedPaidInvoiceAsync(context);
+        var service = CreateService(context);
+        var disputeId = $"dp_test_{Guid.NewGuid():N}";
+        await service.RecordDisputeAsync(providerPaymentId, disputeId, "fraudulent", null);
+
+        var first = await service.RecordDisputeClosedAsync(disputeId, "lost");
+        var firstClosedOn = first!.DisputeClosedOn;
+        var second = await service.RecordDisputeClosedAsync(disputeId, "lost");
+
+        Assert.Equal(firstClosedOn, second!.DisputeClosedOn);
+    }
+
+    [Fact]
+    public async Task ADisputeClosedEventForAnUnknownDisputeIsNotRecorded()
+    {
+        await using var context = CreateContext();
+
+        var result = await CreateService(context).RecordDisputeClosedAsync(
+            $"dp_does_not_exist_{Guid.NewGuid():N}", "lost");
+
+        Assert.Null(result);
+    }
+
+    [Fact]
+    public async Task FundsReinstatedAfterAWonDisputeReopensTheInvoiceAsPaidAndTheStatusAsSucceeded()
+    {
+        await using var context = CreateContext();
+        var (invoiceId, paymentId, providerPaymentId) = await SeedPaidInvoiceAsync(context, total: 20m);
+        var service = CreateService(context);
+        var disputeId = $"dp_test_{Guid.NewGuid():N}";
+        await service.RecordDisputeAsync(providerPaymentId, disputeId, "fraudulent", null);
+        await service.RecordDisputeClosedAsync(disputeId, "won");
+
+        var result = await service.RecordDisputeFundsReinstatedAsync(disputeId);
+
+        Assert.NotNull(result);
+        Assert.NotNull(result!.DisputeFundsReinstatedOn);
+        Assert.Equal(PaymentStatus.Succeeded, result.Status);
+
+        var invoice = await context.Set<Invoice>().SingleAsync(i => i.Id == invoiceId);
+        Assert.Equal(InvoiceStatus.Paid, invoice.Status);
+        Assert.Equal(20m, invoice.AmountPaid);
+
+        var payment = await context.Set<Payment>().Include(p => p.Allocations).SingleAsync(p => p.Id == paymentId);
+        var allocation = Assert.Single(payment.Allocations);
+        Assert.Equal(0m, allocation.ReversedAmount);
+        Assert.Null(allocation.ReversedOn);
+    }
+
+    [Fact]
+    public async Task TheSameFundsReinstatedEventRedeliveredDoesNotDoubleCreditTheInvoice()
+    {
+        await using var context = CreateContext();
+        var (invoiceId, _, providerPaymentId) = await SeedPaidInvoiceAsync(context, total: 20m);
+        var service = CreateService(context);
+        var disputeId = $"dp_test_{Guid.NewGuid():N}";
+        await service.RecordDisputeAsync(providerPaymentId, disputeId, "fraudulent", null);
+
+        await service.RecordDisputeFundsReinstatedAsync(disputeId);
+        await service.RecordDisputeFundsReinstatedAsync(disputeId);
+
+        var invoice = await context.Set<Invoice>().SingleAsync(i => i.Id == invoiceId);
+        // Still just fully reinstated once, not double-credited past the invoice's own total.
+        Assert.Equal(20m, invoice.AmountPaid);
+    }
+
+    [Fact]
+    public async Task FundsReinstatedForAnUnknownDisputeIsNotRecorded()
+    {
+        await using var context = CreateContext();
+
+        var result = await CreateService(context).RecordDisputeFundsReinstatedAsync(
+            $"dp_does_not_exist_{Guid.NewGuid():N}");
+
+        Assert.Null(result);
+    }
+
+    [Fact]
+    public async Task FundsReinstatedWhenNothingWasEverReversedStillRecordsTheEventWithNoBookkeeping()
+    {
+        await using var context = CreateContext();
+        // A payment whose dispute was recorded with nothing live left to reverse (see
+        // RecordDisputeAsync's own remarks for how that happens - already fully refunded some other
+        // way) - DisputeAmountReversed stays zero, so reinstatement has nothing to give back either.
+        var (_, _, providerPaymentId) = await SeedPaidInvoiceAsync(context);
+        var service = CreateService(context);
+        await service.ReversePaymentAsync(
+            (await context.Set<Payment>().SingleAsync(p => p.ProviderPaymentId == providerPaymentId)).Id,
+            PaymentStatus.Refunded);
+        var disputeId = $"dp_test_{Guid.NewGuid():N}";
+        await service.RecordDisputeAsync(providerPaymentId, disputeId, "fraudulent", null);
+
+        var result = await service.RecordDisputeFundsReinstatedAsync(disputeId);
+
+        Assert.NotNull(result);
+        Assert.NotNull(result!.DisputeFundsReinstatedOn);
+        // Already Refunded before the dispute ever recorded - reinstating a dispute that had nothing
+        // live to reverse doesn't resurrect an unrelated refund.
+        Assert.Equal(PaymentStatus.Refunded, result.Status);
+    }
 }
