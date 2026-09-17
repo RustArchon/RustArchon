@@ -268,13 +268,16 @@ pointing at `https://panel.yourdomain.com/webhooks/stripe` (your `PANEL_PUBLIC_U
 nothing new to route; this is the Panel's own route, not the Api, since the Api is never reachable from
 outside the Docker network - see `StripeWebhookHandler`'s remarks). Stripe's event picker is a search
 box over individual event names, not a category checkbox - there's no single "all charge disputes"
-toggle. RustArchon currently *acts* on three: `checkout.session.completed` (records a successful
-payment), `payment_intent.payment_failed` (records a decline on the Payment Ledger report), and
+toggle. RustArchon currently *acts* on five: `checkout.session.completed` (records a successful
+payment), `payment_intent.payment_failed` (records a decline on the Payment Ledger report),
 `charge.dispute.created` (records a chargeback the moment it happens and unlocks the chargeback packet
 page for it - skip this one and a dispute is invisible until you notice it manually in Stripe's own
-dashboard). It's worth also subscribing to the rest of the `charge.dispute.*` family now (`closed`,
-`funds_reinstated`, `funds_withdrawn`, `updated`) even though nothing acts on those yet, so you don't
-have to come back and re-edit this endpoint's event list as that handling is added later.
+dashboard), `charge.dispute.closed` (records the final won/lost/warning_closed outcome), and
+`charge.dispute.funds_reinstated` (re-settles the invoice once a won dispute's money actually returns -
+see `PaymentService.RecordDisputeFundsReinstatedAsync`'s own remarks for why that's a separate event
+from `closed`). It's worth also subscribing to the remaining `charge.dispute.*` events now
+(`funds_withdrawn`, `updated`) even though nothing acts on those yet, so you don't have to come back and
+re-edit this endpoint's event list as that handling is added later.
 
 Save the endpoint, then open it back up and click **reveal** next to **Signing secret** (`whsec_...`) -
 that goes in the "Stripe webhook signing secret" field. This is the one that verifies Stripe's
