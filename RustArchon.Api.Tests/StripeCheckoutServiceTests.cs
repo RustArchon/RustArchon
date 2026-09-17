@@ -97,4 +97,21 @@ public class StripeCheckoutServiceTests
 
         Assert.Null(result);
     }
+
+    [Fact]
+    public async Task APayableInvoiceWithNoStripeSecretKeyConfiguredReturnsNullRatherThanCallingStripe()
+    {
+        await using var context = CreateContext();
+        var invoice = NewInvoice(Guid.NewGuid(), InvoiceStatus.Open, 15m);
+        context.Set<Invoice>().Add(invoice);
+        await context.SaveChangesAsync();
+
+        // The default Mock.Of<IStripeCredentialProvider>() below already returns null/empty for
+        // GetSecretKeyAsync() - this test exists to pin that an unconfigured key is refused here,
+        // before ever reaching Stripe.net's own SessionService.CreateAsync call.
+        var result = await CreateService(context)
+            .CreateCheckoutSessionAsync(invoice.TenantId, invoice.Id, "https://x/success", "https://x/cancel");
+
+        Assert.Null(result);
+    }
 }
