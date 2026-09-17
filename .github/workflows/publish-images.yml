@@ -5,6 +5,11 @@ name: Publish container images
 # README's "Cloning this repo"/multi-repo workflow: every submodule PR merges into its own repo first,
 # then a single "bump submodules" PR lands here last). Building from each submodule's own main the
 # moment its PR merges would risk pulling in sibling versions that were never actually run together.
+#
+# Tags every build `edge` and `sha-<short>`, never `latest` - this is the untested end of the pipeline,
+# not a release. See .github/workflows/promote-release.yml, the only place `latest` (or a `vX.Y.Z` tag)
+# ever gets set, and only by re-tagging one of these exact images once a human has actually tried it -
+# never by rebuilding. RELEASE_CHECKLIST.md has the full promotion flow.
 on:
   push:
     branches: [main]
@@ -69,7 +74,7 @@ jobs:
         with:
           images: ghcr.io/rustarchon/rustarchon-${{ matrix.service }}
           tags: |
-            type=raw,value=latest
+            type=raw,value=edge
             type=sha,format=short
 
       - name: Build and push
