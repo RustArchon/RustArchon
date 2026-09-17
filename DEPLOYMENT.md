@@ -245,6 +245,56 @@ into a browser. Once a real provider is configured and its "send a test email" b
 Settings comes back successful, this stops being necessary for anyone but you'll always be able to
 fall back to it if email delivery ever breaks.
 
+## Stripe payments (optional)
+
+Lets a customer pay an open invoice online instead of you recording payment by hand - see
+`IStripeCheckoutService`/`StripeWebhookHandler`'s own remarks for the full design. Both credentials are
+set from Admin → Platform Settings → Payments, not `.env` - see `StripeCredentialProvider`'s own remarks
+for why this one deliberately isn't environment configuration the way most of this file is:
+
+1. **Stripe secret key** (a restricted key, scoped to `Checkout Sessions: Write` **and**
+   `Tax Calculations & Transactions: Write` - the second is needed even if you never touch tax
+   yourself, since `StripeTaxService` shares this same key; see the README/chat history for exactly how
+   to create one) goes in the "Stripe secret key" field. Encrypted at rest, the same as the email
+   provider's own API key on that page.
+2. In the Stripe dashboard, add a webhook endpoint pointing at
+   `https://panel.yourdomain.com/webhooks/stripe` (your `PANEL_PUBLIC_URL`, already tunnelled - nothing
+   new to route) subscribed to **all three**: `checkout.session.completed` (records a successful
+   payment), `payment_intent.payment_failed` (records a decline on the Payment Ledger report), and
+   `charge.dispute.created` (records a chargeback the moment it happens and unlocks the chargeback
+   packet page for it - see `StripeWebhookHandler`'s remarks; skip this one and a dispute is invisible
+   until you notice it manually in Stripe's own dashboard). Stripe gives you a signing secret
+   (`whsec_...`) the moment you save it - that goes in the "Stripe webhook signing secret" field on the
+   same page. This is the one that verifies Stripe's signature; it can never call Stripe's API.
+3. Both take effect immediately - no restart, no `docker compose up` needed, since RustArchon.Panel's
+   webhook route fetches the current value on every delivery rather than caching it at startup.
+
+Where Checkout sends the browser back to after payment is a separate setting, "Panel base URL" under
+Admin → Platform Settings → General - seeded once from `CorsSettings:BlazorServerUrl` the first time
+this Api starts, then yours to change without touching `.env` at all if the two ever need to differ.
+
+Leave both unset and the feature is simply not offered - `IStripeCheckoutService`/`StripeWebhookHandler`
+fail cleanly (a 400/"can't be paid right now", never a startup crash) rather than requiring this before
+the rest of the platform works.
+
+**Sales tax is separate and per-Organization.** Even with the key scoped correctly, `StripeTaxService`
+calculates nothing for an Organization with no billing address on file (`Organization` page in the
+Panel) - no error, just $0 tax, since there's no jurisdiction to calculate against. This is opt-in by
+the customer filling in their own address, not something you turn on platform-wide.
+
+**Nexus/tax registration is a Stripe Dashboard responsibility, not something this codebase manages.**
+Stripe Tax itself monitors your Stripe-processed sales against each jurisdiction's economic-nexus
+threshold and emails/notifies you in the Dashboard when you've crossed one - see
+[Monitor your obligations](https://dashboard.stripe.com/tax/locations). Registering there is what turns
+tax calculation on for a jurisdiction; RustArchon has no code that manages registrations. What RustArchon
+*does* do: if `StripeTaxService` ever gets a `not_collecting` result (tax is legitimately owed somewhere
+you aren't registered - as opposed to a genuine $0 for a state with no sales tax, a B2B reverse charge,
+etc.), it refuses to issue that invoice rather than silently under-charging, and the hourly billing sweep
+retries automatically the moment you register. Set **`ComplianceNotificationEmail`** on the platform
+settings page (Billing category) to get a once-daily digest of which jurisdictions are currently blocking
+an invoice this way - leave it blank to skip the digest entirely. A site admin also sees a banner in the
+Panel whenever at least one invoice is blocked.
+
 ## Known gaps
 
 Carried over from the main README's "Before deploying this anywhere real" - still true here:

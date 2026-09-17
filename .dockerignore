@@ -12,3 +12,9 @@ JumpStart/docs
 
 # RustArchon-specific local artifacts that shouldn't be baked into an image.
 **/App_Data
+
+# Personal local-only source (see RustArchon.Panel/.gitignore's matching *.local.cs pattern and
+# SingleUserAuth.cs's own remarks) - excluded here too as a second, independent layer: this keeps it
+# out of any image build even if it somehow existed in a working directory that wasn't a clean git
+# checkout, on top of the runtime check SingleUserAuth.cs itself does either way.
+**/*.local.cs

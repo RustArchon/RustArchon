@@ -60,7 +60,10 @@ public class OrganizationSettingsServiceTests
         await SeedAsync(context);
 
         var updated = await new OrganizationSettingsService(context)
-            .UpdateAsync(_tenantId, "Acme Holdings", "new-owner@acme.example");
+            .UpdateAsync(
+                _tenantId, "Acme Holdings", "new-owner@acme.example",
+                billingLine1: null, billingLine2: null, billingCity: null, billingState: null,
+                billingPostalCode: null, billingCountry: null);
 
         Assert.True(updated);
 
@@ -75,7 +78,10 @@ public class OrganizationSettingsServiceTests
         await using var context = CreateContext();
         await SeedAsync(context);
 
-        await new OrganizationSettingsService(context).UpdateAsync(_tenantId, "Acme", contactEmail: "  ");
+        await new OrganizationSettingsService(context).UpdateAsync(
+            _tenantId, "Acme", contactEmail: "  ",
+            billingLine1: null, billingLine2: null, billingCity: null, billingState: null,
+            billingPostalCode: null, billingCountry: null);
 
         var tenant = await context.Set<Tenant>().SingleAsync(t => t.Id == _tenantId);
         Assert.Null(tenant.ContactEmail);
@@ -87,7 +93,10 @@ public class OrganizationSettingsServiceTests
         await using var context = CreateContext();
 
         var updated = await new OrganizationSettingsService(context)
-            .UpdateAsync(_tenantId, "Acme", "owner@acme.example");
+            .UpdateAsync(
+                _tenantId, "Acme", "owner@acme.example",
+                billingLine1: null, billingLine2: null, billingCity: null, billingState: null,
+                billingPostalCode: null, billingCountry: null);
 
         Assert.False(updated);
     }
