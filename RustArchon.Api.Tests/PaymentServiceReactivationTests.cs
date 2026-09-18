@@ -4,6 +4,7 @@ using System;
 using System.Threading;
 using System.Threading.Tasks;
 using JumpStart.Data;
+using JumpStart.Repositories;
 using MassTransit;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Logging.Abstractions;
@@ -33,8 +34,9 @@ public class PaymentServiceReactivationTests(PostgresFixture postgres) : IClassF
         context,
         Mock.Of<ICommunicationPublisher>(),
         new OrganizationLifecycleService(
-            context, Mock.Of<IPublishEndpoint>(), Mock.Of<ICommunicationPublisher>(), clock,
-            NullLogger<OrganizationLifecycleService>.Instance),
+            context, Mock.Of<IPublishEndpoint>(), Mock.Of<ICommunicationPublisher>(),
+            Mock.Of<ISubscriptionService>(), Mock.Of<IRoleCompressionService>(), Mock.Of<IUserContext>(),
+            clock, NullLogger<OrganizationLifecycleService>.Instance),
         // Never actually called in these tests - every payment here is Manual, and
         // PaymentService.ReversePaymentAsync only ever reaches Stripe for a Card payment with a
         // ProviderPaymentId. See PaymentServiceRefundTests for the Stripe-calling path itself.

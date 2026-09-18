@@ -5,11 +5,13 @@ using System.Collections.Generic;
 using System.Threading;
 using System.Threading.Tasks;
 using JumpStart.Data;
+using JumpStart.Repositories;
 using MassTransit;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Logging.Abstractions;
 using Moq;
 using RustArchon.Api.Administration;
+using RustArchon.Api.Billing;
 using RustArchon.Api.Data;
 using RustArchon.Api.Infrastructure;
 using RustArchon.Shared.DTOs;
@@ -52,6 +54,9 @@ public class OrganizationLifecycleServiceTests
             context,
             Mock.Of<IPublishEndpoint>(),
             communicationPublisher.Object,
+            Mock.Of<ISubscriptionService>(),
+            Mock.Of<IRoleCompressionService>(),
+            Mock.Of<IUserContext>(),
             new FixedClock(DateTimeOffset.UtcNow),
             NullLogger<OrganizationLifecycleService>.Instance);
 
