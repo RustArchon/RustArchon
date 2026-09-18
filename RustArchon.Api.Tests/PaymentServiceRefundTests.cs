@@ -5,6 +5,7 @@ using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
 using JumpStart.Data;
+using JumpStart.Repositories;
 using MassTransit;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Logging.Abstractions;
@@ -30,8 +31,9 @@ public class PaymentServiceRefundTests(PostgresFixture postgres) : IClassFixture
         context,
         Mock.Of<ICommunicationPublisher>(),
         new OrganizationLifecycleService(
-            context, Mock.Of<IPublishEndpoint>(), Mock.Of<ICommunicationPublisher>(), TimeProvider.System,
-            NullLogger<OrganizationLifecycleService>.Instance),
+            context, Mock.Of<IPublishEndpoint>(), Mock.Of<ICommunicationPublisher>(),
+            Mock.Of<ISubscriptionService>(), Mock.Of<IRoleCompressionService>(), Mock.Of<IUserContext>(),
+            TimeProvider.System, NullLogger<OrganizationLifecycleService>.Instance),
         stripeRefund ?? Mock.Of<IStripeRefundService>(),
         stripeTax ?? Mock.Of<IStripeTaxService>(),
         TimeProvider.System,

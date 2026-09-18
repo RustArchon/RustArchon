@@ -5,6 +5,7 @@ using System.Collections.Generic;
 using System.Threading;
 using System.Threading.Tasks;
 using JumpStart.Data;
+using JumpStart.Repositories;
 using MassTransit;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
@@ -53,6 +54,9 @@ public class DunningServiceTests
             new DbContextOptionsBuilder<ApiDbContext>().UseInMemoryDatabase(_dbName).Options));
         services.AddSingleton(communicationPublisher.Object);
         services.AddSingleton(Mock.Of<IPublishEndpoint>());
+        services.AddSingleton(Mock.Of<ISubscriptionService>());
+        services.AddSingleton(Mock.Of<IRoleCompressionService>());
+        services.AddSingleton(Mock.Of<IUserContext>());
         services.AddSingleton(clock);
         services.AddSingleton<ILogger<OrganizationLifecycleService>>(NullLogger<OrganizationLifecycleService>.Instance);
         services.AddScoped<IOrganizationLifecycleService, OrganizationLifecycleService>();

@@ -5,6 +5,7 @@ using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
 using JumpStart.Data;
+using JumpStart.Repositories;
 using MassTransit;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Logging.Abstractions;
@@ -30,8 +31,9 @@ public class PaymentServiceDisputeTests(PostgresFixture postgres) : IClassFixtur
         context,
         Mock.Of<ICommunicationPublisher>(),
         new OrganizationLifecycleService(
-            context, Mock.Of<IPublishEndpoint>(), Mock.Of<ICommunicationPublisher>(), TimeProvider.System,
-            NullLogger<OrganizationLifecycleService>.Instance),
+            context, Mock.Of<IPublishEndpoint>(), Mock.Of<ICommunicationPublisher>(),
+            Mock.Of<ISubscriptionService>(), Mock.Of<IRoleCompressionService>(), Mock.Of<IUserContext>(),
+            TimeProvider.System, NullLogger<OrganizationLifecycleService>.Instance),
         Mock.Of<IStripeRefundService>(),
         Mock.Of<IStripeTaxService>(),
         TimeProvider.System,
@@ -98,8 +100,9 @@ public class PaymentServiceDisputeTests(PostgresFixture postgres) : IClassFixtur
         var service = new PaymentService(
             context, Mock.Of<ICommunicationPublisher>(),
             new OrganizationLifecycleService(
-                context, Mock.Of<IPublishEndpoint>(), Mock.Of<ICommunicationPublisher>(), TimeProvider.System,
-                NullLogger<OrganizationLifecycleService>.Instance),
+                context, Mock.Of<IPublishEndpoint>(), Mock.Of<ICommunicationPublisher>(),
+                Mock.Of<ISubscriptionService>(), Mock.Of<IRoleCompressionService>(), Mock.Of<IUserContext>(),
+                TimeProvider.System, NullLogger<OrganizationLifecycleService>.Instance),
             stripeRefund.Object, Mock.Of<IStripeTaxService>(), TimeProvider.System, NullLogger<PaymentService>.Instance);
 
         await service.RecordDisputeAsync(providerPaymentId, "dp_test_1", "fraudulent", null);
