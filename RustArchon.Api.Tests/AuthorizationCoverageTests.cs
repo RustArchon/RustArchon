@@ -28,16 +28,30 @@ public class AuthorizationCoverageTests
     /// Endpoints that are deliberately reachable without authentication.
     /// </summary>
     /// <remarks>
+    /// <para>
     /// Each is a decision, listed so a reviewer sees it. Registration and invitation redemption both
     /// run before an account exists; the public plan list is what the marketing site renders; the
     /// public branding endpoint is the platform's own name/URL, which a nav bar (and the login page it
     /// renders on) needs before anyone is signed in.
+    /// </para>
+    /// <para>
+    /// <c>PublicTicketingConfigController</c> is the same shape as <c>PublicBrandingController</c> - a
+    /// narrow, non-secret config slice the marketing site's contact form needs before anyone is signed
+    /// in. <c>TicketSubmissionController</c> is that form's actual submission - the caller has no
+    /// account by definition, guarded instead by a honeypot, a per-IP rate limit
+    /// (<c>"ticket-submission"</c> in <c>Program.cs</c>), and a captcha check. <c>GuestTicketController</c>
+    /// is an anonymous submitter's own access to their one ticket afterward - gated by the unguessable
+    /// <c>Ticket.GuestAccessToken</c> in the URL, not by anything this scan can see.
+    /// </para>
     /// </remarks>
     private static readonly string[] DeliberatelyAnonymous =
     [
         "InvitationsController",
         "PublicPlansController",
-        "PublicBrandingController"
+        "PublicBrandingController",
+        "PublicTicketingConfigController",
+        "TicketSubmissionController",
+        "GuestTicketController"
     ];
 
     /// <summary>
@@ -64,6 +78,14 @@ public class AuthorizationCoverageTests
     private static readonly string[] AuthenticatedOnlyByDesign =
     [
         "AccountBootstrapController.EnsureTenant",
+
+        // Same bootstrap circularity as EnsureTenant just above, for the same reason: this runs from
+        // Register.razor's static form-post handler, before any Blazor circuit (and so before the
+        // normal circuit-scoped JWT machinery) exists, off a bare identity-assertion token with no
+        // tenant_id or Permission claim to check. What gates it instead is the unguessable
+        // GuestAccessToken plus a matching verified email - see ClaimTicket's own remarks.
+        "AccountBootstrapController.ClaimTicket",
+
         "InvitationAcceptanceController.Accept",
 
         // Creating an Organization of your own, and the two reads its screen needs. The same
