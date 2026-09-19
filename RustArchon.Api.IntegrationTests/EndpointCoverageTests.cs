@@ -65,6 +65,26 @@ public class EndpointCoverageTests(ApiFactory factory) : IClassFixture<ApiFactor
         // The platform's own name and public site URL - the nav bar (and the login page it renders
         // on) needs this before anyone is signed in. See PublicBrandingController.
         "PublicBranding.Get",
+
+        // The marketing site's contact form has to know which captcha widget to load, and which
+        // queues to offer, before the visitor has any identity at all. Exposes only the provider
+        // name, the widget's public site key and each active queue's display fields - never the
+        // secret key, and never the platform settings table. Same shape as PublicBranding.Get.
+        "PublicTicketingConfig.Get",
+
+        // Submitting a ticket without an account is what the contact form is for. Three defences,
+        // cheapest first, all checked by TicketingPublicEndpointTests: a honeypot field, a per-IP
+        // rate limit (the "ticket-submission" policy), and a captcha whenever the platform has a
+        // provider configured. Creates one ticket and queues one email, and reads nothing back.
+        "TicketSubmission.Submit",
+
+        // A submitter looking at, and replying to, their own ticket. The token in the URL is the
+        // credential: 256 random bits, and GetByGuestAccessTokenAsync also refuses one past its
+        // expiry, so an unknown, expired or guessed token is a plain 404 that reveals nothing.
+        // Never exposes staff notes, and replies go through the same TicketReplyPolicy as a
+        // signed-in customer's.
+        "GuestTicket.Get",
+        "GuestTicket.AddMessage",
     };
 
     /// <summary>
@@ -89,6 +109,13 @@ public class EndpointCoverageTests(ApiFactory factory) : IClassFixture<ApiFactor
         // hold. What gates it instead is the token plus a signed-in account whose address matches
         // the one the invitation was sent to.
         "InvitationAcceptance.Accept",
+
+        // Relinking a guest ticket to the account its submitter has just created. Runs from
+        // Register.razor straight after sign-up, on the same short-lived identity-assertion token
+        // EnsureTenant uses - so, like EnsureTenant, the caller cannot yet hold a permission. What
+        // gates it instead is proof of ownership (the ticket's guest token) plus a verified email
+        // that matches the address the ticket was submitted from.
+        "AccountBootstrap.ClaimTicket",
 
         // Creating an Organization of your own, and the two reads the screen that does it needs.
         // Same shape again: the Organization does not exist yet, so there is nothing to hold a
