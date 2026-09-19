@@ -76,6 +76,7 @@ public class RustServersControllerDuplicateNameTests(PostgresFixture postgres) :
             Mock.Of<IPlayerKillEventRepository>(),
             Mock.Of<IServerInfoSnapshotRepository>(),
             Mock.Of<IConnectionLogRepository>(),
+            Mock.Of<IServerPluginRepository>(),
             subscriptionRepository.Object);
     }
 

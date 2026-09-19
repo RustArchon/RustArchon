@@ -22,23 +22,15 @@ using RustArchon.Shared.DTOs;
 namespace RustArchon.Panel.Tests;
 
 /// <summary>
-/// Regression coverage for <c>ServerDetail.OnLogEntryReceived</c>'s insertion-ordering fix: a live
-/// log entry delivered out of chronological order (an older <c>OccurredAtUtc</c> arriving after a
-/// newer one - see that handler's own remarks on why two valid transitions can race) must still land
-/// in the right spot in the displayed list, not wherever it happened to arrive.
+/// The Plugins tab on <c>ServerDetail</c>: it lists what the Api has stored for the server - name,
+/// author, version - and says so plainly when there is nothing to list or the fetch fails.
 /// </summary>
-/// <remarks>
-/// Drives this through a real render rather than calling the private handler directly, so this also
-/// exercises the actual <c>IRconHubClient.LogEntryReceived</c> subscription wiring and the Logs tab's
-/// markup - not just the list-mutation logic in isolation.
-/// </remarks>
-public class ServerDetailLogOrderingTests : BunitContext
+public class ServerDetailPluginsTabTests : BunitContext
 {
     private readonly Mock<IRustServerApiClient> _rustServerClient = new();
-    private readonly Mock<IRconHubClient> _hubClient = new();
     private readonly Guid _serverId = Guid.NewGuid();
 
-    public ServerDetailLogOrderingTests()
+    public ServerDetailPluginsTabTests()
     {
         JSInterop.Mode = JSRuntimeMode.Loose;
 
@@ -71,15 +63,12 @@ public class ServerDetailLogOrderingTests : BunitContext
         _rustServerClient
             .Setup(c => c.GetConnectionLogAsync(_serverId, It.IsAny<DateTimeOffset?>(), It.IsAny<DateTimeOffset?>()))
             .ReturnsAsync([]);
-        _rustServerClient.Setup(c => c.GetPluginsAsync(_serverId)).ReturnsAsync([]);
-        // Covers both LoadBanListAsync's global.banlistex and LoadLiveServerInfoAsync's serverinfo -
-        // a clean "the command failed" response is enough for both to settle into their own error
-        // state without throwing; neither is what this test is about.
         _rustServerClient
             .Setup(c => c.SendCommandAsync(_serverId, It.IsAny<SendCommandRequest>()))
             .ReturnsAsync(new RconCommandResult(false, null, null, null, null));
 
-        _hubClient.Setup(h => h.ConnectAsync(_serverId)).Returns(Task.CompletedTask);
+        var hubClient = new Mock<IRconHubClient>();
+        hubClient.Setup(h => h.ConnectAsync(_serverId)).Returns(Task.CompletedTask);
 
         var tokenStore = new Mock<ITokenStore>();
         tokenStore.Setup(t => t.GetToken()).Returns((string?)null);
@@ -92,7 +81,7 @@ public class ServerDetailLogOrderingTests : BunitContext
             .Returns((string key) => new LocalizedString(key, key));
 
         Services.AddSingleton(_rustServerClient.Object);
-        Services.AddSingleton(_hubClient.Object);
+        Services.AddSingleton(hubClient.Object);
         Services.AddSingleton(tokenStore.Object);
         Services.AddSingleton(new SiteBrandingService(valkeyCache.Object, new Mock<ISiteBrandingApiClient>().Object));
         Services.AddSingleton(localizer.Object);
@@ -100,35 +89,63 @@ public class ServerDetailLogOrderingTests : BunitContext
         AddAuthorization().SetAuthorized("test-admin");
     }
 
-    [Fact]
-    public void LogEntriesArrivingOutOfOrder_AreDisplayedOldestFirst()
+    private IRenderedComponent<ServerDetail> RenderPluginsTab()
     {
-        // TabQuery is [SupplyParameterFromQuery] - bUnit can only feed it through the current URI,
-        // not through the parameter builder (that throws), so the Logs tab is selected by navigating
-        // the fake NavigationManager before rendering, same as a real "?tab=logs" link would.
-        var navigationManager = Services.GetRequiredService<NavigationManager>();
-        navigationManager.NavigateTo($"/servers/{_serverId}?tab=logs");
+        // TabQuery is [SupplyParameterFromQuery] - see ServerDetailLogOrderingTests for why the tab is
+        // chosen by navigating the fake NavigationManager rather than through the parameter builder.
+        Services.GetRequiredService<NavigationManager>().NavigateTo($"/servers/{_serverId}?tab=plugins");
+        return Render<ServerDetail>(parameters => parameters.Add(p => p.Id, _serverId));
+    }
 
-        var cut = Render<ServerDetail>(parameters => parameters
-            .Add(p => p.Id, _serverId));
+    private static ServerPluginDto Plugin(string name, string author, string version, ServerModFramework framework) =>
+        new() { Name = name, Author = author, Version = version, Framework = framework, CapturedAtUtc = DateTimeOffset.UtcNow };
 
-        var baseline = DateTimeOffset.UtcNow;
+    [Fact]
+    public void ListsEachPluginsNameAuthorAndVersion()
+    {
+        _rustServerClient.Setup(c => c.GetPluginsAsync(_serverId)).ReturnsAsync(
+        [
+            Plugin("Better Chat", "LaserHydra", "5.2.14", ServerModFramework.Carbon),
+            Plugin("Kits", "Gachl", "4.0.0", ServerModFramework.Carbon)
+        ]);
 
-        // Delivered second-arrives-first-chronologically, then earliest, then latest - none of the
-        // three arrive in the order their own timestamps would sort into.
-        RaiseLogEntry("second", baseline.AddSeconds(10));
-        RaiseLogEntry("first", baseline);
-        RaiseLogEntry("third", baseline.AddSeconds(20));
+        var cut = RenderPluginsTab();
 
         cut.WaitForAssertion(() =>
         {
-            var messages = cut.FindAll(".connection-log-detail").Select(e => e.TextContent.Trim()).ToList();
-            Assert.Equal(["first", "second", "third"], messages);
+            var rows = cut.FindAll(".plugins-pane tbody tr")
+                .Select(tr => tr.QuerySelectorAll("td").Select(td => td.TextContent.Trim()).ToArray())
+                .ToList();
+
+            Assert.Equal(2, rows.Count);
+            Assert.Equal(["Better Chat", "LaserHydra", "5.2.14"], rows[0]);
+            Assert.Equal(["Kits", "Gachl", "4.0.0"], rows[1]);
+        });
+        Assert.Contains("Carbon", cut.Find(".plugins-pane .badge").TextContent);
+    }
+
+    [Fact]
+    public void NoPlugins_ShowsTheEmptyState()
+    {
+        _rustServerClient.Setup(c => c.GetPluginsAsync(_serverId)).ReturnsAsync([]);
+
+        var cut = RenderPluginsTab();
+
+        cut.WaitForAssertion(() =>
+        {
+            Assert.Empty(cut.FindAll(".plugins-pane table"));
+            Assert.Contains("No Oxide or Carbon plugins have been reported", cut.Find(".plugins-pane .console-empty").TextContent);
         });
     }
 
-    private void RaiseLogEntry(string message, DateTimeOffset occurredAtUtc) =>
-        _hubClient.Raise(
-            h => h.LogEntryReceived += null,
-            _serverId, ConnectionLogLevel.Info, message, (RconConnectionStatus?)null, occurredAtUtc);
+    [Fact]
+    public void AFailedFetch_ShowsAnErrorInsteadOfAnEmptyList()
+    {
+        _rustServerClient.Setup(c => c.GetPluginsAsync(_serverId)).ThrowsAsync(new InvalidOperationException("boom"));
+
+        var cut = RenderPluginsTab();
+
+        cut.WaitForAssertion(() =>
+            Assert.Contains("Failed to load the plugin list.", cut.Find(".plugins-pane .alert").TextContent));
+    }
 }

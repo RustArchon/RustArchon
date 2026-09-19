@@ -68,6 +68,7 @@ public class RustServersControllerGetEventsFilteringTests
             Mock.Of<IPlayerKillEventRepository>(),
             Mock.Of<IServerInfoSnapshotRepository>(),
             Mock.Of<IConnectionLogRepository>(),
+            Mock.Of<IServerPluginRepository>(),
             subscriptionRepository);
 
         // ControllerBase.User reads through ControllerContext.HttpContext.User - not set by the
