@@ -480,4 +480,61 @@ public class PluginUpdateServiceTests
         Assert.Equal("not_signed_by_this_panel", (await Create().StartAsync(Server())).Code);
         AssertNothingHappened();
     }
+
+    // ---- the token in a header (Updater 0.3.0 and later) --------------------------------------------------
+
+    [Theory]
+    [InlineData("v0.3.0")]
+    [InlineData("0.3.1")]
+    [InlineData("v0.10.0")]      // compared as numbers, not text: 0.10.0 is newer than 0.3.0
+    [InlineData("v1.0.0")]
+    public async Task AnUpdaterThatCanSendTheTokenInAHeaderIsGivenItAsAThirdArgumentAndAnAddressWithNoCredential(string updaterVersion)
+    {
+        GivenServerOnKey(PanelKey, PluginKeyState.Active, updaterVersion);
+
+        var result = await Create().StartAsync(Server());
+
+        Assert.True(result.Started);
+        var command = Assert.Single(_sent).Command;
+        Assert.Equal("archon.update 0.2.1 http://192.168.0.46:5200/ingest/plugin TOKEN123", command);
+        Assert.DoesNotContain(ServerId.ToString(), command);
+    }
+
+    [Theory]
+    [InlineData("v0.2.0")]
+    [InlineData("0.2.9")]
+    [InlineData("v0.1.0")]
+    [InlineData(null)]           // a version the Updater never reported: the old form works everywhere
+    [InlineData("junk")]
+    public async Task AnOlderOrUnknownUpdaterIsStillGivenTheTokenInTheAddress(string? updaterVersion)
+    {
+        GivenServerOnKey(PanelKey, PluginKeyState.Active, updaterVersion!);
+
+        await Create().StartAsync(Server());
+
+        Assert.Equal($"archon.update 0.2.1 http://192.168.0.46:5200/ingest/plugin/{ServerId}/TOKEN123", Assert.Single(_sent).Command);
+    }
+
+    [Fact]
+    public async Task TheHeaderFormIsBuiltFromThePanelBaseLikeTheOtherOne()
+    {
+        GivenServerOnKey(PanelKey, PluginKeyState.Active, "v0.3.0");
+        _settings.Setup(s => s.GetStringAsync(PlatformSettingsRegistry.PanelBaseUrl)).ReturnsAsync("https://panel.example.com/rustarchon/?x=1#frag");
+
+        await Create().StartAsync(Server());
+
+        Assert.Equal("archon.update 0.2.1 https://panel.example.com/rustarchon/ingest/plugin TOKEN123", Assert.Single(_sent).Command);
+    }
+
+    [Fact]
+    public async Task TheHeaderFormStillThrowsTheTokenAwayIfTheUpdaterRefuses()
+    {
+        GivenServerOnKey(PanelKey, PluginKeyState.Active, "v0.3.0");
+        GivenUpdaterReplies("{\"v\":1,\"ok\":false,\"err\":\"bad_token\",\"message\":\"no\"}");
+
+        var result = await Create().StartAsync(Server());
+
+        Assert.False(result.Started);
+        _tokens.Verify(t => t.RevokeAsync("TOKEN123"), Times.Once);
+    }
 }

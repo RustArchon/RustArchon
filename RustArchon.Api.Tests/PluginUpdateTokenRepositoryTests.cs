@@ -305,4 +305,86 @@ public class PluginUpdateTokenRepositoryTests(PostgresFixture postgres) : IClass
 
         Assert.Null(await repository.RedeemAsync(serverId, token));
     }
+
+    // ---- redeeming without naming the server (the header form) ---------------------------------------------
+
+    [Fact]
+    public async Task ATokenRedeemedByItselfSaysWhichServerAndKeyItWasMintedFor()
+    {
+        await using var context = CreateContext();
+        var tenant = await SeedTenantAsync(context);
+        var serverId = Guid.NewGuid();
+        var repository = new PluginUpdateTokenRepository(context, new TestClock(Start));
+        var token = await repository.MintAsync(tenant, serverId, Fingerprint, Lifetime);
+
+        var redemption = await repository.RedeemAsync(token);
+
+        Assert.NotNull(redemption);
+        Assert.Equal(serverId, redemption!.RustServerId);
+        Assert.Equal(Fingerprint, redemption.SigningKeyFingerprint);
+    }
+
+    [Fact]
+    public async Task ATokenRedeemedByItselfWorksExactlyOnceAndNotAgainByServer()
+    {
+        await using var context = CreateContext();
+        var tenant = await SeedTenantAsync(context);
+        var serverId = Guid.NewGuid();
+        var repository = new PluginUpdateTokenRepository(context, new TestClock(Start));
+        var token = await repository.MintAsync(tenant, serverId, Fingerprint, Lifetime);
+
+        Assert.NotNull(await repository.RedeemAsync(token));
+        Assert.Null(await repository.RedeemAsync(token));
+        Assert.Null(await repository.RedeemAsync(serverId, token));      // one use, whichever way it is presented
+    }
+
+    [Fact]
+    public async Task ATokenUsedWithTheServerNamedCannotBeUsedAgainByItself()
+    {
+        await using var context = CreateContext();
+        var tenant = await SeedTenantAsync(context);
+        var serverId = Guid.NewGuid();
+        var repository = new PluginUpdateTokenRepository(context, new TestClock(Start));
+        var token = await repository.MintAsync(tenant, serverId, Fingerprint, Lifetime);
+
+        Assert.NotNull(await repository.RedeemAsync(serverId, token));
+        Assert.Null(await repository.RedeemAsync(token));
+    }
+
+    [Fact]
+    public async Task AnExpiredTokenRedeemedByItselfIsRefused()
+    {
+        await using var context = CreateContext();
+        var tenant = await SeedTenantAsync(context);
+        var clock = new TestClock(Start);
+        var repository = new PluginUpdateTokenRepository(context, clock);
+        var token = await repository.MintAsync(tenant, Guid.NewGuid(), Fingerprint, Lifetime);
+        clock.Now = Start + Lifetime + TimeSpan.FromSeconds(1);
+
+        Assert.Null(await repository.RedeemAsync(token));
+    }
+
+    [Theory]
+    [InlineData("")]
+    [InlineData("not-a-token-we-ever-minted")]
+    public async Task AnUnknownOrEmptyTokenRedeemedByItselfIsRefused(string token)
+    {
+        await using var context = CreateContext();
+        var repository = new PluginUpdateTokenRepository(context, new TestClock(Start));
+
+        Assert.Null(await repository.RedeemAsync(token));
+    }
+
+    [Fact]
+    public async Task ARevokedTokenRedeemedByItselfIsRefused()
+    {
+        await using var context = CreateContext();
+        var tenant = await SeedTenantAsync(context);
+        var repository = new PluginUpdateTokenRepository(context, new TestClock(Start));
+        var token = await repository.MintAsync(tenant, Guid.NewGuid(), Fingerprint, Lifetime);
+
+        await repository.RevokeAsync(token);
+
+        Assert.Null(await repository.RedeemAsync(token));
+    }
 }

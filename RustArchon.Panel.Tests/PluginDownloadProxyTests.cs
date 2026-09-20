@@ -160,4 +160,77 @@ public class PluginDownloadProxyTests
 
         Assert.Equal(1, handler.Calls);
     }
+
+    // ---- the header form (Updater 0.3.0 and later) ---------------------------------------------------------
+
+    private static async Task<(IResult Result, HttpContext Http)> RunHeaderAsync(StubHandler handler, string? token)
+    {
+        var http = new DefaultHttpContext();
+        http.Response.Body = new MemoryStream();
+        if (token is not null) { http.Request.Headers["X-RustArchon-Update-Token"] = token; }
+        var result = await PluginDownloadProxy.HandleHeaderTokenAsync(http.Request, Client(handler), http.Response, CancellationToken.None);
+        return (result, http);
+    }
+
+    [Fact]
+    public async Task TheHeaderFormPassesTheExactBytesThroughAndForwardsTheTokenInTheSameHeaderNotTheAddress()
+    {
+        var bytes = new byte[] { 0xEF, 0xBB, 0xBF, 0x0D, 0x0A, 0x0A, 0xC3, 0xA9, 0x00, 0xFF };
+        var handler = new StubHandler(_ => Ok(bytes));
+
+        var (result, http) = await RunHeaderAsync(handler, "good-token_123");
+
+        var file = Assert.IsType<FileContentHttpResult>(result);
+        Assert.Equal(bytes, file.FileContents.ToArray());
+        Assert.Equal("/internal/plugin/download", handler.Request!.RequestUri!.AbsolutePath);
+        Assert.DoesNotContain("good-token_123", handler.Request.RequestUri.ToString());
+        Assert.Equal("good-token_123", Assert.Single(handler.Request.Headers.GetValues("X-RustArchon-Update-Token")));
+        Assert.Equal("0.2.1", http.Response.Headers["X-RustArchon-Plugin-Version"]);
+        Assert.Equal("no-store", http.Response.Headers.CacheControl.ToString());
+    }
+
+    [Theory]
+    [InlineData(null)]
+    [InlineData("")]
+    public async Task ANullOrEmptyHeaderIsRefusedWithoutCallingApi(string? token)
+    {
+        var handler = new StubHandler(_ => Ok([1]));
+
+        var (result, http) = await RunHeaderAsync(handler, token);
+
+        Assert.IsType<NotFound>(result);
+        Assert.Equal(0, handler.Calls);
+        Assert.Equal("no-store", http.Response.Headers.CacheControl.ToString());
+    }
+
+    [Fact]
+    public async Task AnOversizedHeaderIsRefusedWithoutCallingApi()
+    {
+        var handler = new StubHandler(_ => Ok([1]));
+
+        var (result, _) = await RunHeaderAsync(handler, new string('a', PluginDownloadProxy.MaxTokenLength + 1));
+
+        Assert.IsType<NotFound>(result);
+        Assert.Equal(0, handler.Calls);
+    }
+
+    [Theory]
+    [InlineData(HttpStatusCode.NotFound)]
+    [InlineData(HttpStatusCode.Unauthorized)]
+    [InlineData(HttpStatusCode.ServiceUnavailable)]
+    [InlineData(HttpStatusCode.InternalServerError)]
+    public async Task EveryRefusalFromApiIsTheSameBareNotFound(HttpStatusCode status)
+    {
+        var (result, _) = await RunHeaderAsync(new StubHandler(_ => new HttpResponseMessage(status)), "some-token");
+
+        Assert.IsType<NotFound>(result);
+    }
+
+    [Fact]
+    public async Task AnUnreachableApiIsABareNotFound()
+    {
+        var (result, _) = await RunHeaderAsync(new StubHandler(_ => throw new HttpRequestException("down")), "some-token");
+
+        Assert.IsType<NotFound>(result);
+    }
 }

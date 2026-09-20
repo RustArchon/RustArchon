@@ -108,7 +108,7 @@ public sealed class ApiBridgeContractTests : IDisposable
         return match.Groups[1].Value;
     }
 
-    private RustArchonUpdater NewUpdater(byte[] updaterFile, Func<string, byte[]> download)
+    private RustArchonUpdater NewUpdater(byte[] updaterFile, Func<string, string?, byte[]> download)
     {
         var text = Encoding.UTF8.GetString(updaterFile);
         var updater = new RustArchonUpdater
@@ -147,7 +147,7 @@ public sealed class ApiBridgeContractTests : IDisposable
         var oldFingerprint = await RotateAsync(deployment);
 
         var bridge = await deployment.Scripts().BuildBridgeAsync(oldFingerprint);
-        var updater = NewUpdater(updaterFile, _ => bridge.Bytes);
+        var updater = NewUpdater(updaterFile, (_, _) => bridge.Bytes);
         await RunUpdateAsync(updater, bridge.PluginVersion!);
 
         Assert.Equal("loading", updater.State.Phase);
@@ -172,7 +172,7 @@ public sealed class ApiBridgeContractTests : IDisposable
 
         // The server still trusts the FIRST key. One bridge, signed with the first, embedding the third.
         var bridge = await deployment.Scripts().BuildBridgeAsync(first);
-        var updater = NewUpdater(updaterFile, _ => bridge.Bytes);
+        var updater = NewUpdater(updaterFile, (_, _) => bridge.Bytes);
         await RunUpdateAsync(updater, bridge.PluginVersion!);
         Assert.Equal("loading", updater.State.Phase);
         Assert.Equal("valid", ArchonIntegrity.Check(File.ReadAllBytes(MainPath), activeKey.ModulusBase64, activeKey.ExponentBase64).State);
@@ -184,7 +184,7 @@ public sealed class ApiBridgeContractTests : IDisposable
         Assert.Equal("succeeded", updater.State.Phase);
 
         var next = await deployment.Scripts("9.0.0").BuildAsync();
-        var second = NewUpdater(updaterFile, _ => next.Bytes);
+        var second = NewUpdater(updaterFile, (_, _) => next.Bytes);
         await RunUpdateAsync(second, "9.0.0");
         Assert.Equal("loading", second.State.Phase);
     }
@@ -222,7 +222,7 @@ public sealed class ApiBridgeContractTests : IDisposable
         var bFingerprint = await RotateAsync(panelB);
         var foreign = await panelB.Scripts().BuildBridgeAsync(bFingerprint);
 
-        var updater = NewUpdater(updaterFile, _ => foreign.Bytes);
+        var updater = NewUpdater(updaterFile, (_, _) => foreign.Bytes);
         await RunUpdateAsync(updater, foreign.PluginVersion!);
 
         Assert.Equal("failed", updater.State.Phase);

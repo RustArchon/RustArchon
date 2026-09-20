@@ -99,7 +99,7 @@ public sealed class ApiToUpdaterContractTests : IDisposable
             UtcNow = () => _now,
             TrustedModulus = Extract(updaterText, "TrustedModulus"),
             TrustedExponent = Extract(updaterText, "TrustedExponent"),
-            Download = _ => newMain
+            Download = (_, _) => newMain
         };
         typeof(RustArchonUpdater).GetMethod("Init", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)!
             .Invoke(updater, null);
