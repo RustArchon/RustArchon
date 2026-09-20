@@ -14,6 +14,7 @@ using Microsoft.Extensions.Logging.Abstractions;
 using Moq;
 using RustArchon.Api.Controllers;
 using RustArchon.Api.Data;
+using RustArchon.Api.Infrastructure;
 using RustArchon.Api.Infrastructure.Security;
 using RustArchon.Api.Mapping;
 using RustArchon.Api.Repositories;
@@ -77,6 +78,9 @@ public class RustServersControllerDuplicateNameTests(PostgresFixture postgres) :
             Mock.Of<IServerInfoSnapshotRepository>(),
             Mock.Of<IConnectionLogRepository>(),
             Mock.Of<IServerPluginRepository>(),
+            Mock.Of<IServerPluginStatusRepository>(),
+            Mock.Of<IPluginScriptService>(),
+            Mock.Of<IPluginUpdateService>(),
             subscriptionRepository.Object);
     }
 
