@@ -260,4 +260,88 @@ public class PluginAdminControllerTests(PostgresFixture postgres) : IClassFixtur
         Assert.Equal(["k4", "k3", "k2"], three.Select(e => e.Subject).ToArray());
         Assert.Single(clamped); // a nonsense limit is clamped to 1, not passed to the database
     }
+
+    // ---- exporting and importing keys ----------------------------------------------------------------------
+
+    [Fact]
+    public async Task ExportingReturnsTheBundleAsANeverCachedJsonFileAttributedToTheAdmin()
+    {
+        _keys.Setup(k => k.ExportAsync("a long enough passphrase", "admin@example.com"))
+            .ReturnsAsync(new PluginKeyExport("rustarchon-signing-keys-abc.json", "{\"format\":\"x\"}", ["1111111111111111"]));
+        var controller = Create();
+
+        var result = await controller.ExportKeys(new ExportPluginKeysRequestDto { Passphrase = "a long enough passphrase" });
+
+        var file = Assert.IsType<FileContentResult>(result);
+        Assert.Equal("application/json", file.ContentType);
+        Assert.Equal("rustarchon-signing-keys-abc.json", file.FileDownloadName);
+        Assert.Equal("{\"format\":\"x\"}", Encoding.UTF8.GetString(file.FileContents));
+        Assert.Equal("no-store", controller.Response.Headers.CacheControl.ToString());
+    }
+
+    [Fact]
+    public async Task ARefusedExportIsAPlainSentenceNotAFile()
+    {
+        _keys.Setup(k => k.ExportAsync(It.IsAny<string>(), It.IsAny<string>()))
+            .ThrowsAsync(new PluginKeyOperationException("passphrase_weak", "The passphrase must be 12 to 256 characters."));
+
+        var result = await Create().ExportKeys(new ExportPluginKeysRequestDto { Passphrase = "short" });
+
+        Assert.Equal("The passphrase must be 12 to 256 characters.", Assert.IsType<BadRequestObjectResult>(result).Value);
+    }
+
+    [Fact]
+    public async Task ImportingPassesTheBundleThePassphraseTheFlagsAndTheAdminAndMapsThePlan()
+    {
+        _keys.Setup(k => k.ImportAsync("{bundle}", "a long enough passphrase", true, true, "admin@example.com", "sync"))
+            .ReturnsAsync(new PluginKeyImportResult(true,
+                [new PluginKeyImportItem("2222222222222222", PluginKeyState.Active, "activated"), new PluginKeyImportItem("1111111111111111", null, "previous_active_retired")],
+                "1111111111111111", "2222222222222222"));
+
+        var result = await Create().ImportKeys(new ImportPluginKeysRequestDto
+        {
+            Bundle = "{bundle}", Passphrase = "a long enough passphrase", ActivateBundleKey = true, DryRun = true, Note = "sync"
+        });
+
+        var dto = Assert.IsType<PluginKeyImportResultDto>(Assert.IsType<OkObjectResult>(result.Result).Value);
+        Assert.True(dto.DryRun);
+        Assert.True(dto.ChangesActiveKey);
+        Assert.True(dto.ChangesAnything);
+        Assert.Equal(("1111111111111111", "2222222222222222"), (dto.ActiveBefore, dto.ActiveAfter));
+        Assert.Equal(("2222222222222222", "active", "activated"), (dto.Items[0].Fingerprint, dto.Items[0].BundleState, dto.Items[0].Action));
+        Assert.Equal(string.Empty, dto.Items[1].BundleState);                       // a key here that the file does not mention
+    }
+
+    [Theory]
+    [InlineData("bundle_unreadable")]
+    [InlineData("revoked_in_bundle_active_here")]
+    [InlineData("concurrent_change")]
+    public async Task ARefusedImportIsAPlainSentence(string code)
+    {
+        _keys.Setup(k => k.ImportAsync(It.IsAny<string>(), It.IsAny<string>(), It.IsAny<bool>(), It.IsAny<bool>(), It.IsAny<string>(), It.IsAny<string?>()))
+            .ThrowsAsync(new PluginKeyOperationException(code, "a sentence for " + code));
+
+        var result = await Create().ImportKeys(new ImportPluginKeysRequestDto { Bundle = "{}", Passphrase = "a long enough passphrase" });
+
+        Assert.Equal("a sentence for " + code, Assert.IsType<BadRequestObjectResult>(result.Result).Value);
+    }
+
+    [Fact]
+    public void ImportingHasARequestSizeLimitSoABogusFileCannotBeAnyBiggerThanABundle()
+    {
+        var limit = typeof(PluginAdminController).GetMethod(nameof(PluginAdminController.ImportKeys))!.GetCustomAttribute<RequestSizeLimitAttribute>();
+
+        Assert.NotNull(limit);
+        Assert.True(PluginKeyBundle.MaxBundleBytes + 8192 < 1024 * 1024);           // the ceiling it is set from is far below a megabyte
+    }
+
+    [Fact]
+    public void TheRequestsThatCarryASecretAreNeverPartOfAnyResponseDto()
+    {
+        var responses = new[] { typeof(PluginKeyDto), typeof(PluginKeyImportResultDto), typeof(PluginKeyImportItemDto) };
+        var names = responses.SelectMany(t => t.GetProperties()).Select(p => p.Name);
+
+        Assert.DoesNotContain(names, n => n.Contains("Passphrase", StringComparison.OrdinalIgnoreCase));
+        Assert.DoesNotContain(names, n => n.Contains("Bundle", StringComparison.OrdinalIgnoreCase) && n != "BundleState");
+    }
 }
