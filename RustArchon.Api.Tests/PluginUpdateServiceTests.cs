@@ -32,6 +32,7 @@ public class PluginUpdateServiceTests
     private readonly Mock<IPluginUpdateTokenRepository> _tokens = new();
     private readonly Mock<IPlatformSettingsCache> _settings = new();
     private readonly Mock<IRequestClient<SendRconCommand>> _client = new();
+    private readonly Mock<IPluginUpdateAttemptRepository> _attempts = new();
     private readonly List<SendRconCommand> _sent = [];
 
     public PluginUpdateServiceTests()
@@ -48,8 +49,8 @@ public class PluginUpdateServiceTests
     }
 
     private PluginUpdateService Create() =>
-        new(_statuses.Object, _plugins.Object, _script.Object, _tokens.Object, _settings.Object, _client.Object,
-            NullLogger<PluginUpdateService>.Instance);
+        new(_statuses.Object, _plugins.Object, _script.Object, _tokens.Object, _settings.Object, _client.Object, _attempts.Object,
+            TimeProvider.System, NullLogger<PluginUpdateService>.Instance);
 
     private static RustServer Server(bool enabled = true, bool updates = true) =>
         new() { Id = ServerId, TenantId = TenantId, IsEnabled = enabled, PluginUpdatesEnabled = updates };
@@ -65,7 +66,7 @@ public class PluginUpdateServiceTests
         });
 
     private void GivenPlugins(params string[] names) =>
-        _plugins.Setup(r => r.GetForServerAsync(ServerId)).ReturnsAsync(
+        _plugins.Setup(r => r.GetForServerAcrossTenantsAsync(TenantId, ServerId)).ReturnsAsync(
             names.Select(n => new ServerPlugin { Name = n, RustServerId = ServerId, TenantId = TenantId }).ToList());
 
     private void GivenUpdaterReplies(string message, bool success = true) =>
@@ -186,7 +187,7 @@ public class PluginUpdateServiceTests
     [Fact]
     public async Task ANullPluginListIsTreatedAsNoUpdater()
     {
-        _plugins.Setup(r => r.GetForServerAsync(ServerId)).ReturnsAsync((List<ServerPlugin>)null!);
+        _plugins.Setup(r => r.GetForServerAcrossTenantsAsync(TenantId, ServerId)).ReturnsAsync((List<ServerPlugin>)null!);
 
         var result = await Create().StartAsync(Server());
 
@@ -383,7 +384,7 @@ public class PluginUpdateServiceTests
         GivenStatus(fingerprint: fingerprint);
         _script.Setup(s => s.GetKeyStateAsync(It.Is<string>(f => string.Equals(f, fingerprint, StringComparison.OrdinalIgnoreCase))))
             .ReturnsAsync(state);
-        _plugins.Setup(r => r.GetForServerAsync(ServerId)).ReturnsAsync(
+        _plugins.Setup(r => r.GetForServerAcrossTenantsAsync(TenantId, ServerId)).ReturnsAsync(
         [
             new ServerPlugin { Name = RustArchonPlugin.Name, RustServerId = ServerId, TenantId = TenantId },
             new ServerPlugin { Name = RustArchonPlugin.UpdaterName, Version = updaterVersion, RustServerId = ServerId, TenantId = TenantId }
@@ -550,7 +551,7 @@ public class PluginUpdateServiceTests
         });
         _script.Setup(s => s.GetKeyStateAsync(It.Is<string>(f => string.Equals(f, fingerprint, StringComparison.OrdinalIgnoreCase)))).ReturnsAsync(keyState);
         _script.Setup(s => s.GetLatestUpdaterVersionAsync()).ReturnsAsync(latestUpdater);
-        _plugins.Setup(r => r.GetForServerAsync(ServerId)).ReturnsAsync(updaterVersion is null
+        _plugins.Setup(r => r.GetForServerAcrossTenantsAsync(TenantId, ServerId)).ReturnsAsync(updaterVersion is null
             ? [new ServerPlugin { Name = RustArchonPlugin.Name, RustServerId = ServerId, TenantId = TenantId }]
             :
             [
@@ -752,5 +753,80 @@ public class PluginUpdateServiceTests
         await Create().StartUpdaterAsync(Server());
 
         _tokens.Verify(t => t.RevokeAsync(It.IsAny<string>()), Times.Never);
+    }
+
+    // ---- attempts: what is recorded, and by whom -----------------------------------------------------------
+
+    [Fact]
+    public async Task AStartedPluginUpdateIsRecordedAsAManualAttemptByDefault()
+    {
+        await Create().StartAsync(Server());
+
+        _attempts.Verify(a => a.RecordStartedAsync(TenantId, ServerId, PluginUpdateKinds.Main, "0.2.0", "0.2.1", PluginUpdateTriggers.Manual, It.IsAny<DateTimeOffset>()), Times.Once);
+    }
+
+    [Fact]
+    public async Task AnAutomaticStartIsRecordedAsAutomatic()
+    {
+        await Create().StartAsync(Server(), PluginUpdateTriggers.Auto);
+
+        _attempts.Verify(a => a.RecordStartedAsync(TenantId, ServerId, PluginUpdateKinds.Main, "0.2.0", "0.2.1", PluginUpdateTriggers.Auto, It.IsAny<DateTimeOffset>()), Times.Once);
+    }
+
+    [Fact]
+    public async Task APluginThatRefusesTheVersionIsRecordedAsRefusedWithItsCode()
+    {
+        GivenUpdaterReplies("{\"v\":1,\"ok\":false,\"err\":\"signature_invalid\",\"message\":\"no\"}");
+
+        var result = await Create().StartAsync(Server(), PluginUpdateTriggers.Auto);
+
+        Assert.False(result.Started);
+        _attempts.Verify(a => a.RecordRefusedAsync(TenantId, ServerId, PluginUpdateKinds.Main, "0.2.0", "0.2.1", PluginUpdateTriggers.Auto, "signature_invalid", It.IsAny<DateTimeOffset>()), Times.Once);
+        _attempts.Verify(a => a.RecordStartedAsync(It.IsAny<Guid>(), It.IsAny<Guid>(), It.IsAny<string>(), It.IsAny<string>(), It.IsAny<string>(), It.IsAny<string>(), It.IsAny<DateTimeOffset>()), Times.Never);
+    }
+
+    [Theory]
+    [InlineData("busy")]
+    [InlineData("updater_missing")]
+    public async Task ARefusalThatSaysNothingAboutTheVersionIsNotRecordedSoItCanBeTriedAgain(string code)
+    {
+        GivenUpdaterReplies("{\"v\":1,\"ok\":false,\"err\":\"" + code + "\",\"message\":\"x\"}");
+
+        await Create().StartAsync(Server());
+
+        _attempts.VerifyNoOtherCalls();
+    }
+
+    [Fact]
+    public async Task ARefusalTheServiceMakesItselfOrAnUnreachableServerIsNotAnAttempt()
+    {
+        await Create().StartAsync(Server(updates: false));
+        GivenUpdaterReplies("", success: false);
+        await Create().StartAsync(Server());
+
+        _attempts.VerifyNoOtherCalls();
+    }
+
+    [Fact]
+    public async Task AStartedUpdaterUpdateIsRecordedWithTheUpdaterKindAndTrigger()
+    {
+        GivenUpdaterScenario();
+
+        await Create().StartUpdaterAsync(Server(), PluginUpdateTriggers.Auto);
+
+        _attempts.Verify(a => a.RecordStartedAsync(TenantId, ServerId, PluginUpdateKinds.Updater, "0.2.0", "0.3.0", PluginUpdateTriggers.Auto, It.IsAny<DateTimeOffset>()), Times.Once);
+    }
+
+    [Fact]
+    public async Task AnUpdaterRefusedByThePluginIsRecordedButATooOldPluginIsNot()
+    {
+        GivenUpdaterScenario();
+        GivenUpdaterReplies("{\"v\":1,\"ok\":false,\"err\":\"not_newer\",\"message\":\"x\"}");
+        await Create().StartUpdaterAsync(Server());
+        GivenUpdaterReplies("Unknown command: archon.updater.update");
+        await Create().StartUpdaterAsync(Server());
+
+        _attempts.Verify(a => a.RecordRefusedAsync(TenantId, ServerId, PluginUpdateKinds.Updater, "0.2.0", "0.3.0", PluginUpdateTriggers.Manual, "not_newer", It.IsAny<DateTimeOffset>()), Times.Once);
+        _attempts.Verify(a => a.RecordRefusedAsync(It.IsAny<Guid>(), It.IsAny<Guid>(), It.IsAny<string>(), It.IsAny<string>(), It.IsAny<string>(), It.IsAny<string>(), "plugin_too_old", It.IsAny<DateTimeOffset>()), Times.Never);
     }
 }

@@ -666,4 +666,88 @@ public class RustServersControllerPluginStatusTests(PostgresFixture postgres) : 
         Assert.Null(dto.UpdaterVersion);
         Assert.False(dto.UpdaterUpdateAvailable); // nothing installed to update: the ordinary "download the Updater" prompt applies
     }
+
+    // ---- the automatic-update switch ------------------------------------------------------------------------
+
+    [Fact]
+    public async Task AutoUpdateIsOffByDefault()
+    {
+        var h = await CreateHarnessAsync();
+        var id = await CreateServerAsync(h.Controller, "Auto default");
+
+        Assert.False(ServerFrom(await h.Controller.GetById(id)).PluginAutoUpdateEnabled);
+    }
+
+    [Fact]
+    public async Task AutoUpdateCanBeTurnedOnWhenUpdatesAreAllowedAndTurnedOffAgain()
+    {
+        var h = await CreateHarnessAsync();
+        var id = await CreateServerAsync(h.Controller, "Auto on");
+
+        var on = ServerFrom(await h.Controller.UpdatePluginSettings(id, new UpdateServerPluginSettingsDto { RecordingEnabled = true, CombatLogEnabled = true, UpdatesEnabled = true, AutoUpdateEnabled = true }));
+        var off = ServerFrom(await h.Controller.UpdatePluginSettings(id, new UpdateServerPluginSettingsDto { RecordingEnabled = true, CombatLogEnabled = true, UpdatesEnabled = true, AutoUpdateEnabled = false }));
+
+        Assert.True(on.PluginAutoUpdateEnabled);
+        Assert.False(off.PluginAutoUpdateEnabled);
+    }
+
+    [Fact]
+    public async Task AClientThatDoesNotSendTheAutoSwitchLeavesItAsItWas()
+    {
+        var h = await CreateHarnessAsync();
+        var id = await CreateServerAsync(h.Controller, "Auto omitted");
+        await h.Controller.UpdatePluginSettings(id, new UpdateServerPluginSettingsDto { RecordingEnabled = true, CombatLogEnabled = true, UpdatesEnabled = true, AutoUpdateEnabled = true });
+
+        var after = ServerFrom(await h.Controller.UpdatePluginSettings(id, Switches(recording: true, combat: true, updates: true)));      // no AutoUpdateEnabled
+
+        Assert.True(after.PluginAutoUpdateEnabled);
+    }
+
+    [Fact]
+    public async Task TurningUpdatesOffTurnsAutoUpdateOffWhateverIsSent()
+    {
+        var h = await CreateHarnessAsync();
+        var id = await CreateServerAsync(h.Controller, "Auto follows updates");
+        await h.Controller.UpdatePluginSettings(id, new UpdateServerPluginSettingsDto { RecordingEnabled = true, CombatLogEnabled = true, UpdatesEnabled = true, AutoUpdateEnabled = true });
+
+        var after = ServerFrom(await h.Controller.UpdatePluginSettings(id, new UpdateServerPluginSettingsDto { RecordingEnabled = true, CombatLogEnabled = true, UpdatesEnabled = false, AutoUpdateEnabled = true }));
+
+        Assert.False(after.PluginUpdatesEnabled);
+        Assert.False(after.PluginAutoUpdateEnabled);
+    }
+
+    [Fact]
+    public async Task AutoUpdateCannotBeTurnedOnWhileUpdatesAreOff()
+    {
+        var h = await CreateHarnessAsync();
+        var id = await CreateServerAsync(h.Controller, "Auto needs updates");
+
+        var after = ServerFrom(await h.Controller.UpdatePluginSettings(id, new UpdateServerPluginSettingsDto { RecordingEnabled = true, CombatLogEnabled = true, UpdatesEnabled = false, AutoUpdateEnabled = true }));
+
+        Assert.False(after.PluginAutoUpdateEnabled);
+    }
+
+    [Fact]
+    public async Task ChangingTheAutoSwitchAloneDoesNotTellThePlugin()
+    {
+        var h = await CreateHarnessAsync();
+        var id = await CreateServerAsync(h.Controller, "Auto is panel-side");
+        h.Publish.Invocations.Clear();
+
+        await h.Controller.UpdatePluginSettings(id, new UpdateServerPluginSettingsDto { RecordingEnabled = true, CombatLogEnabled = true, UpdatesEnabled = true, AutoUpdateEnabled = true });
+
+        h.Publish.Verify(p => p.Publish(It.IsAny<ServerPluginSettingsChanged>(), It.IsAny<CancellationToken>()), Times.Never);
+    }
+
+    [Fact]
+    public async Task AnOrdinaryServerEditNeverChangesTheAutoSwitch()
+    {
+        var h = await CreateHarnessAsync();
+        var id = await CreateServerAsync(h.Controller, "Auto survives edits");
+        await h.Controller.UpdatePluginSettings(id, new UpdateServerPluginSettingsDto { RecordingEnabled = true, CombatLogEnabled = true, UpdatesEnabled = true, AutoUpdateEnabled = true });
+
+        await h.Controller.Update(id, new UpdateRustServerDto { Name = "Renamed", Host = "192.0.2.9", Port = 28016 });
+
+        Assert.True(ServerFrom(await h.Controller.GetById(id)).PluginAutoUpdateEnabled);
+    }
 }

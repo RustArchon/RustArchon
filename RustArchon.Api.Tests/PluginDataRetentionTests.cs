@@ -490,4 +490,26 @@ public class PluginDataRetentionTests(PostgresFixture postgres) : IClassFixture<
         var left = await check.PluginUpdateNotices.AcrossAllTenants().Where(n => n.TenantId == tenant).Select(n => n.Name).ToListAsync();
         Assert.Equal(["Fresh"], left);
     }
+
+    [Fact]
+    public async Task OldSucceededUpdateAttemptsArePrunedButRefusalsAndFailuresAreKeptSoAVersionIsNotRetried()
+    {
+        var tenant = await TenantAsync(30);
+        await using (var context = PlatformContext())
+        {
+            foreach (var state in new[] { PluginUpdateAttemptStates.Succeeded, PluginUpdateAttemptStates.Failed, PluginUpdateAttemptStates.Refused, PluginUpdateAttemptStates.Started })
+            {
+                context.PluginUpdateAttempts.Add(new PluginUpdateAttempt { TenantId = tenant, RustServerId = Guid.NewGuid(), ToVersion = "1.0.0", State = state, StartedAtUtc = Now.AddDays(-90) });
+            }
+
+            context.PluginUpdateAttempts.Add(new PluginUpdateAttempt { TenantId = tenant, RustServerId = Guid.NewGuid(), ToVersion = "1.0.1", State = PluginUpdateAttemptStates.Succeeded, StartedAtUtc = Now.AddDays(-2) });
+            await context.SaveChangesAsync();
+        }
+
+        await PruneAsync();
+
+        await using var check = PlatformContext();
+        var left = await check.PluginUpdateAttempts.AcrossAllTenants().Where(a => a.TenantId == tenant).Select(a => a.State + ":" + a.ToVersion).ToListAsync();
+        Assert.Equal(["failed:1.0.0", "refused:1.0.0", "started:1.0.0", "succeeded:1.0.1"], left.Order().ToArray());
+    }
 }

@@ -609,6 +609,37 @@ update, so a bad Updater would have nothing to recover it. The answer is that ea
   and at 19:36:22 - 45 seconds after the swap - the main plugin logged `Updater update 0.3.1 rolled-back`, restored the backup and Carbon
   loaded Updater 0.3.0 again. Not exercised live: a fresh install (no Updater at all) and a main plugin that reloads mid-swap (both covered by tests).
 
+### Automatic updates (2026-09-20)
+
+Scott's decisions: an opt-in per-server switch (yes); **players being online is not a reason to wait** (a plugin reload is brief; the Worker collects what
+the plugin holds every 30 seconds, so at most about that much recorded data is lost); an update that failed is not retried in a loop but a *different*
+version is always tried (and bridges work as ever); a server on an older key is handled by the bridge, not skipped; release control is needed.
+
+- **Switches.** Per server: "Update automatically" (`RustServer.PluginAutoUpdateEnabled`, off by default, shown only while "Allow updates" is on and
+  turned off with it; the settings endpoint takes it as an *optional* field so a client that does not know about it cannot flip it). Site-wide: the
+  platform setting **Automatic plugin updates** (`PluginAutoUpdatesEnabled`, default on) stops every automatic update at once - the emergency stop.
+- **What it is.** `PluginAutoUpdater` (a background pass every 5 minutes, first one 3 minutes after the Api starts) presses the same buttons a person
+  does: `PluginUpdateService.StartAsync` / `StartUpdaterAsync` with trigger `auto`. Every check (signature, key, version, capability, token) is the
+  service's, so automation can never do what a click could not. It decides only when and in what order.
+- **Order.** Current key and a plugin that can update the Updater: the **Updater first**, then the plugin. An older key: the **plugin first** (that is the
+  bridge to the current key), the Updater after it on a later pass. One update at a time per server; the next waits until the last one's outcome is known
+  (the reported version changed, or ten minutes passed). At most five updates start per pass, so a release does not reach every server at once. Servers
+  whose plugin has not answered in 15 minutes are left alone.
+- **No loops.** `PluginUpdateAttempt` rows (also the audit trail of manual updates: kind, from, to, trigger, state, code, times) record every request that
+  reached a server: started, then succeeded (the version arrived) or failed (it did not - the new one was put back), or refused with the plugin's code.
+  A (kind, version) that is failed, refused or still pending on a server is not sent again until a different version is served. Refusals that say nothing
+  about the version (busy, plugin too old) and servers that could not be reached are not attempts and are simply tried again. Succeeded attempts are pruned
+  by plan retention; failures and refusals are kept so a bad version is not retried when the window passes.
+- **Release control.** The auto updater only ever follows *the version being served*: an uploaded release stays a draft until an administrator publishes it,
+  and withdrawing it returns to the embedded build (never a downgrade: nothing newer than installed means nothing to do). Plus the site-wide switch above.
+  Not built: staged roll-outs by percentage or delay after publishing.
+- **Panel.** The Plugins tab has the "Update automatically" switch under "Allow updates", and a "Recent updates" list (last five: automatic or manual,
+  plugin or Updater, versions, outcome in words, time).
+- **Tests.** Real Postgres for the updater (eligibility, order, one at a time, outcome resolution, failed and refused versions not retried, a fixed
+  release retried, an unreachable server retried, staggering, one server's failure not stopping the others, no downgrade, players online ignored),
+  the service's attempt recording, the settings endpoint (optional field, follows the updates switch), the attempts endpoint, retention, and the Panel.
+  Not yet run live.
+
 ### Phase 5 - Session replay UI (later)
 
 Not in the first delivery, but Phase 2 starts capturing so history exists when it ships. Needs Phase 3's map image

@@ -1954,4 +1954,167 @@ public class ServerDetailPluginCardTests : BunitContext
         Assert.Empty(cut.FindAll("[data-testid=plugin-update-updater]"));
         Assert.Empty(cut.FindAll("[data-testid=plugin-install-updater]"));
     }
+
+    // ---- updating automatically ----------------------------------------------------------------------------
+
+    private void GivenAutoSetup(bool updatesOn, bool autoOn = false)
+    {
+        GivenPluginListed();
+        GivenSignedByThisPanel();
+        GivenUpdates(available: false, updaterInstalled: true);
+        _server.PluginRecordingEnabled = true;
+        _server.PluginCombatLogEnabled = true;
+        _server.PluginUpdatesEnabled = updatesOn;
+        _server.PluginAutoUpdateEnabled = autoOn;
+        GivenHandshake();
+    }
+
+    [Fact]
+    public void TheAutomaticSwitchIsOnlyOfferedWhileUpdatesAreAllowed()
+    {
+        GivenAutoSetup(updatesOn: false);
+        var off = RenderPluginsTab();
+        off.WaitForAssertion(() => Assert.NotEmpty(off.FindAll("#plugin-updates")));
+        Assert.Empty(off.FindAll("#plugin-auto-update"));
+
+        GivenAutoSetup(updatesOn: true);
+        var on = RenderPluginsTab();
+        on.WaitForAssertion(() => Assert.NotEmpty(on.FindAll("#plugin-auto-update")));
+        Assert.False(on.Find("#plugin-auto-update").HasAttribute("checked"));
+    }
+
+    [Fact]
+    public void TheAutomaticSwitchReflectsTheSavedState()
+    {
+        GivenAutoSetup(updatesOn: true, autoOn: true);
+
+        var cut = RenderPluginsTab();
+
+        cut.WaitForAssertion(() => Assert.True(cut.Find("#plugin-auto-update").HasAttribute("checked")));
+    }
+
+    [Fact]
+    public void TurningTheAutomaticSwitchOnSendsItWithTheOtherSwitchesAtTheirSavedValues()
+    {
+        GivenAutoSetup(updatesOn: true);
+        UpdateServerPluginSettingsDto? sent = null;
+        _client.Setup(c => c.UpdatePluginSettingsAsync(_serverId, It.IsAny<UpdateServerPluginSettingsDto>()))
+            .Callback<Guid, UpdateServerPluginSettingsDto>((_, s) => sent = s)
+            .ReturnsAsync((Guid _, UpdateServerPluginSettingsDto s) => new RustServerDto
+            {
+                Id = _serverId, Name = "Test Server", Host = "127.0.0.1", Port = 28015, ConnectionStatus = RconConnectionStatus.Connected,
+                PluginRecordingEnabled = true, PluginCombatLogEnabled = true, PluginUpdatesEnabled = true, PluginAutoUpdateEnabled = s.AutoUpdateEnabled ?? false
+            });
+        var cut = RenderPluginsTab();
+        cut.WaitForAssertion(() => Assert.NotEmpty(cut.FindAll("#plugin-auto-update")));
+
+        cut.Find("#plugin-auto-update").Change(true);
+
+        cut.WaitForAssertion(() => Assert.NotNull(sent));
+        Assert.True(sent!.AutoUpdateEnabled);
+        Assert.True(sent.UpdatesEnabled);
+        Assert.True(sent.RecordingEnabled);
+        Assert.True(sent.CombatLogEnabled);
+    }
+
+    [Fact]
+    public void ChangingAnotherSwitchNeverSendsTheAutomaticOne()
+    {
+        GivenAutoSetup(updatesOn: true, autoOn: true);
+        UpdateServerPluginSettingsDto? sent = null;
+        _client.Setup(c => c.UpdatePluginSettingsAsync(_serverId, It.IsAny<UpdateServerPluginSettingsDto>()))
+            .Callback<Guid, UpdateServerPluginSettingsDto>((_, s) => sent = s)
+            .ReturnsAsync(_server);
+        var cut = RenderPluginsTab();
+        cut.WaitForAssertion(() => Assert.NotEmpty(cut.FindAll("#plugin-recording")));
+
+        cut.Find("#plugin-recording").Change(false);
+
+        cut.WaitForAssertion(() => Assert.NotNull(sent));
+        Assert.Null(sent!.AutoUpdateEnabled);              // left out, so the Api leaves it as it is
+    }
+
+    // ---- the recent updates --------------------------------------------------------------------------------
+
+    private static PluginUpdateAttemptDto Attempt(string state = "succeeded", string kind = "main", string trigger = "auto", string from = "0.8.0", string to = "0.9.0", string code = "", int minutesAgo = 5) => new()
+    {
+        Kind = kind, Trigger = trigger, State = state, FromVersion = from, ToVersion = to, Code = code,
+        StartedAtUtc = new DateTimeOffset(2026, 9, 20, 12, 0, 0, TimeSpan.Zero).AddMinutes(-minutesAgo)
+    };
+
+    private void GivenAttempts(params PluginUpdateAttemptDto[] attempts)
+    {
+        GivenAutoSetup(updatesOn: true);
+        _client.Setup(c => c.GetPluginUpdateAttemptsAsync(_serverId)).ReturnsAsync([.. attempts]);
+    }
+
+    [Fact]
+    public void RecentUpdatesAreListedWithWhoWhatVersionsOutcomeAndTime()
+    {
+        GivenAttempts(Attempt("succeeded", "updater", "auto", "0.2.0", "0.3.0"), Attempt("refused", "main", "manual", "0.8.0", "0.9.0", "signature_invalid", 30));
+
+        var cut = RenderPluginsTab();
+
+        cut.WaitForAssertion(() => Assert.Equal(2, cut.FindAll("[data-testid=plugin-update-attempt]").Count));
+        var rows = cut.FindAll("[data-testid=plugin-update-attempt]");
+        Assert.Contains("Automatic", rows[0].TextContent);
+        Assert.Contains("Updater 0.2.0 → 0.3.0", rows[0].TextContent);
+        Assert.Contains("succeeded", rows[0].TextContent);
+        Assert.Contains("2026-09-20 11:55 UTC", rows[0].TextContent);
+        Assert.Contains("Manual", rows[1].TextContent);
+        Assert.Contains("Plugin 0.8.0 → 0.9.0", rows[1].TextContent);
+        Assert.Contains("refused (signature_invalid)", rows[1].TextContent);
+        Assert.Equal("refused", rows[1].GetAttribute("data-state"));
+    }
+
+    [Theory]
+    [InlineData("started", "in progress")]
+    [InlineData("failed", "did not take effect and was put back")]
+    [InlineData("succeeded", "succeeded")]
+    [InlineData("refused", "refused")]
+    public void EachOutcomeIsSaidInPlainWords(string state, string words)
+    {
+        GivenAttempts(Attempt(state));
+
+        var cut = RenderPluginsTab();
+
+        cut.WaitForAssertion(() => Assert.Contains(words, cut.Find("[data-testid=plugin-update-attempt]").TextContent));
+    }
+
+    [Fact]
+    public void OnlyTheLastFiveAreShown()
+    {
+        GivenAttempts(Enumerable.Range(0, 8).Select(i => Attempt(minutesAgo: i)).ToArray());
+
+        var cut = RenderPluginsTab();
+
+        cut.WaitForAssertion(() => Assert.Equal(5, cut.FindAll("[data-testid=plugin-update-attempt]").Count));
+    }
+
+    [Fact]
+    public void WithNoAttemptsThereIsNoListAndAFailedFetchDoesNotBreakTheCard()
+    {
+        GivenAutoSetup(updatesOn: true);
+        var none = RenderPluginsTab();
+        none.WaitForAssertion(() => Assert.NotEmpty(none.FindAll("#plugin-updates")));
+        Assert.Empty(none.FindAll("[data-testid=plugin-update-attempts]"));
+
+        _client.Setup(c => c.GetPluginUpdateAttemptsAsync(_serverId)).ThrowsAsync(new HttpRequestException("boom"));
+        var broken = RenderPluginsTab();
+        broken.WaitForAssertion(() => Assert.NotEmpty(broken.FindAll("#plugin-updates")));
+        Assert.Empty(broken.FindAll("[data-testid=plugin-update-attempts]"));
+        Assert.Empty(broken.FindAll(".plugins-pane .alert"));
+    }
+
+    [Fact]
+    public void AnAttemptsTextIsShownAsTextNeverAsMarkup()
+    {
+        GivenAttempts(Attempt("refused", code: "<img src=x onerror=alert(1)>", to: "<b>9</b>"));
+
+        var cut = RenderPluginsTab();
+
+        cut.WaitForAssertion(() => Assert.NotEmpty(cut.FindAll("[data-testid=plugin-update-attempt]")));
+        Assert.Empty(cut.FindAll("[data-testid=plugin-update-attempt] img"));
+        Assert.Empty(cut.FindAll("[data-testid=plugin-update-attempt] b"));
+    }
 }
