@@ -633,6 +633,12 @@ version is always tried (and bridges work as ever); a server on an older key is 
 - **Release control.** The auto updater only ever follows *the version being served*: an uploaded release stays a draft until an administrator publishes it,
   and withdrawing it returns to the embedded build (never a downgrade: nothing newer than installed means nothing to do). Plus the site-wide switch above.
   Not built: staged roll-outs by percentage or delay after publishing.
+- **In the Add Server wizard (Scott's request).** An **Updates** step follows the Plugin step for anyone who chose to set the plugin up, gathering every
+  update setting on one page with a plain explanation of each and why someone might want it: "Allow updates from this Panel" (one click instead of a
+  new file each time; only a Panel-signed file is accepted and the previous version is put back if the new one does not start), "Update automatically"
+  (fixes and features without remembering; the same checks as a click; players need not leave; a failed version is put back and not retried; leave it
+  off to choose when the server changes) and a note on the Updater helper (installed already, or installable by the Panel once updates are allowed).
+  Both switches are off unless the server already has them on; the step can be skipped and everything is changeable later on the Plugins tab.
 - **Panel.** The Plugins tab has the "Update automatically" switch under "Allow updates", and a "Recent updates" list (last five: automatic or manual,
   plugin or Updater, versions, outcome in words, time).
 - **Tests.** Real Postgres for the updater (eligibility, order, one at a time, outcome resolution, failed and refused versions not retried, a fixed

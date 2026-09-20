@@ -176,7 +176,10 @@ wizard, so there is no old route to redirect.
    the detected framework (Panel-hosted download), then poll the existing plugin list and the handshake, showing a
    live checklist (installed / responding / capabilities available / version current). The wizard **only
    consumes** a plugin-status surface; what "configured correctly" means is defined by the plugin session.
-6. **Done** - summary and a link to the server.
+6. **Updates (added 2026-09-20, only when the plugin was accepted)** - every update-related setting on one page, each with a plain
+   explanation of why someone might want it: "Allow updates from this Panel", "Update automatically", and a note on the
+   Updater helper plugin (see the companion plugin plan, "Automatic updates"). Skippable; changeable later on the Plugins tab.
+7. **Done** - summary and a link to the server.
 
 A skipped or failed step never blocks finishing, **except step 2** - the server must connect to be useful.
 

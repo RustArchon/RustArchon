@@ -647,7 +647,7 @@ public class AddServerWizardTests : BunitContext
         }
 
         Assert.Empty(cut.FindAll("[data-testid=wizard-plugin-ready]"));
-        Assert.Equal("Finish anyway", Text(cut, "wizard-plugin-next").Trim());
+        Assert.Equal("Next anyway", Text(cut, "wizard-plugin-next").Trim());
     }
 
     [Theory]
@@ -684,7 +684,7 @@ public class AddServerWizardTests : BunitContext
         }
 
         Assert.Contains("0.8.0", Text(cut, "wizard-plugin-ready"));
-        Assert.Equal("Finish", Text(cut, "wizard-plugin-next").Trim());
+        Assert.Equal("Next", Text(cut, "wizard-plugin-next").Trim());
     }
 
     [Fact]
@@ -715,7 +715,7 @@ public class AddServerWizardTests : BunitContext
 
         Assert.Contains(expected, detail.TextContent);
         Assert.Empty(cut.FindAll("[data-testid=wizard-plugin-ready]"));
-        Assert.Equal("Finish anyway", Text(cut, "wizard-plugin-next").Trim());
+        Assert.Equal("Next anyway", Text(cut, "wizard-plugin-next").Trim());
     }
 
     [Fact]
@@ -834,6 +834,8 @@ public class AddServerWizardTests : BunitContext
         var cut = ToPluginChecklist();
 
         Click(cut, "wizard-plugin-next");
+        Step(cut, "updates");
+        Click(cut, "wizard-updates-skip");
 
         Step(cut, "done");
         Assert.Contains("Plugins tab", Text(cut, "done-plugin-pending"));
@@ -863,5 +865,234 @@ public class AddServerWizardTests : BunitContext
         await Task.Delay(120);
 
         _client.Verify(c => c.GetByIdAsync(It.IsAny<Guid>()), Times.Never);
+    }
+
+    // ---- updates ----
+
+    private IRenderedComponent<AddServerWizard> ToUpdates()
+    {
+        var cut = ToPluginChecklist();
+        Click(cut, "wizard-plugin-next");
+        Step(cut, "updates");
+        return cut;
+    }
+
+    private UpdateServerPluginSettingsDto? _savedSettings;
+
+    private void GivenSettingsSaveWorks(bool recording = true, bool combat = true)
+    {
+        _client.Setup(c => c.UpdatePluginSettingsAsync(_id, It.IsAny<UpdateServerPluginSettingsDto>()))
+            .Callback<Guid, UpdateServerPluginSettingsDto>((_, dto) => _savedSettings = dto)
+            .ReturnsAsync((Guid _, UpdateServerPluginSettingsDto dto) =>
+            {
+                var saved = Server();
+                saved.PluginRecordingEnabled = dto.RecordingEnabled!.Value;
+                saved.PluginCombatLogEnabled = dto.CombatLogEnabled!.Value;
+                saved.PluginUpdatesEnabled = dto.UpdatesEnabled!.Value;
+                saved.PluginAutoUpdateEnabled = dto.AutoUpdateEnabled ?? false;
+                return saved;
+            });
+    }
+
+    [Fact]
+    public void AfterThePluginStepTheUpdatesStepGathersEveryUpdateSettingOnOnePage()
+    {
+        var cut = ToUpdates();
+
+        Assert.NotNull(cut.Find("[data-testid=wizard-allow-updates]"));
+        Assert.NotNull(cut.Find("[data-testid=wizard-auto-update]"));
+        Assert.NotNull(cut.Find("[data-testid=wizard-updater-note]"));
+        Assert.False(cut.Find("[data-testid=wizard-allow-updates]").HasAttribute("checked"));
+        Assert.False(cut.Find("[data-testid=wizard-auto-update]").HasAttribute("checked"));
+    }
+
+    [Fact]
+    public void EachSettingSaysWhyYouMightWantIt()
+    {
+        var cut = ToUpdates();
+
+        var allow = Text(cut, "wizard-allow-updates-why");
+        Assert.Contains("one click", allow);
+        Assert.Contains("signed", allow);
+        Assert.Contains("previous version back", allow);
+        var auto = Text(cut, "wizard-auto-update-why");
+        Assert.Contains("by itself", auto);
+        Assert.Contains("without having to remember", auto);
+        Assert.Contains("players do not need to leave", auto);
+        Assert.Contains("choose when your server changes", auto);
+        Assert.Contains("later on the server's Plugins tab", cut.Find("[data-testid=step-updates] p").TextContent);
+    }
+
+    [Fact]
+    public void TheAutomaticSwitchWaitsForTheAllowSwitch()
+    {
+        var cut = ToUpdates();
+        Assert.True(cut.Find("[data-testid=wizard-auto-update]").HasAttribute("disabled"));
+        Assert.Contains("Turn on Allow updates first", Text(cut, "wizard-auto-update-needs-allow"));
+
+        cut.Find("[data-testid=wizard-allow-updates]").Change(true);
+
+        Assert.False(cut.Find("[data-testid=wizard-auto-update]").HasAttribute("disabled"));
+        Assert.Empty(cut.FindAll("[data-testid=wizard-auto-update-needs-allow]"));
+    }
+
+    [Fact]
+    public void TurningAllowOffAgainTurnsAutomaticOffToo()
+    {
+        GivenSettingsSaveWorks();
+        var cut = ToUpdates();
+        cut.Find("[data-testid=wizard-allow-updates]").Change(true);
+        cut.Find("[data-testid=wizard-auto-update]").Change(true);
+
+        cut.Find("[data-testid=wizard-allow-updates]").Change(false);
+        cut.Find("[data-testid=wizard-allow-updates]").Change(true);
+
+        Assert.False(cut.Find("[data-testid=wizard-auto-update]").HasAttribute("checked"));
+    }
+
+    [Fact]
+    public void SavingBothSwitchesOnSendsThemAndTheOthersAtTheirSavedValuesThenFinishes()
+    {
+        GivenSettingsSaveWorks();
+        var cut = ToUpdates();
+        cut.Find("[data-testid=wizard-allow-updates]").Change(true);
+        cut.Find("[data-testid=wizard-auto-update]").Change(true);
+
+        Click(cut, "wizard-updates-save");
+
+        Step(cut, "done");
+        Assert.NotNull(_savedSettings);
+        Assert.True(_savedSettings!.UpdatesEnabled);
+        Assert.True(_savedSettings.AutoUpdateEnabled);
+        Assert.Equal(false, _savedSettings.RecordingEnabled);          // the test server's saved values, sent back unchanged
+        Assert.Equal(false, _savedSettings.CombatLogEnabled);
+        Assert.Contains("installed automatically", Text(cut, "done-updates"));
+    }
+
+    [Fact]
+    public void AllowingUpdatesWithoutAutomaticSendsAutomaticOffAndSaysOneClick()
+    {
+        GivenSettingsSaveWorks();
+        var cut = ToUpdates();
+        cut.Find("[data-testid=wizard-allow-updates]").Change(true);
+
+        Click(cut, "wizard-updates-save");
+
+        Step(cut, "done");
+        Assert.True(_savedSettings!.UpdatesEnabled);
+        Assert.False(_savedSettings.AutoUpdateEnabled);
+        Assert.Contains("one click", Text(cut, "done-updates"));
+    }
+
+    [Fact]
+    public void SkippingChangesNothingAndSaysNothingAboutUpdates()
+    {
+        GivenSettingsSaveWorks();
+        var cut = ToUpdates();
+
+        Click(cut, "wizard-updates-skip");
+
+        Step(cut, "done");
+        Assert.Null(_savedSettings);
+        Assert.Empty(cut.FindAll("[data-testid=done-updates]"));
+    }
+
+    [Fact]
+    public void SavingWithBothLeftOffMakesNoCall()
+    {
+        GivenSettingsSaveWorks();
+        var cut = ToUpdates();
+
+        Click(cut, "wizard-updates-save");
+
+        Step(cut, "done");
+        Assert.Null(_savedSettings);
+        _client.Verify(c => c.UpdatePluginSettingsAsync(It.IsAny<Guid>(), It.IsAny<UpdateServerPluginSettingsDto>()), Times.Never);
+    }
+
+    [Fact]
+    public void AFailedSaveStaysOnTheStepAndSaysSoWithoutLosingTheChoices()
+    {
+        _client.Setup(c => c.UpdatePluginSettingsAsync(_id, It.IsAny<UpdateServerPluginSettingsDto>())).ThrowsAsync(new HttpRequestException("boom"));
+        var cut = ToUpdates();
+        cut.Find("[data-testid=wizard-allow-updates]").Change(true);
+        cut.Find("[data-testid=wizard-auto-update]").Change(true);
+
+        Click(cut, "wizard-updates-save");
+
+        cut.WaitForElement("[data-testid=wizard-error]");
+        Assert.NotEmpty(cut.FindAll("[data-testid=step-updates]"));
+        Assert.True(cut.Find("[data-testid=wizard-allow-updates]").HasAttribute("checked"));
+        Assert.True(cut.Find("[data-testid=wizard-auto-update]").HasAttribute("checked"));
+    }
+
+    [Fact]
+    public void BackReturnsToThePluginChecklist()
+    {
+        var cut = ToUpdates();
+
+        Click(cut, "wizard-back");
+
+        cut.WaitForElement("[data-testid=wizard-plugin-checklist]");
+    }
+
+    [Fact]
+    public void TheUpdaterNoteSaysWhetherTheHelperIsAlreadyThereOrWillBeInstalledForYou()
+    {
+        var missing = ToUpdates();
+        Assert.NotEmpty(missing.FindAll("[data-testid=wizard-updater-missing]"));
+        Assert.Contains("can install it for you", Text(missing, "wizard-updater-missing"));
+
+        _framework = ServerModFramework.Carbon;
+        _client.Setup(c => c.GetPluginsAsync(_id)).ReturnsAsync(() => PluginList(RustArchonPlugin.Name));
+        var dto = GoodStatus();
+        dto.UpdaterInstalled = true;
+        _client.Setup(c => c.GetPluginStatusAsync(_id)).ReturnsAsync(() => Status(dto));
+        var installed = ToPluginChecklist();
+        installed.WaitForElement("[data-testid=wizard-plugin-ready]", TimeSpan.FromSeconds(5));     // the wizard has read the plugin's status by now
+        Click(installed, "wizard-plugin-next");
+        Step(installed, "updates");
+        Assert.NotEmpty(installed.FindAll("[data-testid=wizard-updater-installed]"));
+        Assert.Empty(installed.FindAll("[data-testid=wizard-updater-missing]"));
+    }
+
+    [Fact]
+    public void AServerThatAlreadyHasTheSettingsOnShowsThemOn()
+    {
+        _client.Setup(c => c.GetByIdAsync(_id)).ReturnsAsync(() =>
+        {
+            var server = Server();
+            server.PluginUpdatesEnabled = true;
+            server.PluginAutoUpdateEnabled = true;
+            return server;
+        });
+        var cut = ToUpdates();
+
+        Assert.True(cut.Find("[data-testid=wizard-allow-updates]").HasAttribute("checked"));
+        Assert.True(cut.Find("[data-testid=wizard-auto-update]").HasAttribute("checked"));
+    }
+
+    [Fact]
+    public void SkippingThePluginSkipsTheUpdatesStepAndItIsNotShownInTheProgressList()
+    {
+        var cut = ToPlugin();
+        Assert.Empty(cut.FindAll("[data-testid=progress-updates]"));
+
+        Click(cut, "wizard-plugin-skip");
+
+        Step(cut, "done");
+        Assert.Empty(cut.FindAll("[data-testid=step-updates]"));
+    }
+
+    [Fact]
+    public void ChoosingThePluginAddsTheUpdatesStepToTheProgressListAfterIt()
+    {
+        var cut = ToPluginChecklist();
+
+        var progress = cut.FindAll("[data-testid=wizard-progress] li").Select(li => li.TextContent.Trim()).ToList();
+
+        Assert.Equal("5. Plugin", progress[4]);
+        Assert.Equal("6. Updates", progress[5]);
+        Assert.Equal("7. Done", progress[6]);
     }
 }
