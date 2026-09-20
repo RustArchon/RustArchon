@@ -43,6 +43,15 @@ public class ServerConnectionActorInteractivityTests
         return port;
     }
 
+    private const string EmptyDrain = """{"v":1,"ok":true,"data":{"format":1,"bootId":5,"head":9,"cursor":9,"lost":false,"reset":false,"events":[]}}""";
+    private const string BusyDrain = """{"v":1,"ok":true,"data":{"format":1,"bootId":5,"head":10,"cursor":10,"lost":false,"reset":false,"events":[{"s":10}]}}""";
+
+    /// <summary>What a plugin would answer to the test's two drain commands; null for anything else (which is simply echoed).</summary>
+    private static string? DrainReplyFor(string command) =>
+        command.StartsWith("test.drain.empty", StringComparison.Ordinal) ? EmptyDrain
+        : command.StartsWith("test.drain.busy", StringComparison.Ordinal) ? BusyDrain
+        : null;
+
     /// <summary>
     /// A minimal WebRCON-shaped server: accepts one connection, then echoes every request back as a
     /// response carrying the same Identifier and a recognizable Message, for as long as the test runs.
@@ -96,7 +105,7 @@ public class ServerConnectionActorInteractivityTests
                     var responseJson = JsonSerializer.Serialize(new
                     {
                         Identifier = identifier,
-                        Message = $"echo:{message}",
+                        Message = DrainReplyFor(message) ?? $"echo:{message}",
                         Type = "Generic",
                         Stacktrace = string.Empty
                     });
@@ -194,6 +203,57 @@ public class ServerConnectionActorInteractivityTests
                     f.Message == "test.interactive.marker"
                     && f.Direction == RconEventDirection.Sent
                     && f.Interactive),
+                It.IsAny<CancellationToken>()),
+            Times.AtLeastOnce);
+    }
+
+    [Fact]
+    public async Task AnEmptyBackgroundDrainReplyIsNotStoredButBusyOnesAndInteractiveOnesAre()
+    {
+        var port = GetFreeTcpPort();
+        using var listener = new HttpListener();
+        listener.Prefixes.Add($"http://127.0.0.1:{port}/");
+        listener.Start();
+
+        using var serverCts = new CancellationTokenSource();
+        var serverTask = RunEchoServerAsync(listener, serverCts.Token);
+
+        var publishEndpoint = new Mock<IPublishEndpoint>();
+        var reconnectOptions = new ReconnectOptions { ReconnectTimeout = TimeSpan.FromMinutes(5), ErrorReconnectTimeout = TimeSpan.FromMinutes(5) };
+
+        await using var actor = new ServerConnectionActor(
+            Guid.NewGuid(), Guid.NewGuid(), "127.0.0.1", port, "unused-password",
+            Guid.NewGuid(), publishEndpoint.Object, reconnectOptions, NullLogger<ServerConnectionActor>.Instance);
+
+        await Task.Delay(TimeSpan.FromSeconds(2));
+
+        var empty = await actor.SendCommandAsync("test.drain.empty", TimeSpan.FromSeconds(5), CancellationToken.None, RconCommandContext.Background);
+        var busy = await actor.SendCommandAsync("test.drain.busy", TimeSpan.FromSeconds(5), CancellationToken.None, RconCommandContext.Background);
+        var typed = await actor.SendCommandAsync("test.drain.empty", TimeSpan.FromSeconds(5), CancellationToken.None, new RconCommandContext(Interactive: true));
+        Assert.True(empty.Success && busy.Success && typed.Success, $"{empty.Error} {busy.Error} {typed.Error}");
+
+        serverCts.Cancel();
+        listener.Stop();
+        await Task.WhenAny(serverTask, Task.Delay(TimeSpan.FromSeconds(5)));
+
+        // The empty reply to a background poll: not stored.
+        publishEndpoint.Verify(
+            p => p.Publish(
+                It.Is<RconFrameCaptured>(f => f.Direction == RconEventDirection.Received && f.Message == EmptyDrain && !f.Interactive),
+                It.IsAny<CancellationToken>()),
+            Times.Never);
+
+        // One with data in it: stored.
+        publishEndpoint.Verify(
+            p => p.Publish(
+                It.Is<RconFrameCaptured>(f => f.Direction == RconEventDirection.Received && f.Message == BusyDrain && !f.Interactive),
+                It.IsAny<CancellationToken>()),
+            Times.AtLeastOnce);
+
+        // The same empty text in answer to a person's own command: stored, because a person asked and expects to see the answer.
+        publishEndpoint.Verify(
+            p => p.Publish(
+                It.Is<RconFrameCaptured>(f => f.Direction == RconEventDirection.Received && f.Message == EmptyDrain && f.Interactive),
                 It.IsAny<CancellationToken>()),
             Times.AtLeastOnce);
     }
