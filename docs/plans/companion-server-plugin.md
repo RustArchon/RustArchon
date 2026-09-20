@@ -600,8 +600,14 @@ update, so a bad Updater would have nothing to recover it. The answer is that ea
   "started" only; the outcome shows in the Updater's version after Refresh.
 - **Tested** with a temp plugins folder (signed, unsigned, wrong key, tampered, wrong version, not newer, busy, timeout, missing/changed file,
   reload mid-swap, rollback, fresh install, real HTTP with the token in a header) and end to end with the real Api-signed Updater and the real
-  Updater's marker. **Not yet run on a real game server**: a live swap and a live rollback (a deliberately broken Updater) still need doing on
-  Rusty Amigos once the main plugin 0.9.0 is on it, which needs the Panel reachable from the game server.
+  Updater's marker.
+- **Live on Rusty Amigos (2026-09-20).** Plugin 0.8.0 -> 0.9.0 through the Updater 0.2.0 already installed (the version number had to move on:
+  0.8.0 was already installed without the capability, so the Panel saw nothing to update). Then, with no hand install, the Panel's "Update Updater"
+  took the Updater 0.2.0 -> 0.3.0 in about two seconds ("Swapped in RustArchonUpdater 0.3.0" ... "Init v0.3.0" ... "Updater update succeeded",
+  the Updater's header-token download used the LAN address). **Rollback, live:** a deliberately broken Updater 0.3.1 (a syntax error, served from a
+  temporary edit of the source that was reverted afterwards) was swapped in at 19:35:36, Carbon logged `Failed compiling 'RustArchonUpdater.cs'`,
+  and at 19:36:22 - 45 seconds after the swap - the main plugin logged `Updater update 0.3.1 rolled-back`, restored the backup and Carbon
+  loaded Updater 0.3.0 again. Not exercised live: a fresh install (no Updater at all) and a main plugin that reloads mid-swap (both covered by tests).
 
 ### Phase 5 - Session replay UI (later)
 

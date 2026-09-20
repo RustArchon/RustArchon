@@ -24,7 +24,8 @@
 //   4. The old file is kept as RustArchon.cs.bak, the new one is swapped in (File.Replace), and the main plugin's
 //      "loaded" marker is watched. If the new version writes its marker, the update succeeded. If not within the time
 //      limit (it failed to compile, or crashed in Init), the .bak is put back.
-// The Updater itself is only ever updated by hand: a failed Updater would have nothing left to recover it.
+// The Updater never replaces itself: a failed Updater would have nothing left to recover it. The main RustArchon plugin installs and
+// updates the Updater instead (archon.updater.update), and puts the old file back if the new one does not write updater-loaded.txt.
 
 using System;
 using System.Collections.Generic;
