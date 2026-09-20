@@ -635,6 +635,39 @@ public class AddServerWizardTests : BunitContext
     // ---- plugin ----
 
     [Fact]
+    public void ReachingTheEndSavesThatTheWizardWasFinishedOnceForThisServer()
+    {
+        _client.Setup(c => c.CompleteSetupAsync(_id)).ReturnsAsync(Server());
+        var cut = ToPlugin();
+
+        Click(cut, "wizard-plugin-skip");
+
+        Step(cut, "done");
+        _client.Verify(c => c.CompleteSetupAsync(_id), Times.Once);
+    }
+
+    [Fact]
+    public void LeavingBeforeTheEndSavesNothingSoTheServerKeepsItsFinishSetupLink()
+    {
+        var cut = ToPlugin();
+
+        Assert.NotNull(cut);
+        _client.Verify(c => c.CompleteSetupAsync(It.IsAny<Guid>()), Times.Never);
+    }
+
+    [Fact]
+    public void FailingToSaveTheCompletionShowsNoErrorAndTheEndStillShows()
+    {
+        _client.Setup(c => c.CompleteSetupAsync(_id)).ThrowsAsync(new HttpRequestException("boom"));
+        var cut = ToPlugin();
+
+        Click(cut, "wizard-plugin-skip");
+
+        Step(cut, "done");
+        Assert.Empty(cut.FindAll("[data-testid=wizard-error]"));
+    }
+
+    [Fact]
     public void DecliningThePluginGoesStraightToTheEnd()
     {
         var cut = ToPlugin();

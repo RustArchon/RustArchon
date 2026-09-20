@@ -678,6 +678,7 @@ Not yet run live.
   report never brings one back, a server no longer on Carbon has none); `GET api/rustservers/{id}/plugin-failures` (same permission as reading the server); the
   Plugins tab shows "Failed to load" with each file's reasons, plainly saying so when the file is the RustArchon plugin or its Updater. A Carbon server whose every
   plugin failed is still recognized as Carbon. Oxide reports no such list. Compiler text is shown as text, never as markup.
+- **Setup complete.** See the F7 plan, "Still open" 1: a saved flag, not the connection state, decides who is offered "Finish setup".
 - **Defaults.** A **new** server now has "Allow updates" and "Update automatically" on (the entity default; the column's own default is still off, so no migration
   and no existing server changed). The Add Server wizard's Updates step shows them on, explains each, and offers "Keep as they are".
 - **Rate limits as Platform Settings** (category Reports): `ReportsPerServerPerMinute` (60, applied by the Api after the secret is verified),
@@ -777,8 +778,8 @@ unblocked by Phase 1's handshake. Plugin-side `OnPlayerReported` internals belon
   server. The test server is PVE ("Builder-focused PVE"), so it will understate player-vs-player traffic.
 - **Retention** is enforced by `PluginDataRetention` in the Api (see "Hardening pass" below): plugin chunks, console and chat, kill feed,
   stats snapshots, the maps of past wipes and spent tokens. **Player sessions are deliberately not pruned** (they hold the VPN, ban and
-  geolocation lookups and the names the Panel shows); if the plan's "player history" days should cover them too, that is a decision for
-  the owner, not a side effect.
+  geolocation lookups and the names the Panel shows). **Decided (Scott, 2026-09-20): kept indefinitely** - the history is the purpose of the
+  service and is disclosed in the privacy policy - so the plan's "player history" days do not apply to them.
 
 - **Oxide is untested.** Carbon is the first-class target; claim Oxide support only after a compile-and-run test
   on an Oxide server.

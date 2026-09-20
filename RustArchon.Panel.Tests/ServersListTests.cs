@@ -35,9 +35,10 @@ public class ServersListTests : BunitContext
         GivenServers(Server(RconConnectionStatus.Connected));
     }
 
-    private RustServerDto Server(RconConnectionStatus status, bool enabled = true, string name = "Alpha", Guid? id = null) => new()
+    private RustServerDto Server(RconConnectionStatus status, bool enabled = true, string name = "Alpha", Guid? id = null, bool setupComplete = true) => new()
     {
-        Id = id ?? _id, Name = name, Host = "192.0.2.10", Port = 28016, IsEnabled = enabled, ConnectionStatus = status
+        Id = id ?? _id, Name = name, Host = "192.0.2.10", Port = 28016, IsEnabled = enabled, ConnectionStatus = status,
+        SetupCompletedAtUtc = setupComplete ? new DateTimeOffset(2026, 9, 1, 0, 0, 0, TimeSpan.Zero) : null
     };
 
     private void GivenServers(params RustServerDto[] servers) =>
@@ -71,15 +72,16 @@ public class ServersListTests : BunitContext
     }
 
     [Theory]
-    [InlineData(RconConnectionStatus.Error, true, true)]
-    [InlineData(RconConnectionStatus.Disconnected, true, true)]
-    [InlineData(RconConnectionStatus.Connecting, true, true)]
-    [InlineData(RconConnectionStatus.Reconnecting, true, true)]
-    [InlineData(RconConnectionStatus.Connected, true, false)]
-    [InlineData(RconConnectionStatus.Error, false, false)] // disabled on purpose: nothing to finish
-    public void OnlyAnEnabledServerThatIsNotConnectedOffersToFinishSetup(RconConnectionStatus status, bool enabled, bool expectLink)
+    [InlineData(RconConnectionStatus.Error, true, false, true)]
+    [InlineData(RconConnectionStatus.Connected, true, false, true)]      // connected, but the wizard was never finished: steps may be left
+    [InlineData(RconConnectionStatus.Connecting, true, false, true)]
+    [InlineData(RconConnectionStatus.Error, false, false, true)]         // a half-added server that was disabled is still half-added
+    [InlineData(RconConnectionStatus.Error, true, true, false)]          // finished, and offline for a while: not half-added
+    [InlineData(RconConnectionStatus.Disconnected, true, true, false)]
+    [InlineData(RconConnectionStatus.Connected, true, true, false)]
+    public void OnlyAServerWhoseWizardWasNeverFinishedOffersToFinishSetup(RconConnectionStatus status, bool enabled, bool setupComplete, bool expectLink)
     {
-        GivenServers(Server(status, enabled));
+        GivenServers(Server(status, enabled, setupComplete: setupComplete));
 
         var cut = Render<ServersList>();
 
@@ -95,7 +97,7 @@ public class ServersListTests : BunitContext
     public void TheLinkIsPerServer()
     {
         var other = Guid.NewGuid();
-        GivenServers(Server(RconConnectionStatus.Connected, name: "Alpha"), Server(RconConnectionStatus.Error, name: "Beta", id: other));
+        GivenServers(Server(RconConnectionStatus.Connected, name: "Alpha"), Server(RconConnectionStatus.Error, name: "Beta", id: other, setupComplete: false));
 
         var cut = Render<ServersList>();
 

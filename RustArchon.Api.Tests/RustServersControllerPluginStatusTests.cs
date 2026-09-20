@@ -125,6 +125,54 @@ public class RustServersControllerPluginStatusTests(PostgresFixture postgres) : 
     private static RustServerDto ServerFrom<T>(ActionResult<T> result) where T : class =>
         Assert.IsType<RustServerDto>(Assert.IsType<OkObjectResult>(result.Result).Value);
 
+    // ---- setup complete ------------------------------------------------------------------------------------
+
+    [Fact]
+    public async Task ANewServerHasNotFinishedSetupUntilTheWizardSaysSo()
+    {
+        var h = await CreateHarnessAsync();
+        var id = await CreateServerAsync(h.Controller, "Half added");
+
+        Assert.Null(ServerFrom(await h.Controller.GetById(id)).SetupCompletedAtUtc);
+    }
+
+    [Fact]
+    public async Task CompletingSetupStampsTheTimeOnceAndLaterCallsChangeNothing()
+    {
+        var h = await CreateHarnessAsync();
+        var id = await CreateServerAsync(h.Controller, "Finished");
+
+        var first = ServerFrom(await h.Controller.CompleteSetup(id));
+        var second = ServerFrom(await h.Controller.CompleteSetup(id));
+
+        Assert.NotNull(first.SetupCompletedAtUtc);
+        Assert.Equal(first.SetupCompletedAtUtc, second.SetupCompletedAtUtc);
+        Assert.Equal(first.SetupCompletedAtUtc, ServerFrom(await h.Controller.GetById(id)).SetupCompletedAtUtc);
+    }
+
+    [Fact]
+    public async Task CompletingSetupOfAnUnknownServerIsNotFound()
+    {
+        var h = await CreateHarnessAsync();
+
+        Assert.IsType<Microsoft.AspNetCore.Mvc.NotFoundResult>((await h.Controller.CompleteSetup(Guid.NewGuid())).Result);
+    }
+
+    [Fact]
+    public async Task AnOrdinaryEditNeverSetsOrClearsIt()
+    {
+        var h = await CreateHarnessAsync();
+        var half = await CreateServerAsync(h.Controller, "Edit half");
+        var done = await CreateServerAsync(h.Controller, "Edit done");
+        await h.Controller.CompleteSetup(done);
+
+        await h.Controller.Update(half, new UpdateRustServerDto { Name = "Renamed half", Host = "192.0.2.41", Port = 28016 });
+        await h.Controller.Update(done, new UpdateRustServerDto { Name = "Renamed done", Host = "192.0.2.42", Port = 28016 });
+
+        Assert.Null(ServerFrom(await h.Controller.GetById(half)).SetupCompletedAtUtc);
+        Assert.NotNull(ServerFrom(await h.Controller.GetById(done)).SetupCompletedAtUtc);
+    }
+
     // ---- GET plugin-status ---------------------------------------------------------------------------------
 
     [Fact]

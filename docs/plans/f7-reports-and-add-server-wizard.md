@@ -274,8 +274,9 @@ plugin machinery that already exists (plugin list, `plugin-status`, the signed d
 
 **Still open**
 
-1. Abandoned wizard servers: a "Finish setup" link now appears on any enabled server that is not connected (no persisted "setup complete"
-   flag, no auto-delete). Whether that is enough is unconfirmed.
+1. ~~Abandoned wizard servers~~ - done 2026-09-20: `RustServer.SetupCompletedAtUtc` is stamped (`POST api/rustservers/{id}/setup-complete`, idempotent) when the
+   wizard reaches its end, and the servers list offers "Finish setup" on exactly the servers without it. Servers that existed before were backfilled as complete
+   from their creation date (migration `AddServerSetupCompleted`). A failed save leaves the link, which is the safe direction. No auto-delete; Discard still frees the plan slot.
 2. ~~Rate limits as Platform Settings~~ - done (above).
 3. The unverified assumptions listed in the section above, especially what `server.reportsServerEndpoint` prints and how each geolocation
    provider signals a bad key.
