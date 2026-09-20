@@ -1800,4 +1800,158 @@ public class ServerDetailPluginCardTests : BunitContext
     }
 
     private sealed record UpdateSettingsTypedArgs(bool? Recording, bool? Combat);
+
+    // ---- the plugin installing and updating the Updater itself ---------------------------------------------
+
+    private void GivenSelfUpdatingSetup(bool updaterInstalled, bool updaterOutdated, bool updatesOn = true, string keyState = "active", bool capable = true)
+    {
+        GivenPluginListed();
+        GivenSignedByThisPanel();
+        GivenKeyState(keyState);
+        GivenUpdates(available: false, updaterInstalled: updaterInstalled);
+        GivenUpdaterVersions(updaterInstalled ? "0.2.0" : null, "0.3.0", newer: updaterOutdated);
+        _server.PluginUpdatesEnabled = updatesOn;
+        if (capable)
+        {
+            GivenHandshake(capabilities: [RustArchonPlugin.ConfigCapability, RustArchonPlugin.UpdaterUpdateCapability]);
+        }
+        else
+        {
+            GivenHandshake();
+        }
+    }
+
+    [Fact]
+    public void AnOutdatedUpdaterOnACapableSignedServerIsUpdatedByAButtonNotByHand()
+    {
+        GivenSelfUpdatingSetup(updaterInstalled: true, updaterOutdated: true);
+
+        var cut = RenderPluginsTab();
+
+        cut.WaitForAssertion(() => Assert.NotEmpty(cut.FindAll("[data-testid=plugin-update-updater]")));
+        Assert.Contains("0.2.0", cut.Find("[data-testid=plugin-updater-outdated]").TextContent);
+        Assert.Contains("0.3.0", cut.Find("[data-testid=plugin-updater-outdated]").TextContent);
+        Assert.DoesNotContain("by hand", cut.Find("[data-testid=plugin-updater-outdated]").TextContent);
+        Assert.Empty(cut.FindAll("[data-testid=plugin-download-updater]"));
+    }
+
+    [Fact]
+    public void PressingUpdateUpdaterAsksTheApiAndSaysItStarted()
+    {
+        GivenSelfUpdatingSetup(updaterInstalled: true, updaterOutdated: true);
+        _client.Setup(c => c.StartUpdaterUpdateAsync(_serverId)).ReturnsAsync(new PluginUpdateResultDto { Started = true, Code = "started", Message = "raw" });
+        var cut = RenderPluginsTab();
+        cut.WaitForAssertion(() => Assert.NotEmpty(cut.FindAll("[data-testid=plugin-update-updater]")));
+
+        cut.Find("[data-testid=plugin-update-updater]").Click();
+
+        cut.WaitForAssertion(() => Assert.Contains("Updater update started", cut.Find("[data-testid=plugin-update-result]").TextContent));
+        _client.Verify(c => c.StartUpdaterUpdateAsync(_serverId), Times.Once);
+        _client.Verify(c => c.StartPluginUpdateAsync(It.IsAny<Guid>()), Times.Never);       // not the plugin's own update
+    }
+
+    [Theory]
+    [InlineData("plugin_too_old", "too old")]
+    [InlineData("update_plugin_first", "older signing key")]
+    [InlineData("not_connected", "not connected")]
+    [InlineData("up_to_date", "Nothing newer")]
+    [InlineData("no_updater_version", "does not serve an Updater")]
+    [InlineData("something_else", "could not be started")]
+    public void ARefusedUpdaterUpdateSaysWhyInPlainWords(string code, string expected)
+    {
+        GivenSelfUpdatingSetup(updaterInstalled: true, updaterOutdated: true);
+        _client.Setup(c => c.StartUpdaterUpdateAsync(_serverId)).ReturnsAsync(new PluginUpdateResultDto { Started = false, Code = code, Message = "raw api text" });
+        var cut = RenderPluginsTab();
+        cut.WaitForAssertion(() => Assert.NotEmpty(cut.FindAll("[data-testid=plugin-update-updater]")));
+
+        cut.Find("[data-testid=plugin-update-updater]").Click();
+
+        cut.WaitForAssertion(() => Assert.Contains(expected, cut.Find("[data-testid=plugin-update-result]").TextContent));
+        Assert.DoesNotContain("raw api text", cut.Find("[data-testid=plugin-update-result]").TextContent);
+    }
+
+    [Fact]
+    public void AFailedRequestSaysSoInsteadOfBreakingThePage()
+    {
+        GivenSelfUpdatingSetup(updaterInstalled: true, updaterOutdated: true);
+        _client.Setup(c => c.StartUpdaterUpdateAsync(_serverId)).ThrowsAsync(new HttpRequestException("boom"));
+        var cut = RenderPluginsTab();
+        cut.WaitForAssertion(() => Assert.NotEmpty(cut.FindAll("[data-testid=plugin-update-updater]")));
+
+        cut.Find("[data-testid=plugin-update-updater]").Click();
+
+        cut.WaitForAssertion(() => Assert.Contains("could not be started", cut.Find("[data-testid=plugin-update-result]").TextContent));
+    }
+
+    [Fact]
+    public void AMissingUpdaterOnACapableSignedServerIsInstalledByAButton()
+    {
+        GivenSelfUpdatingSetup(updaterInstalled: false, updaterOutdated: false);
+        _client.Setup(c => c.StartUpdaterUpdateAsync(_serverId)).ReturnsAsync(new PluginUpdateResultDto { Started = true, Code = "started", Message = "" });
+
+        var cut = RenderPluginsTab();
+
+        cut.WaitForAssertion(() => Assert.NotEmpty(cut.FindAll("[data-testid=plugin-install-updater]")));
+        Assert.Contains("can install it for you", cut.Find("[data-testid=plugin-updater-missing]").TextContent);
+        Assert.Empty(cut.FindAll("[data-testid=plugin-download-updater]"));
+
+        cut.Find("[data-testid=plugin-install-updater]").Click();
+        cut.WaitForAssertion(() => _client.Verify(c => c.StartUpdaterUpdateAsync(_serverId), Times.Once));
+    }
+
+    [Fact]
+    public void WithUpdatesTurnedOffTheButtonIsNotOfferedButTheHintSaysHowToGetIt()
+    {
+        GivenSelfUpdatingSetup(updaterInstalled: true, updaterOutdated: true, updatesOn: false);
+
+        var cut = RenderPluginsTab();
+
+        cut.WaitForAssertion(() => Assert.NotEmpty(cut.FindAll("[data-testid=plugin-updater-outdated]")));
+        Assert.Empty(cut.FindAll("[data-testid=plugin-update-updater]"));
+        Assert.Contains("Allow updates", cut.Find("[data-testid=plugin-updater-enable-hint]").TextContent);
+        Assert.NotEmpty(cut.FindAll("[data-testid=plugin-download-updater]"));         // the by-hand route is still there
+    }
+
+    [Theory]
+    [InlineData("retired")]
+    [InlineData("revoked")]
+    [InlineData("")]
+    public void AServerThatDoesNotTrustThisPanelsCurrentKeyIsNotOfferedTheButton(string keyState)
+    {
+        GivenSelfUpdatingSetup(updaterInstalled: true, updaterOutdated: true, keyState: keyState);
+
+        var cut = RenderPluginsTab();
+
+        cut.WaitForAssertion(() => Assert.NotEmpty(cut.FindAll("[data-testid=plugin-updater-outdated]")));
+        Assert.Empty(cut.FindAll("[data-testid=plugin-update-updater]"));
+        Assert.NotEmpty(cut.FindAll("[data-testid=plugin-download-updater]"));
+    }
+
+    [Fact]
+    public void APluginTooOldToDoItKeepsTheByHandDownloadAndSaysToUpdateThePluginFirst()
+    {
+        GivenSelfUpdatingSetup(updaterInstalled: true, updaterOutdated: true, capable: false);
+
+        var cut = RenderPluginsTab();
+
+        cut.WaitForAssertion(() => Assert.NotEmpty(cut.FindAll("[data-testid=plugin-updater-outdated]")));
+        var text = cut.Find("[data-testid=plugin-updater-outdated]").TextContent;
+        Assert.Contains("by hand", text);
+        Assert.Contains("update the plugin first", text);
+        Assert.Empty(cut.FindAll("[data-testid=plugin-update-updater]"));
+        Assert.NotEmpty(cut.FindAll("[data-testid=plugin-download-updater]"));
+        Assert.Empty(cut.FindAll("[data-testid=plugin-updater-enable-hint]"));
+    }
+
+    [Fact]
+    public void ACurrentUpdaterShowsNoUpdaterButtons()
+    {
+        GivenSelfUpdatingSetup(updaterInstalled: true, updaterOutdated: false);
+
+        var cut = RenderPluginsTab();
+
+        cut.WaitForAssertion(() => Assert.NotEmpty(cut.FindAll("[data-testid=plugin-up-to-date]")));
+        Assert.Empty(cut.FindAll("[data-testid=plugin-update-updater]"));
+        Assert.Empty(cut.FindAll("[data-testid=plugin-install-updater]"));
+    }
 }

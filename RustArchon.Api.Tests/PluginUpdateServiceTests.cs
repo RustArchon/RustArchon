@@ -537,4 +537,220 @@ public class PluginUpdateServiceTests
         Assert.False(result.Started);
         _tokens.Verify(t => t.RevokeAsync("TOKEN123"), Times.Once);
     }
+
+    // ---- updating (or installing) the Updater, carried out by the main plugin ----------------------------
+
+    private void GivenUpdaterScenario(string[]? capabilities = null, string? updaterVersion = "v0.2.0", string? latestUpdater = "0.3.0",
+        string fingerprint = PanelKey, PluginKeyState? keyState = PluginKeyState.Active, string state = "valid")
+    {
+        _statuses.Setup(r => r.GetForServerAcrossTenantsAsync(TenantId, ServerId)).ReturnsAsync(new ServerPluginStatus
+        {
+            TenantId = TenantId, RustServerId = ServerId, PluginVersion = "0.8.0", SigningState = state, SigningKeyFingerprint = fingerprint,
+            Capabilities = capabilities ?? [RustArchonPlugin.UpdaterUpdateCapability]
+        });
+        _script.Setup(s => s.GetKeyStateAsync(It.Is<string>(f => string.Equals(f, fingerprint, StringComparison.OrdinalIgnoreCase)))).ReturnsAsync(keyState);
+        _script.Setup(s => s.GetLatestUpdaterVersionAsync()).ReturnsAsync(latestUpdater);
+        _plugins.Setup(r => r.GetForServerAsync(ServerId)).ReturnsAsync(updaterVersion is null
+            ? [new ServerPlugin { Name = RustArchonPlugin.Name, RustServerId = ServerId, TenantId = TenantId }]
+            :
+            [
+                new ServerPlugin { Name = RustArchonPlugin.Name, RustServerId = ServerId, TenantId = TenantId },
+                new ServerPlugin { Name = RustArchonPlugin.UpdaterName, Version = updaterVersion, RustServerId = ServerId, TenantId = TenantId }
+            ]);
+        _tokens.Setup(t => t.MintAsync(TenantId, ServerId, It.IsAny<string>(), It.IsAny<TimeSpan>(), PluginUpdateTokenPurposes.Updater)).ReturnsAsync("TOKEN123");
+    }
+
+    private void AssertNothingHappenedForTheUpdater()
+    {
+        _tokens.Verify(t => t.MintAsync(It.IsAny<Guid>(), It.IsAny<Guid>(), It.IsAny<string>(), It.IsAny<TimeSpan>(), It.IsAny<string>()), Times.Never);
+        _tokens.Verify(t => t.MintAsync(It.IsAny<Guid>(), It.IsAny<Guid>(), It.IsAny<string>(), It.IsAny<TimeSpan>()), Times.Never);
+        Assert.Empty(_sent);
+    }
+
+    [Fact]
+    public async Task AnOlderUpdaterIsUpdatedWithATokenForTheUpdaterAndTheHeaderFormCommand()
+    {
+        GivenUpdaterScenario();
+
+        var result = await Create().StartUpdaterAsync(Server());
+
+        Assert.True(result.Started);
+        Assert.Equal(("started", "0.2.0", "0.3.0"), (result.Code, result.FromVersion, result.ToVersion));
+        _tokens.Verify(t => t.MintAsync(TenantId, ServerId, PanelKey, PluginUpdateService.TokenLifetime, PluginUpdateTokenPurposes.Updater), Times.Once);
+        _tokens.Verify(t => t.MintAsync(It.IsAny<Guid>(), It.IsAny<Guid>(), It.IsAny<string>(), It.IsAny<TimeSpan>()), Times.Never);   // never a main-plugin token
+        var command = Assert.Single(_sent);
+        Assert.Equal("archon.updater.update 0.3.0 http://192.168.0.46:5200/ingest/plugin TOKEN123", command.Command);
+        Assert.DoesNotContain(ServerId.ToString(), command.Command);
+        Assert.False(command.Interactive);
+    }
+
+    [Fact]
+    public async Task AMissingUpdaterIsInstalledByTheSameCommand()
+    {
+        GivenUpdaterScenario(updaterVersion: null);
+
+        var result = await Create().StartUpdaterAsync(Server());
+
+        Assert.True(result.Started);
+        Assert.Null(result.FromVersion);
+        Assert.Contains("installing", result.Message);
+        Assert.StartsWith("archon.updater.update 0.3.0 ", Assert.Single(_sent).Command);
+    }
+
+    [Fact]
+    public async Task TheUpdaterUrlIsBuiltFromThePanelBaseWithNoQueryOrDoubleSlash()
+    {
+        GivenUpdaterScenario();
+        _settings.Setup(s => s.GetStringAsync(PlatformSettingsRegistry.PanelBaseUrl)).ReturnsAsync("https://panel.example.com/rustarchon/?x=1#frag");
+
+        await Create().StartUpdaterAsync(Server());
+
+        Assert.Equal("archon.updater.update 0.3.0 https://panel.example.com/rustarchon/ingest/plugin TOKEN123", Assert.Single(_sent).Command);
+    }
+
+    [Fact]
+    public async Task ADisabledServerOrUpdatesOffIsRefusedForTheUpdaterToo()
+    {
+        GivenUpdaterScenario();
+
+        Assert.Equal("server_disabled", (await Create().StartUpdaterAsync(Server(enabled: false))).Code);
+        Assert.Equal("updates_disabled", (await Create().StartUpdaterAsync(Server(updates: false))).Code);
+        AssertNothingHappenedForTheUpdater();
+    }
+
+    [Fact]
+    public async Task APluginThatHasNeverReportedInIsRefusedForTheUpdater()
+    {
+        GivenUpdaterScenario();
+        _statuses.Setup(r => r.GetForServerAcrossTenantsAsync(TenantId, ServerId)).ReturnsAsync((ServerPluginStatus?)null);
+
+        Assert.Equal("no_handshake", (await Create().StartUpdaterAsync(Server())).Code);
+        AssertNothingHappenedForTheUpdater();
+    }
+
+    [Theory]
+    [InlineData("invalid", PluginKeyState.Active, "not_signed_by_this_panel")]     // the plugin's own check failed
+    [InlineData("valid", null, "not_signed_by_this_panel")]                          // a key this Panel has never had
+    [InlineData("valid", PluginKeyState.Revoked, "key_revoked")]
+    [InlineData("valid", PluginKeyState.Retired, "update_plugin_first")]             // the Updater is signed with the ACTIVE key: move the plugin there first
+    public async Task ASigningKeyThatIsNotTheActiveOneOfThisPanelIsRefusedBeforeAnythingIsMinted(string state, PluginKeyState? keyState, string code)
+    {
+        GivenUpdaterScenario(keyState: keyState, state: state);
+
+        var result = await Create().StartUpdaterAsync(Server());
+
+        Assert.False(result.Started);
+        Assert.Equal(code, result.Code);
+        AssertNothingHappenedForTheUpdater();
+    }
+
+    [Fact]
+    public async Task APluginWithoutTheUpdaterUpdateCapabilityIsToldToUpdateItselfFirst()
+    {
+        GivenUpdaterScenario(capabilities: ["config", "combat", "tcs", "positions", "map", "updates"]);
+
+        var result = await Create().StartUpdaterAsync(Server());
+
+        Assert.Equal("plugin_too_old", result.Code);
+        Assert.Contains("Update the plugin first", result.Message);
+        AssertNothingHappenedForTheUpdater();
+    }
+
+    [Fact]
+    public async Task AnUpdaterThatIsAlreadyTheNewestIsRefused()
+    {
+        GivenUpdaterScenario(updaterVersion: "v0.3.0", latestUpdater: "0.3.0");
+
+        var result = await Create().StartUpdaterAsync(Server());
+
+        Assert.Equal("up_to_date", result.Code);
+        AssertNothingHappenedForTheUpdater();
+    }
+
+    [Fact]
+    public async Task ANewerInstalledUpdaterIsNotDowngraded()
+    {
+        GivenUpdaterScenario(updaterVersion: "v0.9.0", latestUpdater: "0.3.0");
+
+        Assert.Equal("up_to_date", (await Create().StartUpdaterAsync(Server())).Code);
+        AssertNothingHappenedForTheUpdater();
+    }
+
+    [Fact]
+    public async Task APanelThatServesNoUpdaterVersionIsRefused()
+    {
+        GivenUpdaterScenario(latestUpdater: null);
+
+        Assert.Equal("no_updater_version", (await Create().StartUpdaterAsync(Server())).Code);
+        AssertNothingHappenedForTheUpdater();
+    }
+
+    [Fact]
+    public async Task ABadPanelBaseUrlIsRefusedForTheUpdater()
+    {
+        GivenUpdaterScenario();
+        _settings.Setup(s => s.GetStringAsync(PlatformSettingsRegistry.PanelBaseUrl)).ReturnsAsync("ftp://nope");
+
+        Assert.Equal("panel_url_invalid", (await Create().StartUpdaterAsync(Server())).Code);
+        AssertNothingHappenedForTheUpdater();
+    }
+
+    [Fact]
+    public async Task IfThePluginRefusesTheTokenIsThrownAwayAndItsReasonIsPassedOn()
+    {
+        GivenUpdaterScenario();
+        GivenUpdaterReplies("{\"v\":1,\"ok\":false,\"err\":\"not_newer\",\"message\":\"installed 0.3.0\"}");
+
+        var result = await Create().StartUpdaterAsync(Server());
+
+        Assert.False(result.Started);
+        Assert.Equal(("not_newer", "installed 0.3.0"), (result.Code, result.Message));
+        _tokens.Verify(t => t.RevokeAsync("TOKEN123"), Times.Once);
+    }
+
+    [Fact]
+    public async Task APluginThatDoesNotKnowTheCommandIsReportedAsTooOldAndTheTokenIsThrownAway()
+    {
+        GivenUpdaterScenario();
+        GivenUpdaterReplies("Unknown command: archon.updater.update");
+
+        var result = await Create().StartUpdaterAsync(Server());
+
+        Assert.Equal("plugin_too_old", result.Code);
+        _tokens.Verify(t => t.RevokeAsync("TOKEN123"), Times.Once);
+    }
+
+    [Fact]
+    public async Task ADisconnectedServerRevokesTheUpdaterToken()
+    {
+        GivenUpdaterScenario();
+        GivenUpdaterReplies("", success: false);
+
+        var result = await Create().StartUpdaterAsync(Server());
+
+        Assert.Equal("not_connected", result.Code);
+        _tokens.Verify(t => t.RevokeAsync("TOKEN123"), Times.Once);
+    }
+
+    [Fact]
+    public async Task ATimeoutRevokesTheUpdaterToken()
+    {
+        GivenUpdaterScenario();
+        _client
+            .Setup(c => c.GetResponse<RconCommandResult>(It.IsAny<SendRconCommand>(), It.IsAny<CancellationToken>(), It.IsAny<RequestTimeout>()))
+            .ThrowsAsync(new RequestTimeoutException());
+
+        Assert.Equal("timeout", (await Create().StartUpdaterAsync(Server())).Code);
+        _tokens.Verify(t => t.RevokeAsync("TOKEN123"), Times.Once);
+    }
+
+    [Fact]
+    public async Task ASuccessfulUpdaterStartKeepsTheToken()
+    {
+        GivenUpdaterScenario();
+
+        await Create().StartUpdaterAsync(Server());
+
+        _tokens.Verify(t => t.RevokeAsync(It.IsAny<string>()), Times.Never);
+    }
 }

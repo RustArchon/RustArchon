@@ -104,8 +104,9 @@ server.
   (no silent downgrade), backs up `<name>.cs` to `.bak`, swaps with `File.Replace`, and waits for the new main
   plugin to write a `loaded.<version>` marker; if it does not appear in time it restores `.bak`. (The marker
   uses only `System.IO`, which the spike proved works.)
-- **The Updater itself is updated manually** (re-download from the Panel), because a failed Updater has no one to
-  recover it. The handshake reports its version and the Panel warns when it is old.
+- **The Updater is never updated by itself**, because a failed Updater has no one to recover it. From plugin 0.8.0 the **main plugin**
+  installs and updates the Updater and puts the old one back if the new one does not come up (see "Updater self-update" below), so there is no
+  hand maintenance; the very first install of the main plugin is still by hand. (Earlier text: re-download from the Panel.) The handshake reports its version and the Panel warns when it is old.
 - **Rotation:** a bridge release signed with the old key that embeds the new key. "Regenerate key" without that
   flow would strand every installed plugin, so it is gated behind the flow.
 - RCON frames carrying token URLs are already flagged so only the site owner sees them; tokens are still
@@ -404,7 +405,7 @@ exists locally only; nothing is on GitHub until Scott confirms visibility and li
 - Not yet run live (unit and contract tested, including real HTTP): bad signature, wrong key, older version,
   corrupt download, token reuse. The `PluginUpdateAttempt` audit rows and the "updater is out of date" warning are
   not built.
-- The Updater's own updates stay manual by design.
+- The Updater's own updates were manual by design; from plugin 0.8.0 the main plugin does them (see "Updater self-update").
 
 ### Phase 4b - Key rotation that does not strand old plugins
 
@@ -523,8 +524,8 @@ Built on branch `feature/overnight-hardening` in each repository, tested, **not 
   `X-RustArchon-Update-Token` and the address carries no credential (`GET /ingest/plugin` on the Panel, `GET internal/plugin/download` on
   the Api, which finds the server from the token). The token must be URL-safe base64 (letters, digits, `-`, `_`), which also rules out header
   injection. The Api chooses the form from the Updater version the server reports: 0.3.0 or newer gets the header form, anything older (or
-  unknown) still gets the token in the address, and that door stays. **The new Updater has to be installed by hand** (the Updater is never
-  self-updated); until then updates keep working exactly as before. Checked live against the local Api: a real token redeemed through the header
+  unknown) still gets the token in the address, and that door stays. A server gets the new Updater through the Updater self-update below (no
+  hand install); until then updates keep working exactly as before. Checked live against the local Api: a real token redeemed through the header
   door returned the signed 0.7.0 script with `Cache-Control: no-store`, and the same token answered 404 the second time.
 - **Names on the Bases list.** The game only gives the plugin the ids on a cupboard, so anyone offline showed as a number. The Api now fills
   the gap when it serves the list, from the name each player used in their latest session on that server (the Worker records every connection),
@@ -569,6 +570,38 @@ Built on the same `feature/overnight-hardening` branches; **not yet run against 
 - **Later: an Update button.** Not possible from what UpdateChecker provides (a page, not a file). Paid marketplaces will not hand a server a file
   without a login, so this would need a per-marketplace answer (uMod publishes downloads; Codefling and others do not) and a way for the
   server owner to supply credentials. To be designed separately.
+
+### Updater self-update (2026-09-20, plugin 0.8.0 and Updater 0.3.0)
+
+Scott's requirement: no manual maintenance. The reason the Updater was manual is that it is the only thing that can roll back a bad main-plugin
+update, so a bad Updater would have nothing to recover it. The answer is that each is the other's way back.
+
+- **Who does what.** The **main plugin** downloads, verifies, swaps and watches the Updater (`archon.updater.update <version> <url> <token>`,
+  `archon.updater.status`, capability `updater-update`); the Updater keeps doing the same for the main plugin. Only one is ever replaced at a
+  time: each refuses to start while the other's state file says it is downloading or loading (`update-status.txt` / `updater-swap.txt`).
+- **What is checked.** The last-line signature must verify under the key **this plugin** trusts (its own stamp, which must itself verify), the
+  `[Info("RustArchonUpdater", ...)]` version must be the one asked for and newer than the installed one (no downgrade), and the file must
+  arrive within the 1 MB cap with redirects refused and the token in a header. Otherwise nothing on disk changes.
+- **Rollback.** The previous file is kept as `RustArchonUpdater.cs.bak`. The new Updater writes `updater-loaded.txt` (version and time) when it
+  comes up - a copy that fails to compile never does - and the main plugin waits for that marker for 45 seconds, then restores the backup. The
+  swap survives the main plugin reloading (the state is on disk and resumed at load). If there was no Updater at all (a **fresh install**), the
+  file that did not come up is simply removed.
+- **Key rotation.** The Panel signs the Updater with its active key, which the plugin that installs it must trust, so a server still on an older key
+  is told to **update the plugin first** (`update_plugin_first`); that bridge moves it to the new key, after which the Updater can be updated.
+- **Bootstrap.** No hand-install is needed even for servers running Updater 0.2.0: the old Updater updates the main plugin to 0.8.0 as always, and
+  0.8.0 then updates the Updater. `plugin_too_old` tells the Panel's user to do the plugin first when the capability is missing.
+- **Api.** `POST api/rustservers/{id}/plugin/update-updater` (`PluginUpdateService.StartUpdaterAsync`, same switch, permission and result shape as
+  the plugin update). Preconditions: updates on, handshake known, the plugin's signature valid and its key the Panel's **active** one, the
+  `updater-update` capability, and a newer (or missing) Updater. The token has a **purpose** (`main` or `updater`; new column, migration
+  `AddPluginUpdateTokenPurpose`) so a token minted for one file can never fetch the other; the download door serves the Updater only to an
+  `updater` token whose key is still active. The command always uses the header form (`archon.updater.update <v> <panel>/ingest/plugin <token>`).
+- **Panel.** On the Plugins tab an outdated Updater shows "Update Updater", a missing one "Install Updater" (with the download kept as the by-hand
+  route when the plugin is too old, the key is not the Panel's current one, or updates are off - with a hint to turn them on). The result reads
+  "started" only; the outcome shows in the Updater's version after Refresh.
+- **Tested** with a temp plugins folder (signed, unsigned, wrong key, tampered, wrong version, not newer, busy, timeout, missing/changed file,
+  reload mid-swap, rollback, fresh install, real HTTP with the token in a header) and end to end with the real Api-signed Updater and the real
+  Updater's marker. **Not yet run on a real game server**: a live swap and a live rollback (a deliberately broken Updater) still need doing on
+  Rusty Amigos once the main plugin 0.8.0 is on it, which needs the Panel reachable from the game server.
 
 ### Phase 5 - Session replay UI (later)
 

@@ -44,6 +44,11 @@ namespace Oxide.Plugins
         internal const string MainScriptFileName = "RustArchon.cs";
         internal const string StatusFileName = "update-status.txt";
         internal const string LoadedMarkerFileName = "loaded.txt";
+
+        // What this Updater writes when it loads, for the main plugin to read (the reverse of the marker above), and the main plugin's own
+        // state file for replacing this Updater.
+        internal const string OwnMarkerFileName = "updater-loaded.txt";
+        internal const string MainSwapFileName = "updater-swap.txt";
         internal const int MaxDownloadBytes = 1024 * 1024;
         internal const int DownloadTimeoutSeconds = 30;
         internal const int MaxTokenLength = 128;
@@ -121,8 +126,28 @@ namespace Oxide.Plugins
                 SaveState();
             }
 
+            // Written on every load so the main plugin, which replaces this file and puts the old one back if it does not come up,
+            // can tell that a freshly swapped-in Updater actually ran. A version that fails to compile never gets here.
+            WriteLoadedMarker();
+
             Puts("Init v" + Version + " phase=" + State.Phase + " signature=" + Integrity.State
                 + (Integrity.KeyFingerprint.Length > 0 ? " key=" + Integrity.KeyFingerprint : ""));
+        }
+
+        // "version=<x.y.z>" and "utc=<round-trip time>" next to the status file. Best effort: never stops the plugin loading.
+        internal void WriteLoadedMarker()
+        {
+            try
+            {
+                if (DataDirectory == null) { return; }
+                Directory.CreateDirectory(DataDirectory);
+                File.WriteAllText(
+                    Path.Combine(DataDirectory, OwnMarkerFileName),
+                    "version=" + Version + "\nutc=" + UtcNow().ToString("o") + "\n");
+            }
+            catch (Exception)
+            {
+            }
         }
 
         private void Unload()
@@ -161,6 +186,12 @@ namespace Oxide.Plugins
             if (State.Phase == PhaseDownloading || State.Phase == PhaseLoading)
             {
                 return UpdaterJson.Err("busy", "an update is already in progress (" + State.Phase + ")");
+            }
+
+            // The main plugin is replacing THIS file right now: each would be watching the other move.
+            if (UpdaterSwapInProgress())
+            {
+                return UpdaterJson.Err("busy", "the RustArchon plugin is replacing this Updater right now");
             }
 
             if (!UpdaterLogic.IsVersion(version))
@@ -514,6 +545,32 @@ namespace Oxide.Plugins
         }
 
         // ---- state on disk (so a reload of this plugin mid-update does not lose track of it) ---------------------
+
+        // The main plugin's state file for its replacement of this Updater, read only to avoid overlapping with it.
+        private bool UpdaterSwapInProgress()
+        {
+            try
+            {
+                if (DataDirectory == null) { return false; }
+                var path = Path.Combine(DataDirectory, MainSwapFileName);
+                if (!File.Exists(path)) { return false; }
+
+                foreach (var line in File.ReadAllLines(path))
+                {
+                    if (line.StartsWith("phase=", StringComparison.Ordinal))
+                    {
+                        var phase = line.Substring(6).Trim();
+                        return phase == "downloading" || phase == "loading";
+                    }
+                }
+            }
+            catch (Exception)
+            {
+                return true;
+            }
+
+            return false;
+        }
 
         private void SaveState()
         {

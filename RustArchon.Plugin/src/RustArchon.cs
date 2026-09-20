@@ -38,11 +38,16 @@ namespace Oxide.Plugins
         // What this build can actually do. A capability is listed only once its code exists, so the panel
         // never enables a feature the installed plugin cannot perform. "recording" and "combat" arrive with
         // their hooks in a later phase; until then only the settings channel itself is offered.
-        private static readonly string[] Capabilities = { "config", "combat", "tcs", "positions", "map", "updates" };
+        private static readonly string[] Capabilities = { "config", "combat", "tcs", "positions", "map", "updates", "updater-update" };
 
         // Set by Init unless something (a test) supplied a path first.
         internal string SettingsFilePath;
         internal string ScriptFilePath;
+        // The key this plugin trusts: stamped in by the Panel that served it. Fields, not constants, only so a test can supply one;
+        // nothing at runtime ever assigns them.
+        internal string TrustedModulus = ArchonIntegrity.TrustedModulus;
+        internal string TrustedExponent = ArchonIntegrity.TrustedExponent;
+
         internal ArchonSettings Settings = new ArchonSettings();
         internal ArchonIntegrity.Result Integrity = ArchonIntegrity.Result.Unlocated;
         private bool _settingsPersisted;
@@ -66,9 +71,10 @@ namespace Oxide.Plugins
             {
                 ScriptFilePath = LocateOwnScriptPath();
             }
-            Integrity = ArchonIntegrity.CheckFile(ScriptFilePath, ArchonIntegrity.TrustedModulus, ArchonIntegrity.TrustedExponent);
+            Integrity = ArchonIntegrity.CheckFile(ScriptFilePath, TrustedModulus, TrustedExponent);
 
             WriteLoadedMarker();
+            ResumeUpdaterSwap();
 
             // Dormant by default: the damage hooks fire for every hit on every entity, so they are only subscribed
             // while the Combat log switch is on (see ApplyCombatSubscription).
@@ -158,6 +164,483 @@ namespace Oxide.Plugins
             if (arg.Connection != null) { return; }
 
             arg.ReplyWith(ArchonJson.Ok(UpdateNotices.ToJson()));
+        }
+
+        // ---- updating the Updater ----------------------------------------------------------------------------
+        //
+        // The Updater replaces this plugin; this plugin replaces the Updater. Each is the other's way back: an Updater that came up
+        // broken (it failed to compile, or crashed in Init) cannot restore itself, so THIS plugin, which is running, puts the previous
+        // Updater file back if the new one does not report loading in time. That is why the Updater is only replaced from here and never
+        // by itself, and only while this plugin is running and verified.
+        //
+        // The new Updater is accepted only if its last-line signature verifies under the key THIS plugin trusts (the key stamped into
+        // this file, which must itself verify), its [Info] version is the one asked for, and it is newer than the one installed. The
+        // download is capped, refuses redirects and carries the one-time token in a header.
+
+        internal const string UpdaterScriptFileName = "RustArchonUpdater.cs";
+        internal const string UpdaterSwapFileName = "updater-swap.txt";
+        internal const string UpdaterLoadedMarkerFileName = "updater-loaded.txt";
+        internal const string UpdaterOwnStatusFileName = "update-status.txt";
+        internal const int UpdaterLoadWaitSeconds = 45;
+
+        // Where things are. Resolved by Init from where this file and its settings live, unless a test supplied them first.
+        internal string PluginDirectory;
+        internal string DataDirectory;
+        internal Func<string, string, byte[]> UpdaterDownload = ArchonUpdaterSwap.DefaultDownload;
+        internal Func<DateTime> UtcNow = delegate { return DateTime.UtcNow; };
+        internal ArchonUpdaterSwap.State UpdaterSwap = new ArchonUpdaterSwap.State();
+        private ArchonUpdaterSwap.Download _updaterDownload;
+        private Timer _updaterTimer;
+
+        // archon.updater.update <version> <url> <token>
+        [ConsoleCommand("archon.updater.update")]
+        internal void CmdUpdaterUpdate(ConsoleSystem.Arg arg)
+        {
+            if (arg.Connection != null) { return; }
+
+            if (!arg.HasArgs(3) || arg.HasArgs(4))
+            {
+                arg.ReplyWith(ArchonJson.Err("usage", "archon.updater.update <version> <url> <token>"));
+                return;
+            }
+
+            arg.ReplyWith(BeginUpdaterUpdate(arg.GetString(0, ""), arg.GetString(1, ""), arg.GetString(2, "")));
+        }
+
+        // archon.updater.status
+        [ConsoleCommand("archon.updater.status")]
+        internal void CmdUpdaterStatus(ConsoleSystem.Arg arg)
+        {
+            if (arg.Connection != null) { return; }
+
+            var installed = ReadInstalledUpdaterVersion();
+            arg.ReplyWith(ArchonJson.Ok(
+                "{\"phase\":" + ArchonJson.Quote(UpdaterSwap.Phase)
+                + ",\"targetVersion\":" + ArchonJson.Quote(UpdaterSwap.Target)
+                + ",\"previousVersion\":" + ArchonJson.Quote(UpdaterSwap.Previous)
+                + ",\"installedVersion\":" + ArchonJson.Quote(installed ?? "")
+                + ",\"reason\":" + ArchonJson.Quote(UpdaterSwap.Reason) + "}"));
+        }
+
+        // Validates the request and starts the download. Returns the JSON reply.
+        internal string BeginUpdaterUpdate(string version, string url, string token)
+        {
+            if (UpdaterSwap.Phase == ArchonUpdaterSwap.PhaseDownloading || UpdaterSwap.Phase == ArchonUpdaterSwap.PhaseLoading)
+            {
+                return ArchonJson.Err("busy", "an Updater update is already in progress (" + UpdaterSwap.Phase + ")");
+            }
+
+            // Fail closed: nothing is installed on the say-so of a plugin that cannot vouch for its own file.
+            if (Integrity.State != "valid" || !ArchonIntegrity.IsStamped(TrustedModulus, TrustedExponent))
+            {
+                return ArchonJson.Err("not_verified", "this plugin does not verify under its own key (" + Integrity.State + "), so it will not install anything");
+            }
+
+            if (!ArchonUpdaterSwap.IsVersion(version))
+            {
+                return ArchonJson.Err("bad_version", "version must look like 1.2.3");
+            }
+
+            Uri uri;
+            if (!ArchonUpload.TryParseUrl(url, out uri))
+            {
+                return ArchonJson.Err("bad_url", "url must be an absolute http or https address with no credentials in it");
+            }
+
+            if (!ArchonUpload.IsValidToken(token))
+            {
+                return ArchonJson.Err("bad_token", "the token must be 1 to " + ArchonUpload.MaxTokenLength + " letters, digits, dashes or underscores");
+            }
+
+            var path = UpdaterScriptPathOrNull();
+            if (path == null || !Directory.Exists(PluginDirectory))
+            {
+                return ArchonJson.Err("plugins_folder_unknown", "the plugins folder this plugin lives in could not be found");
+            }
+
+            // Never swap while the Updater is in the middle of replacing this plugin: each would be watching the other move.
+            if (MainUpdateInProgress())
+            {
+                return ArchonJson.Err("busy", "the Updater is updating this plugin right now");
+            }
+
+            // No Updater file at all is a fresh install (there is nothing to be newer than, and nothing to put back on failure - the new
+            // file is simply removed). One that exists must be readable and older than what is offered.
+            var present = File.Exists(path);
+            var installed = present ? ReadInstalledUpdaterVersion() : "";
+            if (present && installed == null)
+            {
+                return ArchonJson.Err("updater_unreadable", "the installed Updater has no readable version");
+            }
+
+            if (present && ArchonUpdaterSwap.CompareVersions(version, installed) <= 0)
+            {
+                return ArchonJson.Err("not_newer", "installed " + installed + ", offered " + version);
+            }
+
+            UpdaterSwap = new ArchonUpdaterSwap.State
+            {
+                Phase = ArchonUpdaterSwap.PhaseDownloading, Target = version, Previous = installed, StartedUtc = UtcNow()
+            };
+            SaveUpdaterSwap();
+
+            var download = new ArchonUpdaterSwap.Download();
+            _updaterDownload = download;
+            var download_url = url;
+            var download_token = token;
+            RunInBackground(delegate
+            {
+                try
+                {
+                    download.Bytes = UpdaterDownload(download_url, download_token);
+                }
+                catch (Exception e)
+                {
+                    download.Error = e.GetType().Name + ": " + e.Message;
+                }
+                finally
+                {
+                    download.Done = true;
+                }
+            });
+
+            StartUpdaterTicker();
+            return ArchonJson.Ok("{\"phase\":\"downloading\",\"installedVersion\":" + ArchonJson.Quote(installed)
+                + ",\"targetVersion\":" + ArchonJson.Quote(version) + "}");
+        }
+
+        // Runs once a second, on the game thread, only while an Updater update is in progress.
+        internal void UpdaterTick()
+        {
+            if (UpdaterSwap.Phase == ArchonUpdaterSwap.PhaseDownloading)
+            {
+                TickUpdaterDownloading();
+            }
+            else if (UpdaterSwap.Phase == ArchonUpdaterSwap.PhaseLoading)
+            {
+                TickUpdaterLoading();
+            }
+            else
+            {
+                StopUpdaterTicker();
+            }
+        }
+
+        private void TickUpdaterDownloading()
+        {
+            var download = _updaterDownload;
+            if (download == null || !download.Done)
+            {
+                if ((UtcNow() - UpdaterSwap.StartedUtc).TotalSeconds > ArchonUpdaterSwap.DownloadTimeoutSeconds + 15)
+                {
+                    FailUpdaterSwap("download_timeout", "no answer within " + (ArchonUpdaterSwap.DownloadTimeoutSeconds + 15) + " seconds");
+                }
+                return;
+            }
+
+            if (download.Error != null || download.Bytes == null)
+            {
+                FailUpdaterSwap("download_failed", download.Error ?? "no data");
+                return;
+            }
+
+            VerifyAndApplyUpdater(download.Bytes);
+        }
+
+        private void VerifyAndApplyUpdater(byte[] bytes)
+        {
+            var check = ArchonIntegrity.CheckLastLine(bytes, TrustedModulus, TrustedExponent);
+            if (check.State != "valid")
+            {
+                FailUpdaterSwap("signature_" + check.State, "the downloaded file did not verify against this plugin's key " + check.KeyFingerprint);
+                return;
+            }
+
+            var text = Encoding.UTF8.GetString(bytes);
+            var offered = ArchonUpdaterSwap.ReadInfoVersion(text);
+            if (offered == null)
+            {
+                FailUpdaterSwap("not_an_updater", "the downloaded file has no RustArchonUpdater [Info] version");
+                return;
+            }
+
+            if (offered != UpdaterSwap.Target)
+            {
+                FailUpdaterSwap("version_mismatch", "asked for " + UpdaterSwap.Target + " but the file is " + offered);
+                return;
+            }
+
+            var installedNow = ReadInstalledUpdaterVersion();
+            var presentNow = File.Exists(UpdaterScriptPathOrNull());
+            if (presentNow && (installedNow == null || ArchonUpdaterSwap.CompareVersions(offered, installedNow) <= 0))
+            {
+                FailUpdaterSwap("not_newer", "installed " + (installedNow ?? "unreadable") + ", offered " + offered);
+                return;
+            }
+
+            if (!presentNow != (UpdaterSwap.Previous.Length == 0))
+            {
+                FailUpdaterSwap("changed", "the Updater file was added or removed while the download ran");
+                return;
+            }
+
+            // The Updater may have started an update of this plugin while the download ran.
+            if (MainUpdateInProgress())
+            {
+                FailUpdaterSwap("busy", "the Updater started updating this plugin");
+                return;
+            }
+
+            ApplyUpdater(bytes);
+        }
+
+        private void ApplyUpdater(byte[] bytes)
+        {
+            var target = UpdaterScriptPathOrNull();
+            var temp = target + ".new";
+            var backup = target + ".bak";
+
+            try
+            {
+                Directory.CreateDirectory(DataDirectory);
+                File.WriteAllBytes(temp, bytes);
+                var fresh = !File.Exists(target);
+                if (!fresh) { File.Copy(target, backup, true); }
+                UpdaterSwap.SwapUtc = UtcNow();
+                if (fresh) { File.Move(temp, target); }
+                else { ArchonUpdaterSwap.SwapInto(temp, target); }
+            }
+            catch (Exception e)
+            {
+                ArchonUpdaterSwap.TryDelete(temp);
+                FailUpdaterSwap("apply_failed", e.GetType().Name + ": " + e.Message);
+                return;
+            }
+
+            UpdaterSwap.Phase = ArchonUpdaterSwap.PhaseLoading;
+            UpdaterSwap.Reason = "";
+            SaveUpdaterSwap();
+            Puts("Swapped in RustArchonUpdater " + UpdaterSwap.Target + "; waiting for it to load.");
+        }
+
+        private void TickUpdaterLoading()
+        {
+            var marker = ReadUpdaterMarker();
+            if (marker != null && marker.Version == UpdaterSwap.Target && marker.Utc >= UpdaterSwap.SwapUtc.AddSeconds(-2))
+            {
+                UpdaterSwap.Phase = ArchonUpdaterSwap.PhaseSucceeded;
+                UpdaterSwap.Reason = "";
+                SaveUpdaterSwap();
+                StopUpdaterTicker();
+                Puts("RustArchonUpdater " + UpdaterSwap.Target + " loaded; Updater update succeeded.");
+                return;
+            }
+
+            if ((UtcNow() - UpdaterSwap.SwapUtc).TotalSeconds > UpdaterLoadWaitSeconds)
+            {
+                RollBackUpdater("the new Updater did not report loading within " + UpdaterLoadWaitSeconds + " seconds");
+            }
+        }
+
+        private void RollBackUpdater(string reason)
+        {
+            var target = UpdaterScriptPathOrNull();
+            var backup = target == null ? null : target + ".bak";
+
+            try
+            {
+                if (UpdaterSwap.Previous.Length == 0)
+                {
+                    // There was no Updater before: the one that did not come up is removed, leaving the server as it was.
+                    if (target != null && File.Exists(target)) { File.Delete(target); }
+                    UpdaterSwap.Phase = ArchonUpdaterSwap.PhaseRolledBack;
+                    UpdaterSwap.Reason = reason;
+                }
+                else if (backup == null || !File.Exists(backup))
+                {
+                    UpdaterSwap.Phase = ArchonUpdaterSwap.PhaseFailed;
+                    UpdaterSwap.Reason = "rollback impossible: no backup found (" + reason + ")";
+                }
+                else
+                {
+                    File.Copy(backup, target, true);
+                    UpdaterSwap.Phase = ArchonUpdaterSwap.PhaseRolledBack;
+                    UpdaterSwap.Reason = reason;
+                }
+            }
+            catch (Exception e)
+            {
+                UpdaterSwap.Phase = ArchonUpdaterSwap.PhaseFailed;
+                UpdaterSwap.Reason = "rollback failed: " + e.GetType().Name + ": " + e.Message + " (" + reason + ")";
+            }
+
+            SaveUpdaterSwap();
+            StopUpdaterTicker();
+            Puts("Updater update " + UpdaterSwap.Target + " " + UpdaterSwap.Phase + ": " + UpdaterSwap.Reason);
+        }
+
+        private void FailUpdaterSwap(string code, string detail)
+        {
+            UpdaterSwap.Phase = ArchonUpdaterSwap.PhaseFailed;
+            UpdaterSwap.Reason = code + ": " + detail;
+            SaveUpdaterSwap();
+            StopUpdaterTicker();
+            Puts("Updater update " + UpdaterSwap.Target + " failed: " + UpdaterSwap.Reason);
+        }
+
+        // At load: an Updater swap that was made but not yet confirmed when this plugin (re)loaded keeps being watched, so a broken
+        // Updater is still put back; a download that died with the previous instance changed nothing on disk and is only recorded.
+        internal void ResumeUpdaterSwap()
+        {
+            if (PluginDirectory == null && ScriptFilePath != null) { PluginDirectory = Path.GetDirectoryName(ScriptFilePath); }
+            if (DataDirectory == null && SettingsFilePath != null) { DataDirectory = Path.GetDirectoryName(SettingsFilePath); }
+
+            UpdaterSwap = LoadUpdaterSwap();
+            if (UpdaterSwap.Phase == ArchonUpdaterSwap.PhaseLoading)
+            {
+                StartUpdaterTicker();
+            }
+            else if (UpdaterSwap.Phase == ArchonUpdaterSwap.PhaseDownloading)
+            {
+                UpdaterSwap.Phase = ArchonUpdaterSwap.PhaseFailed;
+                UpdaterSwap.Reason = "interrupted: this plugin reloaded during the download";
+                SaveUpdaterSwap();
+            }
+        }
+
+        private void StartUpdaterTicker()
+        {
+            if (_updaterTimer == null) { _updaterTimer = timer.Every(1f, UpdaterTick); }
+        }
+
+        private void StopUpdaterTicker()
+        {
+            if (_updaterTimer != null) { _updaterTimer.Destroy(); _updaterTimer = null; }
+        }
+
+        internal string UpdaterScriptPathOrNull()
+        {
+            return PluginDirectory == null ? null : Path.Combine(PluginDirectory, UpdaterScriptFileName);
+        }
+
+        internal string ReadInstalledUpdaterVersion()
+        {
+            try
+            {
+                var path = UpdaterScriptPathOrNull();
+                return path != null && File.Exists(path) ? ArchonUpdaterSwap.ReadInfoVersion(File.ReadAllText(path)) : null;
+            }
+            catch (Exception)
+            {
+                return null;
+            }
+        }
+
+        // The Updater's own state file, read only to see whether it is in the middle of replacing this plugin.
+        private bool MainUpdateInProgress()
+        {
+            try
+            {
+                if (DataDirectory == null) { return false; }
+                var path = Path.Combine(DataDirectory, UpdaterOwnStatusFileName);
+                if (!File.Exists(path)) { return false; }
+
+                foreach (var line in File.ReadAllLines(path))
+                {
+                    if (line.StartsWith("phase=", StringComparison.Ordinal))
+                    {
+                        var phase = line.Substring(6).Trim();
+                        return phase == "downloading" || phase == "loading";
+                    }
+                }
+            }
+            catch (Exception)
+            {
+                return true;    // cannot tell: do not start something that must not overlap
+            }
+
+            return false;
+        }
+
+        // What the new Updater writes when it comes up ("version=<x.y.z>" and "utc=<round-trip time>").
+        private ArchonUpdaterSwap.Marker ReadUpdaterMarker()
+        {
+            try
+            {
+                if (DataDirectory == null) { return null; }
+                var path = Path.Combine(DataDirectory, UpdaterLoadedMarkerFileName);
+                if (!File.Exists(path)) { return null; }
+
+                var marker = new ArchonUpdaterSwap.Marker();
+                foreach (var line in File.ReadAllLines(path))
+                {
+                    if (line.StartsWith("version=", StringComparison.Ordinal)) { marker.Version = line.Substring(8).Trim(); }
+                    else if (line.StartsWith("utc=", StringComparison.Ordinal))
+                    {
+                        DateTime utc;
+                        if (DateTime.TryParse(line.Substring(4).Trim(), System.Globalization.CultureInfo.InvariantCulture,
+                            System.Globalization.DateTimeStyles.RoundtripKind, out utc))
+                        {
+                            marker.Utc = utc.ToUniversalTime();
+                        }
+                    }
+                }
+                return marker.Version == null ? null : marker;
+            }
+            catch (Exception)
+            {
+                return null;
+            }
+        }
+
+        private ArchonUpdaterSwap.State LoadUpdaterSwap()
+        {
+            var state = new ArchonUpdaterSwap.State();
+            try
+            {
+                if (DataDirectory == null) { return state; }
+                var path = Path.Combine(DataDirectory, UpdaterSwapFileName);
+                if (!File.Exists(path)) { return state; }
+
+                foreach (var line in File.ReadAllLines(path))
+                {
+                    var eq = line.IndexOf('=');
+                    if (eq <= 0) { continue; }
+                    var key = line.Substring(0, eq);
+                    var value = line.Substring(eq + 1);
+                    switch (key)
+                    {
+                        case "phase": state.Phase = value; break;
+                        case "target": state.Target = value; break;
+                        case "previous": state.Previous = value; break;
+                        case "reason": state.Reason = value; break;
+                        case "started": state.StartedUtc = ArchonUpdaterSwap.ParseUtc(value); break;
+                        case "swapped": state.SwapUtc = ArchonUpdaterSwap.ParseUtc(value); break;
+                    }
+                }
+            }
+            catch (Exception)
+            {
+                return new ArchonUpdaterSwap.State();
+            }
+            return state;
+        }
+
+        private void SaveUpdaterSwap()
+        {
+            try
+            {
+                if (DataDirectory == null) { return; }
+                Directory.CreateDirectory(DataDirectory);
+                File.WriteAllText(
+                    Path.Combine(DataDirectory, UpdaterSwapFileName),
+                    "phase=" + UpdaterSwap.Phase + "\ntarget=" + UpdaterSwap.Target + "\nprevious=" + UpdaterSwap.Previous
+                    + "\nreason=" + UpdaterSwap.Reason.Replace('\n', ' ').Replace('\r', ' ')
+                    + "\nstarted=" + UpdaterSwap.StartedUtc.ToString("o") + "\nswapped=" + UpdaterSwap.SwapUtc.ToString("o") + "\n");
+            }
+            catch (Exception)
+            {
+            }
         }
 
         // ---- combat log --------------------------------------------------------------------------------------
@@ -1918,6 +2401,150 @@ namespace Oxide.Plugins
                 sb.Append("]}");
                 return sb.ToString();
             }
+        }
+    }
+
+    // The pure parts of replacing the Updater: phases, the state it keeps, version handling, the download and the file swap.
+    internal static class ArchonUpdaterSwap
+    {
+        internal const string PhaseIdle = "idle";
+        internal const string PhaseDownloading = "downloading";
+        internal const string PhaseLoading = "loading";
+        internal const string PhaseSucceeded = "succeeded";
+        internal const string PhaseFailed = "failed";
+        internal const string PhaseRolledBack = "rolled-back";
+
+        internal const int MaxDownloadBytes = 1024 * 1024;
+        internal const int DownloadTimeoutSeconds = 30;
+        internal const string TokenHeader = "X-RustArchon-Update-Token";
+
+        internal sealed class State
+        {
+            public string Phase = PhaseIdle;
+            public string Target = "";
+            public string Previous = "";
+            public string Reason = "";
+            public DateTime StartedUtc = DateTime.MinValue;
+            public DateTime SwapUtc = DateTime.MinValue;
+        }
+
+        internal sealed class Download
+        {
+            public volatile bool Done;
+            public byte[] Bytes;
+            public string Error;
+        }
+
+        internal sealed class Marker
+        {
+            public string Version;
+            public DateTime Utc = DateTime.MinValue;
+        }
+
+        // [Info("RustArchonUpdater", "<author>", "x.y.z")] - the exact quoted title means the main plugin's own [Info] can never be
+        // mistaken for it.
+        private static readonly System.Text.RegularExpressions.Regex InfoVersion = new System.Text.RegularExpressions.Regex(
+            "\\[Info\\(\"RustArchonUpdater\"\\s*,\\s*\"[^\"]*\"\\s*,\\s*\"(\\d+\\.\\d+\\.\\d+)\"\\)\\]");
+
+        internal static string ReadInfoVersion(string scriptText)
+        {
+            if (scriptText == null) { return null; }
+            var match = InfoVersion.Match(scriptText);
+            return match.Success ? match.Groups[1].Value : null;
+        }
+
+        internal static bool IsVersion(string text)
+        {
+            if (string.IsNullOrEmpty(text)) { return false; }
+            var parts = text.Split('.');
+            if (parts.Length != 3) { return false; }
+            for (var i = 0; i < parts.Length; i++)
+            {
+                if (parts[i].Length == 0 || parts[i].Length > 9) { return false; }
+                for (var j = 0; j < parts[i].Length; j++)
+                {
+                    if (parts[i][j] < '0' || parts[i][j] > '9') { return false; }
+                }
+            }
+            return true;
+        }
+
+        // Negative when a is older than b, zero when equal, positive when newer. Both must be x.y.z.
+        internal static int CompareVersions(string a, string b)
+        {
+            var left = a.Split('.');
+            var right = b.Split('.');
+            for (var i = 0; i < 3; i++)
+            {
+                var l = int.Parse(left[i]);
+                var r = int.Parse(right[i]);
+                if (l != r) { return l < r ? -1 : 1; }
+            }
+            return 0;
+        }
+
+        internal static DateTime ParseUtc(string text)
+        {
+            DateTime utc;
+            if (DateTime.TryParse(text, System.Globalization.CultureInfo.InvariantCulture, System.Globalization.DateTimeStyles.RoundtripKind, out utc))
+            {
+                return utc.ToUniversalTime();
+            }
+            return DateTime.MinValue;
+        }
+
+        // On a worker thread. Redirects are refused (a token address should answer directly, and following one could send the
+        // token elsewhere) and the body is capped so a hostile server cannot make it read without limit.
+        internal static byte[] DefaultDownload(string url, string token)
+        {
+            var request = (HttpWebRequest)WebRequest.Create(url);
+            request.Timeout = DownloadTimeoutSeconds * 1000;
+            request.ReadWriteTimeout = DownloadTimeoutSeconds * 1000;
+            request.AllowAutoRedirect = false;
+            request.UserAgent = "RustArchon";
+            request.Headers[TokenHeader] = token;
+
+            using (var response = (HttpWebResponse)request.GetResponse())
+            {
+                if ((int)response.StatusCode != 200)
+                {
+                    throw new IOException("the server answered " + (int)response.StatusCode);
+                }
+
+                using (var stream = response.GetResponseStream())
+                using (var buffer = new MemoryStream())
+                {
+                    var chunk = new byte[8192];
+                    int read;
+                    while ((read = stream.Read(chunk, 0, chunk.Length)) > 0)
+                    {
+                        buffer.Write(chunk, 0, read);
+                        if (buffer.Length > MaxDownloadBytes)
+                        {
+                            throw new IOException("the download is larger than " + MaxDownloadBytes + " bytes");
+                        }
+                    }
+                    return buffer.ToArray();
+                }
+            }
+        }
+
+        internal static void SwapInto(string temp, string target)
+        {
+            try
+            {
+                File.Replace(temp, target, null);
+            }
+            catch (Exception)
+            {
+                File.Delete(target);
+                File.Move(temp, target);
+            }
+        }
+
+        internal static void TryDelete(string path)
+        {
+            try { if (File.Exists(path)) { File.Delete(path); } } catch (Exception) { }
         }
     }
 

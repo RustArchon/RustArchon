@@ -475,6 +475,44 @@ public class RustServersControllerPluginStatusTests(PostgresFixture postgres) : 
     }
 
     [Fact]
+    public async Task StartUpdaterUpdate_IsNotFoundForAnUnknownServer()
+    {
+        var h = await CreateHarnessAsync();
+
+        var result = await h.Controller.StartUpdaterUpdate(Guid.NewGuid());
+
+        Assert.IsType<NotFoundResult>(result.Result);
+        h.Update.Verify(u => u.StartUpdaterAsync(It.IsAny<RustServer>()), Times.Never);
+    }
+
+    [Fact]
+    public async Task StartUpdaterUpdate_NeverReachesAnotherTenantsServer()
+    {
+        var a = await CreateHarnessAsync();
+        var b = await CreateHarnessAsync();
+        var serverInB = await CreateServerAsync(b.Controller, "Tenant B");
+
+        var result = await a.Controller.StartUpdaterUpdate(serverInB);
+
+        Assert.IsType<NotFoundResult>(result.Result);
+        a.Update.Verify(u => u.StartUpdaterAsync(It.IsAny<RustServer>()), Times.Never);
+    }
+
+    [Fact]
+    public async Task StartUpdaterUpdate_HandsTheServerToTheServiceAndReturnsItsAnswer()
+    {
+        var h = await CreateHarnessAsync();
+        var id = await CreateServerAsync(h.Controller, "Update my Updater");
+        var answer = new PluginUpdateResultDto { Started = true, Code = "started", Message = "going" };
+        h.Update.Setup(u => u.StartUpdaterAsync(It.Is<RustServer>(s => s.Id == id))).ReturnsAsync(answer);
+
+        var result = await h.Controller.StartUpdaterUpdate(id);
+
+        Assert.Same(answer, Assert.IsType<OkObjectResult>(result.Result).Value);
+        h.Update.Verify(u => u.StartAsync(It.IsAny<RustServer>()), Times.Never);      // the plugin update is a different action
+    }
+
+    [Fact]
     public async Task DownloadPluginUpdater_ServesTheSignedUpdaterWithItsFingerprint()
     {
         var h = await CreateHarnessAsync();
