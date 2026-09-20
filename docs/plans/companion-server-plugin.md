@@ -104,7 +104,7 @@ server.
   (no silent downgrade), backs up `<name>.cs` to `.bak`, swaps with `File.Replace`, and waits for the new main
   plugin to write a `loaded.<version>` marker; if it does not appear in time it restores `.bak`. (The marker
   uses only `System.IO`, which the spike proved works.)
-- **The Updater is never updated by itself**, because a failed Updater has no one to recover it. From plugin 0.8.0 the **main plugin**
+- **The Updater is never updated by itself**, because a failed Updater has no one to recover it. From plugin 0.9.0 the **main plugin**
   installs and updates the Updater and puts the old one back if the new one does not come up (see "Updater self-update" below), so there is no
   hand maintenance; the very first install of the main plugin is still by hand. (Earlier text: re-download from the Panel.) The handshake reports its version and the Panel warns when it is old.
 - **Rotation:** a bridge release signed with the old key that embeds the new key. "Regenerate key" without that
@@ -405,7 +405,7 @@ exists locally only; nothing is on GitHub until Scott confirms visibility and li
 - Not yet run live (unit and contract tested, including real HTTP): bad signature, wrong key, older version,
   corrupt download, token reuse. The `PluginUpdateAttempt` audit rows and the "updater is out of date" warning are
   not built.
-- The Updater's own updates were manual by design; from plugin 0.8.0 the main plugin does them (see "Updater self-update").
+- The Updater's own updates were manual by design; from plugin 0.9.0 the main plugin does them (see "Updater self-update").
 
 ### Phase 4b - Key rotation that does not strand old plugins
 
@@ -571,7 +571,7 @@ Built on the same `feature/overnight-hardening` branches; **not yet run against 
   without a login, so this would need a per-marketplace answer (uMod publishes downloads; Codefling and others do not) and a way for the
   server owner to supply credentials. To be designed separately.
 
-### Updater self-update (2026-09-20, plugin 0.8.0 and Updater 0.3.0)
+### Updater self-update (2026-09-20, plugin 0.9.0 and Updater 0.3.0)
 
 Scott's requirement: no manual maintenance. The reason the Updater was manual is that it is the only thing that can roll back a bad main-plugin
 update, so a bad Updater would have nothing to recover it. The answer is that each is the other's way back.
@@ -588,8 +588,8 @@ update, so a bad Updater would have nothing to recover it. The answer is that ea
   file that did not come up is simply removed.
 - **Key rotation.** The Panel signs the Updater with its active key, which the plugin that installs it must trust, so a server still on an older key
   is told to **update the plugin first** (`update_plugin_first`); that bridge moves it to the new key, after which the Updater can be updated.
-- **Bootstrap.** No hand-install is needed even for servers running Updater 0.2.0: the old Updater updates the main plugin to 0.8.0 as always, and
-  0.8.0 then updates the Updater. `plugin_too_old` tells the Panel's user to do the plugin first when the capability is missing.
+- **Bootstrap.** No hand-install is needed even for servers running Updater 0.2.0: the old Updater updates the main plugin to 0.9.0 as always, and
+  0.9.0 then updates the Updater. `plugin_too_old` tells the Panel's user to do the plugin first when the capability is missing.
 - **Api.** `POST api/rustservers/{id}/plugin/update-updater` (`PluginUpdateService.StartUpdaterAsync`, same switch, permission and result shape as
   the plugin update). Preconditions: updates on, handshake known, the plugin's signature valid and its key the Panel's **active** one, the
   `updater-update` capability, and a newer (or missing) Updater. The token has a **purpose** (`main` or `updater`; new column, migration
@@ -601,7 +601,7 @@ update, so a bad Updater would have nothing to recover it. The answer is that ea
 - **Tested** with a temp plugins folder (signed, unsigned, wrong key, tampered, wrong version, not newer, busy, timeout, missing/changed file,
   reload mid-swap, rollback, fresh install, real HTTP with the token in a header) and end to end with the real Api-signed Updater and the real
   Updater's marker. **Not yet run on a real game server**: a live swap and a live rollback (a deliberately broken Updater) still need doing on
-  Rusty Amigos once the main plugin 0.8.0 is on it, which needs the Panel reachable from the game server.
+  Rusty Amigos once the main plugin 0.9.0 is on it, which needs the Panel reachable from the game server.
 
 ### Phase 5 - Session replay UI (later)
 

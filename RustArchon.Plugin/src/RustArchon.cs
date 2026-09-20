@@ -23,7 +23,7 @@ using UnityEngine;
 
 namespace Oxide.Plugins
 {
-    [Info("RustArchon", "RustArchon", "0.8.0")]
+    [Info("RustArchon", "RustArchon", "0.9.0")]
     [Description("RustArchon companion plugin. Dormant until the RustArchon panel asks; every command is RCON-only.")]
     public class RustArchon : RustPlugin
     {
