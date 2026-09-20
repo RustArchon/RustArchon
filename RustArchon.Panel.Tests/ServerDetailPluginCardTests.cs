@@ -1984,6 +1984,129 @@ public class ServerDetailPluginCardTests : BunitContext
     }
 
     [Fact]
+    public void TheRecordingSwitchesSitBesideAFoldedExplanationOfWhatRecordingDoes()
+    {
+        GivenAutoSetup(updatesOn: true);
+
+        var cut = RenderPluginsTab();
+
+        cut.WaitForAssertion(() => Assert.NotEmpty(cut.FindAll("#plugin-recording")));
+        var disclosure = cut.Find("[data-testid=recording-disclosure]");
+        Assert.False(disclosure.HasAttribute("open"));
+        Assert.Contains("days your plan includes", cut.Find("[data-testid=recording-disclosure-how-long]").TextContent);
+    }
+
+    // ---- plugins that failed to load -----------------------------------------------------------------------
+
+    private static ServerPluginFailureDto Failed(string file, int line = 10, int column = 5, string message = "The name 'X' does not exist") =>
+        new() { FileName = file, Line = line, Column = column, Message = message, CapturedAtUtc = DateTimeOffset.UtcNow };
+
+    private void GivenFailures(params ServerPluginFailureDto[] failures) =>
+        _client.Setup(c => c.GetPluginFailuresAsync(_serverId)).ReturnsAsync([.. failures]);
+
+    [Fact]
+    public void FailedPluginsAreListedByFileWithEveryReasonAndItsPlace()
+    {
+        GivenPluginListed("Kits");
+        GivenFailures(
+            Failed("BotReSpawn.cs", 1436, 59, "Cannot implicitly convert type"),
+            Failed("BotReSpawn.cs", 2645, 48, "The name 'RustNavMesh' does not exist"),
+            Failed("CopyPaste.cs", 3645, 31, "'Sprinkler' does not contain a definition"));
+
+        var cut = RenderPluginsTab();
+
+        cut.WaitForAssertion(() => Assert.NotEmpty(cut.FindAll("[data-testid=plugin-failures]")));
+        Assert.Equal("2", cut.Find("[data-testid=plugin-failures-count]").TextContent.Trim());     // two files, three reasons
+        var files = cut.FindAll("[data-testid=plugin-failure]");
+        Assert.Equal(["BotReSpawn.cs", "CopyPaste.cs"], files.Select(f => f.GetAttribute("data-file")).ToArray());
+        var reasons = files[0].QuerySelectorAll("[data-testid=plugin-failure-reason]");
+        Assert.Equal(2, reasons.Length);
+        Assert.Contains("1436:59", reasons[0].TextContent);
+        Assert.Contains("Cannot implicitly convert type", reasons[0].TextContent);
+        Assert.Contains("2645:48", reasons[1].TextContent);
+    }
+
+    [Fact]
+    public void WhenNothingFailedThereIsNoFailedSection()
+    {
+        GivenPluginListed("Kits");
+        GivenFailures();
+
+        var cut = RenderPluginsTab();
+
+        cut.WaitForAssertion(() => Assert.NotEmpty(cut.FindAll("[data-testid=plugin-row]")));
+        Assert.Empty(cut.FindAll("[data-testid=plugin-failures]"));
+    }
+
+    [Fact]
+    public void AServerWhoseEveryPluginFailedStillShowsWhyEvenThoughTheLoadedListIsEmpty()
+    {
+        _client.Setup(c => c.GetPluginsAsync(_serverId)).ReturnsAsync([]);
+        GivenFailures(Failed("Kits.cs"));
+
+        var cut = RenderPluginsTab();
+
+        cut.WaitForAssertion(() => Assert.NotEmpty(cut.FindAll("[data-testid=plugin-failures]")));
+        Assert.NotEmpty(cut.FindAll("[data-testid=plugin-failure]"));
+    }
+
+    [Theory]
+    [InlineData("RustArchon.cs")]
+    [InlineData("rustarchon.cs")]
+    [InlineData("RustArchonUpdater.cs")]
+    public void OurOwnPluginFailingIsSaidPlainlyWithWhatToDo(string file)
+    {
+        GivenPluginListed("Kits");
+        GivenFailures(Failed(file));
+
+        var cut = RenderPluginsTab();
+
+        cut.WaitForAssertion(() => Assert.NotEmpty(cut.FindAll("[data-testid=plugin-failure-own]")));
+        Assert.Contains("replace the file on the server", cut.Find("[data-testid=plugin-failure-own-hint]").TextContent);
+    }
+
+    [Fact]
+    public void AThirdPartyPluginFailingCarriesNoSuchHint()
+    {
+        GivenPluginListed("Kits");
+        GivenFailures(Failed("BotReSpawn.cs"));
+
+        var cut = RenderPluginsTab();
+
+        cut.WaitForAssertion(() => Assert.NotEmpty(cut.FindAll("[data-testid=plugin-failure]")));
+        Assert.Empty(cut.FindAll("[data-testid=plugin-failure-own]"));
+    }
+
+    [Fact]
+    public void ACompilerMessageIsShownAsTextNeverAsMarkup()
+    {
+        GivenPluginListed("Kits");
+        GivenFailures(Failed("Evil.cs", message: "<img src=x onerror=alert(1)><b>bold</b>"), Failed("<script>alert(1)</script>.cs"));
+
+        var cut = RenderPluginsTab();
+
+        cut.WaitForAssertion(() => Assert.NotEmpty(cut.FindAll("[data-testid=plugin-failure]")));
+        Assert.Empty(cut.FindAll("[data-testid=plugin-failures] img"));
+        Assert.Empty(cut.FindAll("[data-testid=plugin-failures] b"));
+        Assert.Empty(cut.FindAll("[data-testid=plugin-failures] script"));
+        var evil = cut.FindAll("[data-testid=plugin-failure]").First(f => f.GetAttribute("data-file") == "Evil.cs");
+        Assert.Contains("<img src=x onerror=alert(1)>", evil.TextContent);
+    }
+
+    [Fact]
+    public void AFailedFetchOfTheFailuresNeitherBreaksNorHidesThePluginList()
+    {
+        GivenPluginListed("Kits");
+        _client.Setup(c => c.GetPluginFailuresAsync(_serverId)).ThrowsAsync(new HttpRequestException("boom"));
+
+        var cut = RenderPluginsTab();
+
+        cut.WaitForAssertion(() => Assert.NotEmpty(cut.FindAll("[data-testid=plugin-row]")));
+        Assert.Empty(cut.FindAll("[data-testid=plugin-failures]"));
+        Assert.Empty(cut.FindAll(".plugins-pane .alert"));
+    }
+
+    [Fact]
     public void TheAutomaticSwitchReflectsTheSavedState()
     {
         GivenAutoSetup(updatesOn: true, autoOn: true);

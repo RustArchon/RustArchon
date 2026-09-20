@@ -49,7 +49,7 @@ public class PluginAutoUpdaterTests(PostgresFixture postgres) : IClassFixture<Po
 
         public PluginAutoUpdater Create(ApiDbContext? context = null) => new(
             context ?? Context, new ServerPluginStatusRepository(context ?? Context), new ServerPluginRepository(context ?? Context), Script.Object, Attempts, Updates.Object,
-            Settings.Object, NullLogger<PluginAutoUpdater>.Instance);
+            Settings.Object, new PluginRolloutService(context ?? Context, Settings.Object), NullLogger<PluginAutoUpdater>.Instance);
     }
 
     private async Task<Kit> KitAsync(string latestMain = "0.9.0", string latestUpdater = "0.3.0", bool globalOn = true, bool purge = true)
@@ -59,6 +59,7 @@ public class PluginAutoUpdaterTests(PostgresFixture postgres) : IClassFixture<Po
         {
             await using var clean = Platform();
             await clean.PluginUpdateAttempts.AcrossAllTenants().ExecuteDeleteAsync();
+            await clean.PluginRollouts.ExecuteDeleteAsync();
             await clean.Set<ServerPlugin>().AcrossAllTenants().ExecuteDeleteAsync();
             await clean.Set<ServerPluginStatus>().AcrossAllTenants().ExecuteDeleteAsync();
             await clean.Set<PlayerSession>().AcrossAllTenants().ExecuteDeleteAsync();

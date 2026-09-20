@@ -407,7 +407,7 @@ public class RustServersControllerPluginStatusTests(PostgresFixture postgres) : 
 
         Assert.True(dto.PluginRecordingEnabled);
         Assert.True(dto.PluginCombatLogEnabled);
-        Assert.False(dto.PluginUpdatesEnabled); // updates are opt-in
+        Assert.True(dto.PluginUpdatesEnabled); // updates are on for a new server, and the owner can turn them off
     }
 
     // ---- self-update ---------------------------------------------------------------------------------------
@@ -430,11 +430,11 @@ public class RustServersControllerPluginStatusTests(PostgresFixture postgres) : 
     {
         var h = await CreateHarnessAsync();
         var id = await CreateServerAsync(h.Controller, "Edit keeps updates");
-        await h.Controller.UpdatePluginSettings(id, Switches(true, true, updates: true));
+        await h.Controller.UpdatePluginSettings(id, Switches(true, true, updates: false));
 
         var renamed = await h.Controller.Update(id, new UpdateRustServerDto { Id = id, Name = "Renamed", Host = "192.0.2.41", Port = 28016 });
 
-        Assert.True(ServerFrom(renamed).PluginUpdatesEnabled);
+        Assert.False(ServerFrom(renamed).PluginUpdatesEnabled);          // the owner's choice is what stays, on or off
     }
 
     [Fact]
@@ -670,12 +670,12 @@ public class RustServersControllerPluginStatusTests(PostgresFixture postgres) : 
     // ---- the automatic-update switch ------------------------------------------------------------------------
 
     [Fact]
-    public async Task AutoUpdateIsOffByDefault()
+    public async Task AutoUpdateIsOnByDefaultForANewServer()
     {
         var h = await CreateHarnessAsync();
         var id = await CreateServerAsync(h.Controller, "Auto default");
 
-        Assert.False(ServerFrom(await h.Controller.GetById(id)).PluginAutoUpdateEnabled);
+        Assert.True(ServerFrom(await h.Controller.GetById(id)).PluginAutoUpdateEnabled);
     }
 
     [Fact]
@@ -696,11 +696,11 @@ public class RustServersControllerPluginStatusTests(PostgresFixture postgres) : 
     {
         var h = await CreateHarnessAsync();
         var id = await CreateServerAsync(h.Controller, "Auto omitted");
-        await h.Controller.UpdatePluginSettings(id, new UpdateServerPluginSettingsDto { RecordingEnabled = true, CombatLogEnabled = true, UpdatesEnabled = true, AutoUpdateEnabled = true });
+        await h.Controller.UpdatePluginSettings(id, new UpdateServerPluginSettingsDto { RecordingEnabled = true, CombatLogEnabled = true, UpdatesEnabled = true, AutoUpdateEnabled = false });
 
         var after = ServerFrom(await h.Controller.UpdatePluginSettings(id, Switches(recording: true, combat: true, updates: true)));      // no AutoUpdateEnabled
 
-        Assert.True(after.PluginAutoUpdateEnabled);
+        Assert.False(after.PluginAutoUpdateEnabled);          // left as the owner set it, not reset to the new-server default
     }
 
     [Fact]
@@ -744,10 +744,10 @@ public class RustServersControllerPluginStatusTests(PostgresFixture postgres) : 
     {
         var h = await CreateHarnessAsync();
         var id = await CreateServerAsync(h.Controller, "Auto survives edits");
-        await h.Controller.UpdatePluginSettings(id, new UpdateServerPluginSettingsDto { RecordingEnabled = true, CombatLogEnabled = true, UpdatesEnabled = true, AutoUpdateEnabled = true });
+        await h.Controller.UpdatePluginSettings(id, new UpdateServerPluginSettingsDto { RecordingEnabled = true, CombatLogEnabled = true, UpdatesEnabled = true, AutoUpdateEnabled = false });
 
         await h.Controller.Update(id, new UpdateRustServerDto { Name = "Renamed", Host = "192.0.2.9", Port = 28016 });
 
-        Assert.True(ServerFrom(await h.Controller.GetById(id)).PluginAutoUpdateEnabled);
+        Assert.False(ServerFrom(await h.Controller.GetById(id)).PluginAutoUpdateEnabled);
     }
 }

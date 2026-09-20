@@ -46,7 +46,7 @@ enabled. The Panel enables a feature only when its capability is **positively re
 - **Signature:** RSA-2048, SHA-256, PKCS#1 v1.5. Each Panel deployment has its own keypair; the public key is
   stamped into the served script. An update is accepted only if signed by the key embedded in the **currently
   running** version.
-- **Trigger:** off by default; an admin clicks Update in the Panel, the Api mints a single-use expiring token,
+- **Trigger:** off by default (see the 2026-09-20 amendments); an admin clicks Update in the Panel, the Api mints a single-use expiring token,
   and the Worker sends `archon.update <version> <token-url>`.
 - **Two plugins:** a tiny, stable **Updater** (Carbon/BCL APIs only, no Rust internals) swaps the **main**
   plugin, confirms it loaded, and restores a backup if not.
@@ -136,3 +136,13 @@ customer, which the product cannot have. The two plugins are now each other's re
 same signature under the key it trusts, keeping a backup, and putting the backup back if the new Updater's `updater-loaded.txt` marker does not appear
 within 45 seconds), and the Updater continues to do the same for the main plugin. They never replace one another at the same time. What remains manual is
 the first install of the main plugin, which is the trust root. Details and the tests are in the plan, "Updater self-update".
+
+## Amendment (2026-09-20): updates are on for a new server
+
+"Off by default" meant every customer had to find and switch on something whose only effect is to keep their server current and safe, which is the same
+recurring hand-maintenance the previous amendment removed. Decision (Scott, 2026-09-20): a **new** server has "Allow updates" and "Update automatically" on.
+What did not change: an update is still only ever a file signed by the key that server's plugin already trusts, checked by the server itself, put back if it
+does not start, and never retried if it fails; the Add Server wizard says what each switch does and offers to leave them off; either is one click to turn
+off on the Plugins tab; a site-wide platform setting stops every automatic update at once; servers that already existed keep their setting (the column's own
+default is still off, so nothing was switched on for anyone who had not chosen it). Automatic updates can also be paced by a staged roll-out (platform
+setting, off by default). Details in the plan, "Plugin admin, defaults and failed plugins".

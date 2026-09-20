@@ -117,6 +117,15 @@ public class AddServerWizardTests : BunitContext
         return cut;
     }
 
+    [Fact]
+    public void TheDisclosureOfWhatRecordingDoesIsShownOpenBeforeTheOwnerChoosesThePlugin()
+    {
+        var cut = ToPlugin();
+
+        Assert.True(cut.Find("[data-testid=recording-disclosure]").HasAttribute("open"));
+        Assert.Contains("live map", cut.Find("[data-testid=recording-disclosure-benefit]").TextContent);
+    }
+
     private IRenderedComponent<AddServerWizard> ToPluginChecklist()
     {
         var cut = ToPlugin();
@@ -994,6 +1003,54 @@ public class AddServerWizardTests : BunitContext
 
         Step(cut, "done");
         Assert.Null(_savedSettings);
+        Assert.Empty(cut.FindAll("[data-testid=done-updates]"));
+    }
+
+    [Fact]
+    public void ANewServerThatComesBackWithBothSwitchesOnShowsThemOnAndKeepingThemChangesNothing()
+    {
+        // The Api's default for a new server is both on (Scott, 2026-09-20): the page presents that as the starting point, says so, and
+        // "Keep as they are" is a real choice that saves nothing and still tells the person what is on.
+        GivenSettingsSaveWorks();
+        _client.Setup(c => c.GetByIdAsync(_id)).ReturnsAsync(() =>
+        {
+            var server = Server();
+            server.PluginUpdatesEnabled = true;
+            server.PluginAutoUpdateEnabled = true;
+            return server;
+        });
+        var cut = ToUpdates();
+        Assert.True(cut.Find("[data-testid=wizard-allow-updates]").HasAttribute("checked"));
+        Assert.True(cut.Find("[data-testid=wizard-auto-update]").HasAttribute("checked"));
+        Assert.Contains("start on for a new server", cut.Find("[data-testid=step-updates] p").TextContent);
+        Assert.Equal("Keep as they are", Text(cut, "wizard-updates-skip").Trim());
+
+        Click(cut, "wizard-updates-skip");
+
+        Step(cut, "done");
+        Assert.Null(_savedSettings);
+        Assert.Contains("installed automatically", Text(cut, "done-updates"));
+    }
+
+    [Fact]
+    public void TurningBothOffOnAServerThatHasThemOnSavesThatAndSaysNothingAboutUpdates()
+    {
+        GivenSettingsSaveWorks();
+        _client.Setup(c => c.GetByIdAsync(_id)).ReturnsAsync(() =>
+        {
+            var server = Server();
+            server.PluginUpdatesEnabled = true;
+            server.PluginAutoUpdateEnabled = true;
+            return server;
+        });
+        var cut = ToUpdates();
+
+        cut.Find("[data-testid=wizard-allow-updates]").Change(false);
+        Click(cut, "wizard-updates-save");
+
+        Step(cut, "done");
+        Assert.False(_savedSettings!.UpdatesEnabled);
+        Assert.False(_savedSettings.AutoUpdateEnabled);
         Assert.Empty(cut.FindAll("[data-testid=done-updates]"));
     }
 

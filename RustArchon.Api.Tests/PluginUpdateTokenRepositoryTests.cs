@@ -260,9 +260,10 @@ public class PluginUpdateTokenRepositoryTests(PostgresFixture postgres) : IClass
     }
 
     [Fact]
-    public void TheDefaultForAnUpdateEnabledServerIsOffSoUpdatesAreOptIn()
+    public void ANewServerAllowsUpdatesAndUpdatesAutomaticallyUntilTheOwnerTurnsThemOff()
     {
-        Assert.False(new RustServer().PluginUpdatesEnabled);
+        Assert.True(new RustServer().PluginUpdatesEnabled);
+        Assert.True(new RustServer().PluginAutoUpdateEnabled);
     }
     [Fact]
     public async Task RedeemingReturnsTheKeyFingerprintTheTokenWasMintedFor()

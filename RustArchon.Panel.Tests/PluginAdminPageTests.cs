@@ -84,6 +84,230 @@ public class PluginAdminPageTests : BunitContext
         Sha256 = r.Sha256, UploadedAtUtc = r.UploadedAtUtc, UploadedBy = r.UploadedBy
     };
 
+    // ---- the rotation reminder ---------------------------------------------------------------------------
+
+    [Fact]
+    public void ADueReminderIsShownInTheKeysCardWithAWayToRotate()
+    {
+        _client.Setup(c => c.GetKeyReminderAsync()).ReturnsAsync(new PluginKeyReminderDto
+        {
+            Due = true, Fingerprint = "1111111111111111", AgeDays = 401, ReminderDays = 365, ActiveSinceUtc = new DateTimeOffset(2025, 8, 1, 0, 0, 0, TimeSpan.Zero)
+        });
+
+        var cut = RenderPage();
+
+        var note = cut.Find("[data-testid=key-rotation-reminder]");
+        Assert.Contains("401", note.TextContent);
+        Assert.Contains("2025-08-01", note.TextContent);
+        Assert.Contains("Nothing is ever rotated for you", note.TextContent);
+        cut.Find("[data-testid=reminder-rotate]").Click();
+        Assert.NotEmpty(cut.FindAll("[data-testid=confirm-rotate]"));
+    }
+
+    [Fact]
+    public void NoReminderIsShownWhenItIsNotDueOrCouldNotBeRead()
+    {
+        _client.Setup(c => c.GetKeyReminderAsync()).ReturnsAsync(new PluginKeyReminderDto { Due = false, AgeDays = 12, ReminderDays = 365 });
+        Assert.Empty(RenderPage().FindAll("[data-testid=key-rotation-reminder]"));
+
+        _client.Setup(c => c.GetKeyReminderAsync()).ThrowsAsync(new HttpRequestException("boom"));
+        var cut = RenderPage();
+        Assert.Empty(cut.FindAll("[data-testid=key-rotation-reminder]"));
+        Assert.Empty(cut.FindAll("[data-testid=plugin-admin-error]"));
+    }
+
+    [Fact]
+    public void TheActiveKeyShowsWhenItBecameActive()
+    {
+        _keys[0].ActiveSinceUtc = new DateTimeOffset(2026, 3, 4, 0, 0, 0, TimeSpan.Zero);
+
+        var cut = RenderPage();
+
+        Assert.Contains("2026-03-04", cut.Find("[data-testid=key-active-since]").TextContent);
+    }
+
+    // ---- staged roll-out ---------------------------------------------------------------------------------
+
+    [Fact]
+    public void AServedFileInTheMiddleOfItsRolloutSaysHowFarItHasGot()
+    {
+        _releases.Main.RolloutHours = 24;
+        _releases.Main.RolloutStartedUtc = new DateTimeOffset(2026, 9, 20, 6, 0, 0, TimeSpan.Zero);
+        _releases.Main.RolloutPercent = 40;
+
+        var cut = RenderPage();
+
+        var note = cut.Find("[data-testid=rollout-main]").TextContent;
+        Assert.Contains("40%", note);
+        Assert.Contains("2026-09-21 06:00 UTC", note);
+        Assert.Empty(cut.FindAll("[data-testid=rollout-updater]"));
+    }
+
+    [Fact]
+    public void AFinishedRolloutSaysSoAndNoRampSaysNothing()
+    {
+        _releases.Main.RolloutHours = 24;
+        _releases.Main.RolloutStartedUtc = DateTimeOffset.UtcNow.AddDays(-3);
+        _releases.Main.RolloutPercent = 100;
+        _releases.Updater.RolloutHours = 0;
+        _releases.Updater.RolloutStartedUtc = DateTimeOffset.UtcNow.AddDays(-3);
+        _releases.Updater.RolloutPercent = 100;
+
+        var cut = RenderPage();
+
+        Assert.Contains("rolled out to every server", cut.Find("[data-testid=rollout-main]").TextContent);
+        Assert.Empty(cut.FindAll("[data-testid=rollout-updater]"));
+    }
+
+    // ---- signing a file --------------------------------------------------------------------------------------
+
+    private static void ChooseFileToSign(IRenderedComponent<Plugin> cut, string name = "RustArchon.cs", string text = "class X {}") =>
+        cut.FindComponents<InputFile>().Single(c => c.Instance.AdditionalAttributes!["id"]?.ToString() == "sign-file")
+            .UploadFiles(InputFileContent.CreateFromText(text, name));
+
+    private static void TypeNote(IRenderedComponent<Plugin> cut, string note) => cut.Find("[data-testid=sign-note]").Input(note);
+
+    [Fact]
+    public void SigningIsOfferedOnlyOnceAFileIsChosenAndAReasonOfAFewCharactersIsGiven()
+    {
+        var cut = RenderPage();
+        Assert.True(cut.Find("[data-testid=sign-go]").HasAttribute("disabled"));
+
+        ChooseFileToSign(cut);
+        TypeNote(cut, "ab");
+        cut.WaitForAssertion(() => Assert.True(cut.Find("[data-testid=sign-go]").HasAttribute("disabled")));
+
+        TypeNote(cut, "abc");
+        cut.WaitForAssertion(() => Assert.False(cut.Find("[data-testid=sign-go]").HasAttribute("disabled")));
+    }
+
+    [Fact]
+    public void SigningSendsTheKindTheTrimmedReasonAndTheFileThenHandsTheSignedFileToTheBrowserByteForByte()
+    {
+        var module = JSInterop.SetupModule("./js/fileDownload.js");
+        module.SetupVoid("downloadBytes", _ => true).SetVoidResult();
+        string? sentKind = null, sentNote = null, sentName = null;
+        _client.Setup(c => c.SignFileAsync(It.IsAny<string>(), It.IsAny<string>(), It.IsAny<StreamPart>()))
+            .Callback<string, string, StreamPart>((k, n, f) => { sentKind = k; sentNote = n; sentName = f.FileName; })
+            .ReturnsAsync(FileResponse("RustArchonUpdater.cs", "// signed\n"));
+        var cut = RenderPage();
+        cut.Find("#sign-kind").Change("updater");
+        ChooseFileToSign(cut, "RustArchonUpdater.cs");
+        TypeNote(cut, "  a build for the test box  ");
+        cut.WaitForAssertion(() => Assert.False(cut.Find("[data-testid=sign-go]").HasAttribute("disabled")));
+
+        cut.Find("[data-testid=sign-go]").Click();
+
+        cut.WaitForAssertion(() => Assert.NotEmpty(cut.FindAll("[data-testid=plugin-admin-success]")));
+        Assert.Equal(("updater", "a build for the test box", "RustArchonUpdater.cs"), (sentKind, sentNote, sentName));
+        var call = Assert.Single(module.Invocations, i => i.Identifier == "downloadBytes");
+        Assert.Equal("RustArchonUpdater.cs", call.Arguments[0]);
+        Assert.Equal(Convert.ToBase64String(System.Text.Encoding.UTF8.GetBytes("// signed\n")), call.Arguments[1]);
+        Assert.Contains("audit log", cut.Find("[data-testid=plugin-admin-success]").TextContent);
+        _client.Verify(c => c.GetEventsAsync(It.IsAny<int>()), Times.AtLeast(2));                // the audit log is read again to show the new line
+    }
+
+    [Fact]
+    public void ARefusedFileShowsTheApisSentenceAndHandsNothingToTheBrowser()
+    {
+        var module = JSInterop.SetupModule("./js/fileDownload.js");
+        module.SetupVoid("downloadBytes", _ => true).SetVoidResult();
+        var refusal = new HttpResponseMessage(HttpStatusCode.BadRequest) { Content = new StringContent("The file cannot be compiled as C# 7.3, which is what the game server accepts: line 3: ; expected.") };
+        _client.Setup(c => c.SignFileAsync(It.IsAny<string>(), It.IsAny<string>(), It.IsAny<StreamPart>())).ReturnsAsync(refusal);
+        var cut = RenderPage();
+        ChooseFileToSign(cut);
+        TypeNote(cut, "trying it");
+        cut.WaitForAssertion(() => Assert.False(cut.Find("[data-testid=sign-go]").HasAttribute("disabled")));
+
+        cut.Find("[data-testid=sign-go]").Click();
+
+        cut.WaitForAssertion(() => Assert.Contains("cannot be compiled as C# 7.3", cut.Find("[data-testid=plugin-admin-error]").TextContent));
+        Assert.DoesNotContain(module.Invocations, i => i.Identifier == "downloadBytes");
+        Assert.Empty(cut.FindAll("[data-testid=plugin-admin-success]"));
+    }
+
+    [Fact]
+    public void AFileOverTheLimitIsRefusedBeforeItIsSent()
+    {
+        var cut = RenderPage();
+        ChooseFileToSign(cut, text: new string('x', 600 * 1024));
+        TypeNote(cut, "too big");
+        cut.WaitForAssertion(() => Assert.False(cut.Find("[data-testid=sign-go]").HasAttribute("disabled")));
+
+        cut.Find("[data-testid=sign-go]").Click();
+
+        cut.WaitForAssertion(() => Assert.Contains("over 512 KiB", cut.Find("[data-testid=plugin-admin-error]").TextContent));
+        _client.Verify(c => c.SignFileAsync(It.IsAny<string>(), It.IsAny<string>(), It.IsAny<StreamPart>()), Times.Never);
+    }
+
+    // ---- downloading a stored release, signed ------------------------------------------------------------------
+
+    [Fact]
+    public void ADraftAndAPublishedReleaseOfferADownloadButAWithdrawnOneDoesNot()
+    {
+        _releases.Releases = [Release("draft", "9.1.0"), Release("published", "9.0.0"), Release("withdrawn", "8.0.0")];
+
+        var cut = RenderPage();
+
+        var rows = cut.FindAll("[data-testid=release-row]");
+        Assert.NotEmpty(rows[0].QuerySelectorAll("[data-testid=download-release]"));
+        Assert.NotEmpty(rows[1].QuerySelectorAll("[data-testid=download-release]"));
+        Assert.Empty(rows[2].QuerySelectorAll("[data-testid=download-release]"));
+    }
+
+    [Fact]
+    public void DownloadingAReleaseHandsTheSignedFileToTheBrowserAndSaysItWasRecorded()
+    {
+        var module = JSInterop.SetupModule("./js/fileDownload.js");
+        module.SetupVoid("downloadBytes", _ => true).SetVoidResult();
+        var draft = Release("draft", "9.1.0");
+        _releases.Releases = [draft];
+        _client.Setup(c => c.DownloadReleaseAsync(draft.Id)).ReturnsAsync(FileResponse("RustArchon.cs", "// signed draft"));
+        var cut = RenderPage();
+
+        cut.Find("[data-testid=download-release]").Click();
+
+        cut.WaitForAssertion(() => Assert.NotEmpty(cut.FindAll("[data-testid=plugin-admin-success]")));
+        var call = Assert.Single(module.Invocations, i => i.Identifier == "downloadBytes");
+        Assert.Equal("RustArchon.cs", call.Arguments[0]);
+        Assert.Equal(Convert.ToBase64String(System.Text.Encoding.UTF8.GetBytes("// signed draft")), call.Arguments[1]);
+        Assert.Contains("9.1.0", cut.Find("[data-testid=plugin-admin-success]").TextContent);
+        Assert.Contains("audit log", cut.Find("[data-testid=plugin-admin-success]").TextContent);
+    }
+
+    [Fact]
+    public void AReleaseThatCannotBeDownloadedShowsTheApisSentence()
+    {
+        var module = JSInterop.SetupModule("./js/fileDownload.js");
+        module.SetupVoid("downloadBytes", _ => true).SetVoidResult();
+        var draft = Release("draft", "9.1.0");
+        _releases.Releases = [draft];
+        _client.Setup(c => c.DownloadReleaseAsync(draft.Id))
+            .ReturnsAsync(new HttpResponseMessage(HttpStatusCode.BadRequest) { Content = new StringContent("A withdrawn release is not signed.") });
+        var cut = RenderPage();
+
+        cut.Find("[data-testid=download-release]").Click();
+
+        cut.WaitForAssertion(() => Assert.Contains("withdrawn release is not signed", cut.Find("[data-testid=plugin-admin-error]").TextContent));
+        Assert.DoesNotContain(module.Invocations, i => i.Identifier == "downloadBytes");
+    }
+
+    // ---- the audit log names the new actions ------------------------------------------------------------------
+
+    [Theory]
+    [InlineData("KeyGenerated", "Key generated")]
+    [InlineData("FileSigned", "File signed")]
+    [InlineData("ReleaseSigned", "Release downloaded signed")]
+    public void TheNewAuditLinesAreLabelledInWords(string kind, string label)
+    {
+        _client.Setup(c => c.GetEventsAsync(It.IsAny<int>())).ReturnsAsync(
+            [new PluginAdminEventDto { AtUtc = DateTimeOffset.UtcNow, Kind = kind, Subject = "Main 9.1.0", Actor = "admin@example.com", Detail = "why" }]);
+
+        var cut = RenderPage();
+
+        Assert.Contains(label, cut.Find("[data-testid=event-row]").TextContent);
+    }
+
     // ---- access --------------------------------------------------------------------------------------------
 
     [Fact]

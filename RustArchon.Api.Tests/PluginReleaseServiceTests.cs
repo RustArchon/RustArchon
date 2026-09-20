@@ -156,6 +156,87 @@ public class PluginReleaseServiceTests(PostgresFixture postgres) : IClassFixture
     }
 
     [Fact]
+    public async Task AFileThatCannotBeReadAsCSharp73IsRefusedWithWhereItGoesWrong()
+    {
+        await using var context = await FreshAsync();
+        var service = NewService(context);
+        // The real source with a statement broken on a line of its own.
+        var broken = MainSource("9.1.0", t => t + "\nclass Broken { void A() { int x = ; } }\n");
+
+        var refusal = await RefusedAsync(service.UploadAsync(PluginReleaseKind.Main, broken, "a", null));
+
+        Assert.Equal("syntax_error", refusal.Code);
+        Assert.Contains("C# 7.3", refusal.Message);
+        Assert.Matches(@"line \d+:", refusal.Message);
+        Assert.Equal(0, await context.PluginReleases.CountAsync());
+    }
+
+    [Fact]
+    public async Task ModernSyntaxTheGameServerCannotCompileIsRefusedAtUploadNotDiscoveredOnEveryServer()
+    {
+        await using var context = await FreshAsync();
+        var modern = MainSource("9.1.0", t => t + "\nclass Modern { string A(int x) { return x switch { 1 => \"a\", _ => \"b\" }; } }\n");
+
+        var refusal = await RefusedAsync(NewService(context).UploadAsync(PluginReleaseKind.Main, modern, "a", null));
+
+        Assert.Equal("syntax_error", refusal.Code);
+    }
+
+    [Fact]
+    public async Task ManyProblemsAreListedFewAndCounted()
+    {
+        await using var context = await FreshAsync();
+        var many = MainSource("9.1.0", t => t + string.Concat(Enumerable.Range(0, 12).Select(i => $"\nclass Bad{i} {{ void A() {{ int x = ; }} }}\n")));
+
+        var refusal = await RefusedAsync(NewService(context).UploadAsync(PluginReleaseKind.Main, many, "a", null));
+
+        Assert.Equal("syntax_error", refusal.Code);
+        Assert.Contains("more)", refusal.Message);
+    }
+
+    [Fact]
+    public async Task ValidatingChecksEverythingAnUploadDoesButStoresNothingAndAllowsAVersionThatWasAlreadyUploaded()
+    {
+        await using var context = await FreshAsync();
+        var service = NewService(context);
+        await service.UploadAsync(PluginReleaseKind.Main, MainSource("9.1.0"), "a", null);
+
+        var validated = service.Validate(PluginReleaseKind.Main, MainSource("9.1.0"));    // same version again: fine for signing, not for uploading
+
+        Assert.Equal("9.1.0", validated.Version);
+        Assert.Matches("^[0-9a-f]{64}$", validated.Sha256);
+        Assert.DoesNotContain('\r', validated.Text);
+        Assert.Equal(1, await context.PluginReleases.CountAsync());
+        Assert.Equal(1, await context.PluginAdminEvents.CountAsync());                   // the upload's own line; validating wrote none
+        Assert.Equal("wrong_plugin", Assert.Throws<PluginReleaseException>(() => service.Validate(PluginReleaseKind.Updater, MainSource("9.1.0"))).Code);
+        Assert.Equal("syntax_error", Assert.Throws<PluginReleaseException>(() => service.Validate(PluginReleaseKind.Main, MainSource("9.1.0", t => t + "\nclass B { int x = ; }\n"))).Code);
+        Assert.Equal("empty", Assert.Throws<PluginReleaseException>(() => service.Validate(PluginReleaseKind.Main, [])).Code);
+    }
+
+    [Fact]
+    public async Task ADraftAndAPublishedReleaseCanBeFetchedToBeSignedButAWithdrawnOneAndAMissingOneCannot()
+    {
+        await using var context = await FreshAsync();
+        var service = NewService(context);
+        var draft = await service.UploadAsync(PluginReleaseKind.Main, MainSource("9.1.0"), "a", null);
+        var toPublish = await service.UploadAsync(PluginReleaseKind.Main, MainSource("9.2.0"), "a", null);
+        await service.PublishAsync(toPublish.Id, "a");
+        var toWithdraw = await service.UploadAsync(PluginReleaseKind.Main, MainSource("9.3.0"), "a", null);
+        await service.WithdrawAsync(toWithdraw.Id, "bad build", "a");
+
+        var fetchedDraft = await service.GetSourceAsync(draft.Id);
+        var fetchedPublished = await service.GetSourceAsync(toPublish.Id);
+
+        Assert.Equal(PluginReleaseState.Draft, fetchedDraft.State);
+        Assert.Equal("9.1.0", fetchedDraft.Version);
+        Assert.Equal(PluginReleaseKind.Main, fetchedDraft.Kind);
+        Assert.Equal(PluginReleaseState.Published, fetchedPublished.State);
+        Assert.Contains("[Info(\"RustArchon\"", fetchedDraft.Text);
+        Assert.Equal("withdrawn", (await Assert.ThrowsAsync<PluginReleaseException>(() => service.GetSourceAsync(toWithdraw.Id))).Code);
+        Assert.Equal("not_found", (await Assert.ThrowsAsync<PluginReleaseException>(() => service.GetSourceAsync(Guid.NewGuid()))).Code);
+    }
+
+    [Fact]
     public async Task AVersionCanOnlyBeUploadedOnceSoAReleaseNeverChangesUnderneathServers()
     {
         await using var context = await FreshAsync();

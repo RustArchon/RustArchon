@@ -27,10 +27,14 @@ public class PluginAdminControllerTests(PostgresFixture postgres) : IClassFixtur
 {
     private readonly Mock<IPluginKeyService> _keys = new();
     private readonly Mock<IPluginReleaseService> _releases = new();
+    private readonly Mock<IPluginScriptService> _scripts = new();
+    private readonly Mock<IPluginAdminAudit> _audit = new();
+    private readonly Mock<IPluginRollout> _rollout = new();
 
     private PluginAdminController Create(string? email = "admin@example.com", ApiDbContext? context = null)
     {
-        var controller = new PluginAdminController(_keys.Object, _releases.Object, context ?? new ApiDbContext(postgres.Options));
+        var controller = new PluginAdminController(
+            _keys.Object, _releases.Object, context ?? new ApiDbContext(postgres.Options), _scripts.Object, _audit.Object, _rollout.Object, TimeProvider.System);
         var identity = new ClaimsIdentity(email is null ? [] : [new Claim(ClaimTypes.Email, email)], "test");
         controller.ControllerContext = new ControllerContext { HttpContext = new DefaultHttpContext { User = new ClaimsPrincipal(identity) } };
         return controller;
@@ -186,6 +190,129 @@ public class PluginAdminControllerTests(PostgresFixture postgres) : IClassFixtur
         _releases.Verify(r => r.UploadAsync(It.IsAny<PluginReleaseKind>(), It.IsAny<byte[]>(), It.IsAny<string>(), It.IsAny<string?>()), Times.Never);
     }
 
+    // ---- signing a file, and downloading a stored release signed ---------------------------------------------
+
+    private static readonly byte[] SignedBytes = Encoding.UTF8.GetBytes("// the signed file\n");
+
+    private void GivenAValidFile(string version = "9.1.0")
+    {
+        _releases.Setup(r => r.Validate(It.IsAny<PluginReleaseKind>(), It.IsAny<byte[]>()))
+            .Returns(new PluginValidatedSource("normalized source\n", version, new string('c', 64)));
+        _scripts.Setup(s => s.SignSourceAsync(It.IsAny<string>(), It.IsAny<PluginReleaseKind>()))
+            .ReturnsAsync(new PluginScript(SignedBytes, "82b49184449c98f6", version));
+    }
+
+    [Fact]
+    public async Task SigningAFileReturnsTheSignedFileAsANeverCachedDownloadAndRecordsWhoAskedWhatAndWhy()
+    {
+        GivenAValidFile();
+
+        var controller = Create();
+        var result = await controller.SignFile("main", "  a hand-built variant for the test server  ", File("RustArchon.cs", "source"));
+
+        var file = Assert.IsType<FileContentResult>(result);
+        Assert.Equal(SignedBytes, file.FileContents);
+        Assert.Equal("RustArchon.cs", file.FileDownloadName);
+        Assert.Equal("no-store", controller.Response.Headers.CacheControl.ToString());
+        _scripts.Verify(s => s.SignSourceAsync("normalized source\n", PluginReleaseKind.Main), Times.Once);
+        _audit.Verify(a => a.RecordAsync(
+            PluginAdminEventKind.FileSigned, "Main 9.1.0", "admin@example.com",
+            It.Is<string>(d => d.Contains("sha256 cccccccccccc") && d.Contains("key 82b49184449c98f6") && d.EndsWith("a hand-built variant for the test server"))), Times.Once);
+    }
+
+    [Fact]
+    public async Task SigningTheUpdaterNamesTheDownloadAfterTheUpdater()
+    {
+        GivenAValidFile("0.3.0");
+
+        var result = await Create().SignFile("updater", "testing the updater", File("RustArchonUpdater.cs", "source"));
+
+        Assert.Equal("RustArchonUpdater.cs", Assert.IsType<FileContentResult>(result).FileDownloadName);
+        _scripts.Verify(s => s.SignSourceAsync(It.IsAny<string>(), PluginReleaseKind.Updater), Times.Once);
+    }
+
+    [Theory]
+    [InlineData(null)]
+    [InlineData("")]
+    [InlineData("   ")]
+    [InlineData("ok")]
+    public async Task SigningNeedsAReasonSoTheAuditLineIsWorthSomething(string? note)
+    {
+        GivenAValidFile();
+
+        var result = await Create().SignFile("main", note, File("RustArchon.cs", "source"));
+
+        Assert.IsType<BadRequestObjectResult>(result);
+        _scripts.Verify(s => s.SignSourceAsync(It.IsAny<string>(), It.IsAny<PluginReleaseKind>()), Times.Never);
+        _audit.VerifyNoOtherCalls();
+    }
+
+    [Fact]
+    public async Task ARefusedFileIsAPlainSentenceNothingIsSignedAndNothingIsRecorded()
+    {
+        _releases.Setup(r => r.Validate(It.IsAny<PluginReleaseKind>(), It.IsAny<byte[]>()))
+            .Throws(new PluginReleaseException("syntax_error", "The file cannot be compiled as C# 7.3."));
+
+        var result = await Create().SignFile("main", "testing a change", File("RustArchon.cs", "source"));
+
+        Assert.Equal("The file cannot be compiled as C# 7.3.", Assert.IsType<BadRequestObjectResult>(result).Value);
+        _scripts.Verify(s => s.SignSourceAsync(It.IsAny<string>(), It.IsAny<PluginReleaseKind>()), Times.Never);
+        _audit.VerifyNoOtherCalls();
+    }
+
+    [Fact]
+    public async Task SigningRefusesABadKindAndAMissingOrOversizedFileBeforeReadingIt()
+    {
+        Assert.IsType<BadRequestObjectResult>(await Create().SignFile("both", "why not", File("x.cs", "source")));
+        Assert.IsType<BadRequestObjectResult>(await Create().SignFile("main", "why not", null!));
+        Assert.IsType<BadRequestObjectResult>(await Create().SignFile("main", "why not", File("x.cs", "")));
+        var big = new FormFile(new System.IO.MemoryStream(), 0, PluginReleaseService.MaxBytes + 1, "file", "big.cs");
+        Assert.IsType<BadRequestObjectResult>(await Create().SignFile("main", "why not", big));
+        _releases.Verify(r => r.Validate(It.IsAny<PluginReleaseKind>(), It.IsAny<byte[]>()), Times.Never);
+    }
+
+    [Fact]
+    public async Task ADraftReleaseCanBeDownloadedSignedForATestInstallAndTheDownloadIsRecorded()
+    {
+        var id = Guid.NewGuid();
+        _releases.Setup(r => r.GetSourceAsync(id)).ReturnsAsync(new PluginStoredSource(id, PluginReleaseKind.Main, "9.2.0", PluginReleaseState.Draft, "stored\n"));
+        _scripts.Setup(s => s.SignSourceAsync("stored\n", PluginReleaseKind.Main)).ReturnsAsync(new PluginScript(SignedBytes, "82b49184449c98f6", "9.2.0"));
+
+        var controller = Create();
+        var result = await controller.DownloadRelease(id);
+
+        var file = Assert.IsType<FileContentResult>(result);
+        Assert.Equal(SignedBytes, file.FileContents);
+        Assert.Equal("RustArchon.cs", file.FileDownloadName);
+        Assert.Equal("no-store", controller.Response.Headers.CacheControl.ToString());
+        _audit.Verify(a => a.RecordAsync(
+            PluginAdminEventKind.ReleaseSigned, "Main 9.2.0", "admin@example.com",
+            It.Is<string>(d => d.Contains("draft") && d.Contains("82b49184449c98f6"))), Times.Once);
+    }
+
+    [Fact]
+    public async Task DownloadingAReleaseThatIsMissingIsA404AndAWithdrawnOneIsAPlainSentence()
+    {
+        var missing = Guid.NewGuid();
+        var withdrawn = Guid.NewGuid();
+        _releases.Setup(r => r.GetSourceAsync(missing)).ThrowsAsync(new PluginReleaseException("not_found", "No such release."));
+        _releases.Setup(r => r.GetSourceAsync(withdrawn)).ThrowsAsync(new PluginReleaseException("withdrawn", "A withdrawn release is not signed."));
+
+        Assert.IsType<NotFoundResult>(await Create().DownloadRelease(missing));
+        Assert.Equal("A withdrawn release is not signed.", Assert.IsType<BadRequestObjectResult>(await Create().DownloadRelease(withdrawn)).Value);
+        _audit.VerifyNoOtherCalls();
+    }
+
+    [Fact]
+    public void TheSigningEndpointsHaveTheSizeLimitAndNeverServeAnythingAnonymously()
+    {
+        var sign = typeof(PluginAdminController).GetMethod(nameof(PluginAdminController.SignFile))!;
+
+        Assert.NotNull(sign.GetCustomAttribute<RequestSizeLimitAttribute>());
+        Assert.Null(sign.GetCustomAttribute<AllowAnonymousAttribute>());
+        Assert.Null(typeof(PluginAdminController).GetMethod(nameof(PluginAdminController.DownloadRelease))!.GetCustomAttribute<AllowAnonymousAttribute>());
+    }
+
     [Fact]
     public async Task AValidationRefusalFromTheServiceIsShownAsItsSentence()
     {
@@ -236,6 +363,70 @@ public class PluginAdminControllerTests(PostgresFixture postgres) : IClassFixtur
         Assert.Equal("0.2.2", dto.Main.EmbeddedVersion);
         Assert.False(dto.Updater.FromRelease);
         Assert.Single(dto.Releases);
+    }
+
+    [Fact]
+    public async Task TheServedFilesShowHowFarTheirStagedRolloutHasGotAndNothingBeforeItBegins()
+    {
+        var started = DateTimeOffset.UtcNow.AddHours(-3);
+        _releases.Setup(r => r.ResolveAsync(PluginReleaseKind.Main)).ReturnsAsync(new PluginServedSource("x", "9.1.0", true, Guid.NewGuid()));
+        _releases.Setup(r => r.ResolveAsync(PluginReleaseKind.Updater)).ReturnsAsync(new PluginServedSource("x", "0.3.0", false, null));
+        _releases.Setup(r => r.ListAsync()).ReturnsAsync([]);
+        _rollout.Setup(r => r.PeekAsync(PluginReleaseKind.Main, "9.1.0", It.IsAny<DateTimeOffset>())).ReturnsAsync(new PluginRolloutStatus(started, 10, 0.3));
+        _rollout.Setup(r => r.PeekAsync(PluginReleaseKind.Updater, "0.3.0", It.IsAny<DateTimeOffset>())).ReturnsAsync((PluginRolloutStatus?)null);
+
+        var dto = Assert.IsType<PluginReleasesDto>(Assert.IsType<OkObjectResult>((await Create().ListReleases()).Result).Value);
+
+        Assert.Equal(started, dto.Main.RolloutStartedUtc);
+        Assert.Equal(10, dto.Main.RolloutHours);
+        Assert.Equal(30, dto.Main.RolloutPercent);
+        Assert.Null(dto.Updater.RolloutStartedUtc);
+        Assert.Null(dto.Updater.RolloutPercent);
+    }
+
+    [Fact]
+    public async Task ListingTheReleasesNeverBeginsARollout()
+    {
+        _releases.Setup(r => r.ResolveAsync(It.IsAny<PluginReleaseKind>())).ReturnsAsync(new PluginServedSource("x", "9.1.0", true, Guid.NewGuid()));
+        _releases.Setup(r => r.ListAsync()).ReturnsAsync([]);
+
+        await Create().ListReleases();
+
+        _rollout.Verify(r => r.BeginAsync(It.IsAny<PluginReleaseKind>(), It.IsAny<string>(), It.IsAny<DateTimeOffset>()), Times.Never);
+    }
+
+    // ---- the rotation reminder ---------------------------------------------------------------------------------
+
+    [Fact]
+    public async Task TheReminderEndpointReportsWhetherItIsDueWithoutChangingAnything()
+    {
+        var since = DateTimeOffset.UtcNow.AddDays(-400);
+        _keys.Setup(k => k.GetReminderAsync()).ReturnsAsync(new PluginKeyReminder("82b49184449c98f6", since, 400, 365, true));
+
+        var dto = Assert.IsType<PluginKeyReminderDto>(Assert.IsType<OkObjectResult>((await Create().KeyReminder()).Result).Value);
+
+        Assert.True(dto.Due);
+        Assert.Equal("82b49184449c98f6", dto.Fingerprint);
+        Assert.Equal(since, dto.ActiveSinceUtc);
+        Assert.Equal(400, dto.AgeDays);
+        Assert.Equal(365, dto.ReminderDays);
+        _keys.Verify(k => k.RotateAsync(It.IsAny<string>(), It.IsAny<string?>(), It.IsAny<bool>(), It.IsAny<string?>()), Times.Never);
+    }
+
+    [Fact]
+    public async Task TheKeyListCarriesWhenTheActiveKeyBecameActive()
+    {
+        var since = DateTimeOffset.UtcNow.AddDays(-20);
+        _keys.Setup(k => k.ListAsync()).ReturnsAsync(
+        [
+            new PluginKeyInfo("1111111111111111", PluginKeyState.Active, null, null, null, 3, null, since),
+            new PluginKeyInfo("2222222222222222", PluginKeyState.Retired, since, null, null, 0, null)
+        ]);
+
+        var dtos = Assert.IsType<System.Collections.Generic.List<PluginKeyDto>>(Assert.IsType<OkObjectResult>((await Create().ListKeys()).Result).Value);
+
+        Assert.Equal(since, dtos.Single(k => k.State == "active").ActiveSinceUtc);
+        Assert.Null(dtos.Single(k => k.State == "retired").ActiveSinceUtc);
     }
 
     // ---- audit log -----------------------------------------------------------------------------------------
