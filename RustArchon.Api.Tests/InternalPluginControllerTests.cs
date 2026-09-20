@@ -174,4 +174,153 @@ public class InternalPluginControllerTests
         Assert.IsType<NotFoundResult>(result);
         Assert.False(controller.Response.Headers.ContainsKey("X-RustArchon-Plugin-Version"));
     }
+
+    // ---- the header form (Updater 0.3.0 and later) ---------------------------------------------------------
+
+    [Fact]
+    public async Task AGoodTokenInTheHeaderGetsTheSignedScriptForTheServerTheTokenNames()
+    {
+        _tokens.Setup(t => t.RedeemAsync("good")).ReturnsAsync(new PluginTokenRedemption("aaaaaaaaaaaaaaaa", ServerId));
+        var controller = Create();
+
+        var result = await controller.DownloadWithHeaderToken("good");
+
+        var file = Assert.IsType<FileContentResult>(result);
+        Assert.Equal([9, 8, 7], file.FileContents);
+        Assert.Equal("0.2.1", controller.Response.Headers["X-RustArchon-Plugin-Version"]);
+        _script.Verify(s => s.BuildBridgeAsync("aaaaaaaaaaaaaaaa"), Times.Once);
+    }
+
+    [Fact]
+    public async Task TheHeaderFormIsNeverCachedEitherWayItGoes()
+    {
+        _tokens.Setup(t => t.RedeemAsync("good")).ReturnsAsync(Good);
+        _tokens.Setup(t => t.RedeemAsync("bad")).ReturnsAsync((PluginTokenRedemption?)null);
+        var accepted = Create();
+        var refused = Create();
+
+        await accepted.DownloadWithHeaderToken("good");
+        await refused.DownloadWithHeaderToken("bad");
+
+        Assert.Equal("no-store", accepted.Response.Headers.CacheControl.ToString());
+        Assert.Equal("no-store", refused.Response.Headers.CacheControl.ToString());
+    }
+
+    [Theory]
+    [InlineData(null)]
+    [InlineData("")]
+    public async Task ANullOrEmptyHeaderIsABareNotFoundWithoutTouchingTheTokens(string? token)
+    {
+        var result = await Create().DownloadWithHeaderToken(token);
+
+        Assert.IsType<NotFoundResult>(result);
+        _tokens.Verify(t => t.RedeemAsync(It.IsAny<string>()), Times.Never);
+        _script.Verify(s => s.BuildBridgeAsync(It.IsAny<string>()), Times.Never);
+    }
+
+    [Fact]
+    public async Task AnOversizedHeaderIsABareNotFoundWithoutTouchingTheTokens()
+    {
+        var result = await Create().DownloadWithHeaderToken(new string('a', 129));
+
+        Assert.IsType<NotFoundResult>(result);
+        _tokens.Verify(t => t.RedeemAsync(It.IsAny<string>()), Times.Never);
+    }
+
+    [Fact]
+    public async Task ATokenThatIsNotGoodInTheHeaderIsABareNotFoundAndNothingIsBuilt()
+    {
+        _tokens.Setup(t => t.RedeemAsync("nope")).ReturnsAsync((PluginTokenRedemption?)null);
+
+        var result = await Create().DownloadWithHeaderToken("nope");
+
+        Assert.IsType<NotFoundResult>(result);
+        _script.Verify(s => s.BuildBridgeAsync(It.IsAny<string>()), Times.Never);
+    }
+
+    [Fact]
+    public async Task AKeyRevokedSinceTheUpdateStartedIsABareNotFoundInTheHeaderFormToo()
+    {
+        _tokens.Setup(t => t.RedeemAsync("good")).ReturnsAsync(Good);
+        var controller = Create();
+        _script.Setup(s => s.BuildBridgeAsync(It.IsAny<string>()))
+            .ThrowsAsync(new PluginKeyUnavailableException("0123456789abcdef", RustArchon.Api.Data.PluginKeyState.Revoked));
+
+        var result = await controller.DownloadWithHeaderToken("good");
+
+        Assert.IsType<NotFoundResult>(result);
+    }
+
+    [Fact]
+    public void TheHeaderNameTheApiReadsIsTheOneTheUpdaterSends()
+    {
+        var parameter = typeof(InternalPluginController).GetMethod(nameof(InternalPluginController.DownloadWithHeaderToken))!.GetParameters().Single();
+
+        var fromHeader = (Microsoft.AspNetCore.Mvc.FromHeaderAttribute)parameter.GetCustomAttributes(typeof(Microsoft.AspNetCore.Mvc.FromHeaderAttribute), false).Single();
+
+        Assert.Equal("X-RustArchon-Update-Token", fromHeader.Name);
+    }
+
+    // ---- a token for the Updater ---------------------------------------------------------------------------
+
+    private void GivenUpdaterScript() =>
+        _script.Setup(s => s.BuildUpdaterAsync()).ReturnsAsync(new PluginScript([4, 5, 6], "0123456789abcdef", "0.3.0"));
+
+    [Fact]
+    public async Task AnUpdaterTokenGetsTheSignedUpdaterNotTheMainPlugin()
+    {
+        _tokens.Setup(t => t.RedeemAsync("good")).ReturnsAsync(new PluginTokenRedemption("0123456789abcdef", ServerId, RustArchon.Api.Data.PluginUpdateTokenPurposes.Updater));
+        _script.Setup(s => s.GetKeyStateAsync("0123456789abcdef")).ReturnsAsync(RustArchon.Api.Data.PluginKeyState.Active);
+        GivenUpdaterScript();
+        var controller = Create();
+
+        var result = await controller.DownloadWithHeaderToken("good");
+
+        var file = Assert.IsType<FileContentResult>(result);
+        Assert.Equal([4, 5, 6], file.FileContents);
+        Assert.Equal("RustArchonUpdater.cs", file.FileDownloadName);
+        Assert.Equal("0.3.0", controller.Response.Headers["X-RustArchon-Plugin-Version"]);
+        Assert.Equal("no-store", controller.Response.Headers.CacheControl.ToString());
+        _script.Verify(s => s.BuildBridgeAsync(It.IsAny<string>()), Times.Never);
+    }
+
+    [Theory]
+    [InlineData(RustArchon.Api.Data.PluginKeyState.Retired)]
+    [InlineData(RustArchon.Api.Data.PluginKeyState.Revoked)]
+    [InlineData(null)]
+    public async Task AnUpdaterTokenWhoseKeyIsNoLongerTheActiveOneIsABareNotFoundAndNothingIsBuilt(RustArchon.Api.Data.PluginKeyState? state)
+    {
+        _tokens.Setup(t => t.RedeemAsync("good")).ReturnsAsync(new PluginTokenRedemption("0123456789abcdef", ServerId, RustArchon.Api.Data.PluginUpdateTokenPurposes.Updater));
+        _script.Setup(s => s.GetKeyStateAsync("0123456789abcdef")).ReturnsAsync(state);
+        GivenUpdaterScript();
+
+        var result = await Create().DownloadWithHeaderToken("good");
+
+        Assert.IsType<NotFoundResult>(result);
+        _script.Verify(s => s.BuildUpdaterAsync(), Times.Never);
+    }
+
+    [Fact]
+    public async Task AnUpdaterTokenInTheAddressFormStillGetsTheUpdaterNeverTheMainPlugin()
+    {
+        _tokens.Setup(t => t.RedeemAsync(ServerId, "good")).ReturnsAsync(new PluginTokenRedemption("0123456789abcdef", ServerId, RustArchon.Api.Data.PluginUpdateTokenPurposes.Updater));
+        _script.Setup(s => s.GetKeyStateAsync("0123456789abcdef")).ReturnsAsync(RustArchon.Api.Data.PluginKeyState.Active);
+        GivenUpdaterScript();
+
+        var file = Assert.IsType<FileContentResult>(await Create().Download(ServerId, "good"));
+
+        Assert.Equal([4, 5, 6], file.FileContents);
+    }
+
+    [Fact]
+    public async Task AMainTokenNeverGetsTheUpdater()
+    {
+        _tokens.Setup(t => t.RedeemAsync("good")).ReturnsAsync(Good);
+        GivenUpdaterScript();
+
+        var file = Assert.IsType<FileContentResult>(await Create().DownloadWithHeaderToken("good"));
+
+        Assert.Equal([9, 8, 7], file.FileContents);
+        _script.Verify(s => s.BuildUpdaterAsync(), Times.Never);
+    }
 }

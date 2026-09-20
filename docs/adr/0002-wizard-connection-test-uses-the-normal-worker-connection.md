@@ -72,6 +72,8 @@ footprint the current Add form already has once the user saves.
 
 ## Action Items
 
-1. [ ] Add a Discard endpoint that soft-deletes a half-created server and frees its plan slot.
-2. [ ] Add the wizard's resume route `/servers/{id}/setup`.
-3. [ ] Tests: Discard cleanup, plan-limit gate, duplicate-name handling, connect success/failure display.
+1. [x] ~~Add a Discard endpoint~~ - Discard reuses the existing `DELETE /api/rustservers/{id}` (a soft delete that frees the plan slot).
+2. [x] Add the wizard's resume route `/servers/{id}/setup`.
+3. [x] Tests: Discard cleanup, plan-limit gate, duplicate-name handling, connect success/failure display.
+
+*Implemented 2026-09-20. The wizard reads the connection back by polling the server's status once a second, rather than subscribing to the hub.*

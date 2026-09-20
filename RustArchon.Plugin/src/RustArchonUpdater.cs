@@ -11,8 +11,10 @@
 // Written for the C# 7.3 subset (see RustArchon.cs). Every command is RCON-only.
 //
 // How an update goes:
-//   1. The Panel (through the Worker) sends: archon.update <version> <url>. The URL is a single-use, short-lived
-//      token address on the Panel; this plugin holds no credential of its own.
+//   1. The Panel (through the Worker) sends: archon.update <version> <url> [token]. The token is single-use and short-lived;
+//      this plugin holds no credential of its own. From 0.3.0 the token is sent in a request header (X-RustArchon-Update-Token),
+//      so it never appears in a URL that a proxy or web server log could keep. Without the third argument the URL itself carries
+//      the token, as before: what an older Panel sends, and what this still accepts.
 //   2. The file is downloaded on a worker thread (capped in size, redirects refused), never on the game thread.
 //   3. It is accepted only if ALL of these hold: its last-line signature verifies under the key the INSTALLED main
 //      plugin trusts (the key stamped into that file, which must itself verify - so the trust follows the plugin
@@ -22,7 +24,8 @@
 //   4. The old file is kept as RustArchon.cs.bak, the new one is swapped in (File.Replace), and the main plugin's
 //      "loaded" marker is watched. If the new version writes its marker, the update succeeded. If not within the time
 //      limit (it failed to compile, or crashed in Init), the .bak is put back.
-// The Updater itself is only ever updated by hand: a failed Updater would have nothing left to recover it.
+// The Updater never replaces itself: a failed Updater would have nothing left to recover it. The main RustArchon plugin installs and
+// updates the Updater instead (archon.updater.update), and puts the old file back if the new one does not write updater-loaded.txt.
 
 using System;
 using System.Collections.Generic;
@@ -35,15 +38,22 @@ using System.Threading.Tasks;
 
 namespace Oxide.Plugins
 {
-    [Info("RustArchonUpdater", "RustArchon", "0.2.0")]
+    [Info("RustArchonUpdater", "RustArchon", "0.3.0")]
     [Description("Replaces the RustArchon plugin with a newer signed version, and rolls back if it does not load. RCON-only.")]
     public class RustArchonUpdater : RustPlugin
     {
         internal const string MainScriptFileName = "RustArchon.cs";
         internal const string StatusFileName = "update-status.txt";
         internal const string LoadedMarkerFileName = "loaded.txt";
+
+        // What this Updater writes when it loads, for the main plugin to read (the reverse of the marker above), and the main plugin's own
+        // state file for replacing this Updater.
+        internal const string OwnMarkerFileName = "updater-loaded.txt";
+        internal const string MainSwapFileName = "updater-swap.txt";
         internal const int MaxDownloadBytes = 1024 * 1024;
         internal const int DownloadTimeoutSeconds = 30;
+        internal const int MaxTokenLength = 128;
+        internal const string TokenHeaderName = "X-RustArchon-Update-Token";
         internal const int LoadWaitSeconds = 45;
 
         // Phases of an update. "idle", "succeeded", "failed" and "rolled-back" are resting states.
@@ -64,7 +74,7 @@ namespace Oxide.Plugins
         internal string TrustedModulus = UpdaterIntegrity.TrustedModulus;
         internal string TrustedExponent = UpdaterIntegrity.TrustedExponent;
 
-        internal Func<string, byte[]> Download = DefaultDownload;
+        internal Func<string, string, byte[]> Download = DefaultDownload;
         internal Func<DateTime> UtcNow = DefaultUtcNow;
 
         internal UpdateState State = new UpdateState();
@@ -117,8 +127,28 @@ namespace Oxide.Plugins
                 SaveState();
             }
 
+            // Written on every load so the main plugin, which replaces this file and puts the old one back if it does not come up,
+            // can tell that a freshly swapped-in Updater actually ran. A version that fails to compile never gets here.
+            WriteLoadedMarker();
+
             Puts("Init v" + Version + " phase=" + State.Phase + " signature=" + Integrity.State
                 + (Integrity.KeyFingerprint.Length > 0 ? " key=" + Integrity.KeyFingerprint : ""));
+        }
+
+        // "version=<x.y.z>" and "utc=<round-trip time>" next to the status file. Best effort: never stops the plugin loading.
+        internal void WriteLoadedMarker()
+        {
+            try
+            {
+                if (DataDirectory == null) { return; }
+                Directory.CreateDirectory(DataDirectory);
+                File.WriteAllText(
+                    Path.Combine(DataDirectory, OwnMarkerFileName),
+                    "version=" + Version + "\nutc=" + UtcNow().ToString("o") + "\n");
+            }
+            catch (Exception)
+            {
+            }
         }
 
         private void Unload()
@@ -126,19 +156,19 @@ namespace Oxide.Plugins
             StopTicking();
         }
 
-        // archon.update <version> <url>
+        // archon.update <version> <url> [token]
         [ConsoleCommand("archon.update")]
         internal void CmdUpdate(ConsoleSystem.Arg arg)
         {
             if (arg.Connection != null) { return; }
 
-            if (!arg.HasArgs(2) || arg.HasArgs(3))
+            if (!arg.HasArgs(2) || arg.HasArgs(4))
             {
-                arg.ReplyWith(UpdaterJson.Err("usage", "archon.update <version> <url>"));
+                arg.ReplyWith(UpdaterJson.Err("usage", "archon.update <version> <url> [token]"));
                 return;
             }
 
-            arg.ReplyWith(Begin(arg.GetString(0, ""), arg.GetString(1, "")));
+            arg.ReplyWith(Begin(arg.GetString(0, ""), arg.GetString(1, ""), arg.HasArgs(3) ? arg.GetString(2, "") : null));
         }
 
         // archon.update.status
@@ -151,11 +181,18 @@ namespace Oxide.Plugins
         }
 
         // Validates the request and starts the download. Returns the JSON reply.
-        internal string Begin(string version, string url)
+        // token is null when the URL itself carries the credential (the form an older Panel sends).
+        internal string Begin(string version, string url, string token = null)
         {
             if (State.Phase == PhaseDownloading || State.Phase == PhaseLoading)
             {
                 return UpdaterJson.Err("busy", "an update is already in progress (" + State.Phase + ")");
+            }
+
+            // The main plugin is replacing THIS file right now: each would be watching the other move.
+            if (UpdaterSwapInProgress())
+            {
+                return UpdaterJson.Err("busy", "the RustArchon plugin is replacing this Updater right now");
             }
 
             if (!UpdaterLogic.IsVersion(version))
@@ -167,6 +204,11 @@ namespace Oxide.Plugins
             if (!Uri.TryCreate(url, UriKind.Absolute, out uri) || (uri.Scheme != "http" && uri.Scheme != "https"))
             {
                 return UpdaterJson.Err("bad_url", "url must be an absolute http or https address");
+            }
+
+            if (token != null && !UpdaterLogic.IsToken(token))
+            {
+                return UpdaterJson.Err("bad_token", "the token must be 1 to " + MaxTokenLength + " letters, digits, dashes or underscores");
             }
 
             var installed = ReadInstalledVersion();
@@ -189,7 +231,7 @@ namespace Oxide.Plugins
             {
                 try
                 {
-                    result.Bytes = Download(url);
+                    result.Bytes = Download(url, token);
                 }
                 catch (Exception e)
                 {
@@ -505,6 +547,32 @@ namespace Oxide.Plugins
 
         // ---- state on disk (so a reload of this plugin mid-update does not lose track of it) ---------------------
 
+        // The main plugin's state file for its replacement of this Updater, read only to avoid overlapping with it.
+        private bool UpdaterSwapInProgress()
+        {
+            try
+            {
+                if (DataDirectory == null) { return false; }
+                var path = Path.Combine(DataDirectory, MainSwapFileName);
+                if (!File.Exists(path)) { return false; }
+
+                foreach (var line in File.ReadAllLines(path))
+                {
+                    if (line.StartsWith("phase=", StringComparison.Ordinal))
+                    {
+                        var phase = line.Substring(6).Trim();
+                        return phase == "downloading" || phase == "loading";
+                    }
+                }
+            }
+            catch (Exception)
+            {
+                return true;
+            }
+
+            return false;
+        }
+
         private void SaveState()
         {
             try
@@ -616,13 +684,19 @@ namespace Oxide.Plugins
         // On a worker thread. HttpWebRequest rather than HttpClient: it is the long-standing choice on the game
         // server's Mono runtime. Redirects are refused (a token URL should answer directly, and following one could
         // send the token elsewhere), and the body is capped so a hostile server cannot make it read without limit.
-        internal static byte[] DefaultDownload(string url)
+        internal static byte[] DefaultDownload(string url, string token)
         {
             var request = (HttpWebRequest)WebRequest.Create(url);
             request.Timeout = DownloadTimeoutSeconds * 1000;
             request.ReadWriteTimeout = DownloadTimeoutSeconds * 1000;
             request.AllowAutoRedirect = false;
             request.UserAgent = "RustArchonUpdater";
+            if (token != null)
+            {
+                // A header, not part of the address: nothing between here and the Panel logs headers by default, but almost
+                // everything logs URLs. Redirects are refused above, so this is only ever sent to the address that was given.
+                request.Headers[TokenHeaderName] = token;
+            }
 
             using (var response = (HttpWebResponse)request.GetResponse())
             {
@@ -658,6 +732,19 @@ namespace Oxide.Plugins
         // [Info("RustArchon", "<author>", "x.y.z")] - the MAIN plugin's attribute. The exact quoted title means this
         // updater's own [Info("RustArchonUpdater", ...)] can never be mistaken for it.
         private static readonly Regex InfoVersion = new Regex("\\[Info\\(\"RustArchon\"\\s*,\\s*\"[^\"]*\"\\s*,\\s*\"(\\d+\\.\\d+\\.\\d+)\"\\)\\]");
+
+        // The token as the Panel mints it: URL-safe base64 (letters, digits, - and _). Anything else is refused before it can
+        // reach a header, which also rules out line breaks and other header injection.
+        public static bool IsToken(string text)
+        {
+            if (string.IsNullOrEmpty(text) || text.Length > RustArchonUpdater.MaxTokenLength) { return false; }
+            foreach (var c in text)
+            {
+                var ok = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '-' || c == '_';
+                if (!ok) { return false; }
+            }
+            return true;
+        }
 
         public static bool IsVersion(string text)
         {

@@ -353,7 +353,7 @@ public class PluginTcSnapshotTests(PostgresFixture postgres) : IClassFixture<Pos
     private static ServerBasesController Controller(Harness h, string? email = "owner@example.com", Microsoft.Extensions.Logging.ILogger<ServerBasesController>? logger = null)
     {
         var identity = new System.Security.Claims.ClaimsIdentity(email is null ? [] : [new System.Security.Claims.Claim(System.Security.Claims.ClaimTypes.Email, email)], "test");
-        return new ServerBasesController(new RustServerRepository(h.Context), h.Repository, logger ?? NullLogger<ServerBasesController>.Instance)
+        return new ServerBasesController(new RustServerRepository(h.Context), h.Repository, new PlayerSessionRepository(h.Context), logger ?? NullLogger<ServerBasesController>.Instance)
         {
             ControllerContext = new ControllerContext { HttpContext = new Microsoft.AspNetCore.Http.DefaultHttpContext { User = new System.Security.Claims.ClaimsPrincipal(identity) } }
         };
@@ -442,5 +442,119 @@ public class PluginTcSnapshotTests(PostgresFixture postgres) : IClassFixture<Pos
 
         Assert.Equal(declared.Count, declared.Distinct().Count());
         Assert.All(PermissionCatalog.OwnerPermissions, p => Assert.Contains(p, declared));
+    }
+
+    // ---- names for players who are not online --------------------------------------------------------------
+
+    private static async Task AddSessionAsync(Harness h, string steamId, string name, double minutesAgo, Guid? server = null)
+    {
+        h.Context.Set<PlayerSession>().Add(new PlayerSession
+        {
+            TenantId = h.TenantId, RustServerId = server ?? h.ServerId, SteamId = steamId, DisplayName = name, IpAddress = "203.0.113.1",
+            ConnectedAtUtc = T0.AddMinutes(-minutesAgo), DisconnectedAtUtc = T0.AddMinutes(-minutesAgo + 5)
+        });
+        await h.Context.SaveChangesAsync();
+    }
+
+    private static string RawTc(int id, string owner, params (string Id, string? Name)[] authorized) =>
+        "{\"i\":" + id + ",\"x\":1,\"y\":1,\"z\":1,\"o\":\"" + owner + "\",\"a\":["
+        + string.Join(",", authorized.Select(a => "{\"i\":\"" + a.Id + "\"" + (a.Name is null ? "" : ",\"n\":\"" + a.Name + "\"") + "}")) + "]}";
+
+    private static async Task<BasesDto> GetBasesAsync(Harness h) =>
+        Assert.IsType<BasesDto>(Assert.IsType<OkObjectResult>((await Controller(h).Get(h.ServerId)).Result).Value);
+
+    [Fact]
+    public async Task APlayerTheGameGaveNoNameForIsNamedFromTheirLastSessionOnThisServer()
+    {
+        var h = await CreateAsync();
+        await AddServerAsync(h);
+        await h.Repository.ReplaceAsync(h.TenantId, h.ServerId, true, List(RawTc(1, Alice, (Alice, "Alice"), (Bob, null))), T0);
+        await AddSessionAsync(h, Bob, "Bobby Tables", minutesAgo: 600);
+
+        var bases = await GetBasesAsync(h);
+
+        Assert.Equal(["Alice", "Bobby Tables"], bases.Tcs.Single().Authorized.Select(a => a.Name).ToArray());
+    }
+
+    [Fact]
+    public async Task TheMostRecentSessionsNameWins()
+    {
+        var h = await CreateAsync();
+        await AddServerAsync(h);
+        await h.Repository.ReplaceAsync(h.TenantId, h.ServerId, true, List(RawTc(1, Alice, (Alice, "Alice"), (Bob, null))), T0);
+        await AddSessionAsync(h, Bob, "Old Name", minutesAgo: 5000);
+        await AddSessionAsync(h, Bob, "New Name", minutesAgo: 100);
+        await AddSessionAsync(h, Bob, "Older Still", minutesAgo: 9000);
+
+        var bases = await GetBasesAsync(h);
+
+        Assert.Equal("New Name", bases.Tcs.Single().Authorized.Single(a => a.PlayerId == Bob).Name);
+    }
+
+    [Fact]
+    public async Task AnAuthorizedPlayerNothingKnowsStaysAnId()
+    {
+        var h = await CreateAsync();
+        await AddServerAsync(h);
+        await h.Repository.ReplaceAsync(h.TenantId, h.ServerId, true, List(RawTc(1, Alice, (Bob, null))), T0);
+
+        var tc = (await GetBasesAsync(h)).Tcs.Single();
+
+        Assert.Equal(string.Empty, tc.Authorized.Single().Name);
+        Assert.Equal(string.Empty, tc.OwnerName);
+    }
+
+    [Fact]
+    public async Task ANameFromThePluginIsNeverReplacedByASessionsName()
+    {
+        var h = await CreateAsync();
+        await AddServerAsync(h);
+        await h.Repository.ReplaceAsync(h.TenantId, h.ServerId, true, List(Tc(1, Alice, authorized: [(Alice, "Alice Live")])), T0);
+        await AddSessionAsync(h, Alice, "Alice Old", minutesAgo: 60);
+
+        var tc = (await GetBasesAsync(h)).Tcs.Single();
+
+        Assert.Equal("Alice Live", tc.Authorized.Single().Name);
+        Assert.Equal("Alice Live", tc.OwnerName);
+    }
+
+    [Fact]
+    public async Task AnOwnerWhoIsNotAuthorizedOnTheirOwnCupboardIsStillNamed()
+    {
+        var h = await CreateAsync();
+        await AddServerAsync(h);
+        await h.Repository.ReplaceAsync(h.TenantId, h.ServerId, true, List(Tc(1, Alice, authorized: [])), T0);
+        await AddSessionAsync(h, Alice, "Alice From History", minutesAgo: 60);
+
+        var tc = (await GetBasesAsync(h)).Tcs.Single();
+
+        Assert.Equal("Alice From History", tc.OwnerName);
+    }
+
+    [Fact]
+    public async Task ASessionOnAnotherServerOrInAnotherOrganizationNamesNobodyHere()
+    {
+        var h = await CreateAsync();
+        var other = await CreateAsync();
+        await AddServerAsync(h);
+        await h.Repository.ReplaceAsync(h.TenantId, h.ServerId, true, List(Tc(1, Alice, authorized: [])), T0);
+        await AddSessionAsync(h, Alice, "Same Org Other Server", minutesAgo: 60, server: Guid.NewGuid());
+        await AddSessionAsync(other, Alice, "Other Org", minutesAgo: 30, server: h.ServerId);
+
+        var tc = (await GetBasesAsync(h)).Tcs.Single();
+
+        Assert.Equal(string.Empty, tc.OwnerName);
+    }
+
+    [Fact]
+    public async Task ASessionWithNoNameDoesNotBlankAKnownOne()
+    {
+        var h = await CreateAsync();
+        await AddServerAsync(h);
+        await h.Repository.ReplaceAsync(h.TenantId, h.ServerId, true, List(Tc(1, Alice, authorized: [])), T0);
+        await AddSessionAsync(h, Alice, "Alice Named", minutesAgo: 600);
+        await AddSessionAsync(h, Alice, "", minutesAgo: 10);        // the newest session has no name recorded
+
+        Assert.Equal("Alice Named", (await GetBasesAsync(h)).Tcs.Single().OwnerName);
     }
 }

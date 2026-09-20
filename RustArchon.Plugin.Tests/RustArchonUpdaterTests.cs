@@ -62,14 +62,14 @@ public sealed class RustArchonUpdaterTests : IDisposable
         return bytes;
     }
 
-    private RustArchonUpdater NewUpdater(Func<string, byte[]>? download = null, bool stamped = true)
+    private RustArchonUpdater NewUpdater(Func<string, string?, byte[]>? download = null, bool stamped = true)
     {
         var updater = new RustArchonUpdater
         {
             PluginDirectory = _plugins,
             DataDirectory = _data,
             UtcNow = () => _now,
-            Download = download ?? (_ => throw new InvalidOperationException("no download expected"))
+            Download = download ?? ((_, _) => throw new InvalidOperationException("no download expected"))
         };
         if (stamped)
         {
@@ -88,7 +88,7 @@ public sealed class RustArchonUpdaterTests : IDisposable
     private async Task<RustArchonUpdater> StartUpdateAsync(byte[] served, string version = "0.2.1", bool stamped = true)
     {
         InstallCurrent();
-        var updater = NewUpdater(_ => served, stamped);
+        var updater = NewUpdater((_, _) => served, stamped);
         var reply = JsonDocument.Parse(updater.Begin(version, "http://192.0.2.1/ingest/plugin/x/y")).RootElement;
         Assert.True(reply.GetProperty("ok").GetBoolean(), reply.ToString());
         await updater.DownloadTask;
@@ -117,7 +117,7 @@ public sealed class RustArchonUpdaterTests : IDisposable
     [Theory]
     [InlineData]
     [InlineData("0.2.1")]
-    [InlineData("0.2.1", "http://a/b", "extra")]
+    [InlineData("0.2.1", "http://a/b", "token", "extra")]
     public void WrongArgumentCountGetsAUsageError(params string[] args)
     {
         InstallCurrent();
@@ -192,7 +192,7 @@ public sealed class RustArchonUpdaterTests : IDisposable
     {
         InstallCurrent();
         var gate = new ManualResetEventSlim();
-        var updater = NewUpdater(_ => { gate.Wait(); return []; });
+        var updater = NewUpdater((_, _) => { gate.Wait(); return []; });
         Assert.True(JsonDocument.Parse(updater.Begin("0.2.1", "http://192.0.2.1/x")).RootElement.GetProperty("ok").GetBoolean());
 
         var second = JsonDocument.Parse(updater.Begin("0.2.2", "http://192.0.2.1/y")).RootElement;
@@ -263,7 +263,7 @@ public sealed class RustArchonUpdaterTests : IDisposable
     public async Task IfTheNewVersionNeverLoadsTheBackupIsPutBack()
     {
         var old = InstallCurrent("0.2.0");
-        var updater = NewUpdater(_ => Script("0.2.1"));
+        var updater = NewUpdater((_, _) => Script("0.2.1"));
         updater.Begin("0.2.1", "http://192.0.2.1/x");
         await updater.DownloadTask;
         updater.Tick(); // swapped in; the new file is NOT going to write a marker (it failed to compile)
@@ -323,7 +323,7 @@ public sealed class RustArchonUpdaterTests : IDisposable
     private async Task AssertRefusedAsync(byte[] served, string expectedReasonPrefix, string version = "0.2.1", bool stamped = true)
     {
         var old = InstallCurrent("0.2.0");
-        var updater = NewUpdater(_ => served, stamped);
+        var updater = NewUpdater((_, _) => served, stamped);
         Assert.True(JsonDocument.Parse(updater.Begin(version, "http://192.0.2.1/x")).RootElement.GetProperty("ok").GetBoolean());
         await updater.DownloadTask;
 
@@ -399,7 +399,7 @@ public sealed class RustArchonUpdaterTests : IDisposable
     public async Task ADownloadThatThrowsIsReportedAndChangesNothing()
     {
         var old = InstallCurrent("0.2.0");
-        var updater = NewUpdater(_ => throw new IOException("connection refused"));
+        var updater = NewUpdater((_, _) => throw new IOException("connection refused"));
         updater.Begin("0.2.1", "http://192.0.2.1/x");
         await updater.DownloadTask;
 
@@ -416,7 +416,7 @@ public sealed class RustArchonUpdaterTests : IDisposable
     {
         var old = InstallCurrent("0.2.0");
         var gate = new ManualResetEventSlim();
-        var updater = NewUpdater(_ => { gate.Wait(); return []; });
+        var updater = NewUpdater((_, _) => { gate.Wait(); return []; });
         updater.Begin("0.2.1", "http://192.0.2.1/x");
 
         updater.Tick(); // not done, not yet timed out
@@ -452,7 +452,7 @@ public sealed class RustArchonUpdaterTests : IDisposable
     public async Task AReloadedUpdaterStillRollsBackIfTheNewVersionNeverLoads()
     {
         var old = InstallCurrent("0.2.0");
-        var first = NewUpdater(_ => Script("0.2.1"));
+        var first = NewUpdater((_, _) => Script("0.2.1"));
         first.Begin("0.2.1", "http://192.0.2.1/x");
         await first.DownloadTask;
         first.Tick();
@@ -662,7 +662,7 @@ public sealed class RustArchonUpdaterTests : IDisposable
         var body = Script("0.2.1");
         var (url, done) = Serve(Http("200 OK", body));
 
-        var got = await Task.Run(() => RustArchonUpdater.DefaultDownload(url));
+        var got = await Task.Run(() => RustArchonUpdater.DefaultDownload(url, null));
 
         Assert.Equal(body, got);
         await done;
@@ -676,7 +676,7 @@ public sealed class RustArchonUpdaterTests : IDisposable
     {
         var (url, done) = Serve(Http(status, Encoding.ASCII.GetBytes("nope")));
 
-        await Assert.ThrowsAnyAsync<Exception>(() => Task.Run(() => RustArchonUpdater.DefaultDownload(url)));
+        await Assert.ThrowsAnyAsync<Exception>(() => Task.Run(() => RustArchonUpdater.DefaultDownload(url, null)));
         await done;
     }
 
@@ -686,7 +686,7 @@ public sealed class RustArchonUpdaterTests : IDisposable
         // A token URL must answer directly: following a redirect could send the token somewhere else.
         var (url, done) = Serve(Http("302 Found", [], "Location: http://192.0.2.1/elsewhere\r\n"));
 
-        await Assert.ThrowsAnyAsync<Exception>(() => Task.Run(() => RustArchonUpdater.DefaultDownload(url)));
+        await Assert.ThrowsAnyAsync<Exception>(() => Task.Run(() => RustArchonUpdater.DefaultDownload(url, null)));
         await done;
     }
 
@@ -695,7 +695,7 @@ public sealed class RustArchonUpdaterTests : IDisposable
     {
         var (url, done) = Serve(Http("200 OK", new byte[RustArchonUpdater.MaxDownloadBytes + 1]));
 
-        var ex = await Assert.ThrowsAnyAsync<Exception>(() => Task.Run(() => RustArchonUpdater.DefaultDownload(url)));
+        var ex = await Assert.ThrowsAnyAsync<Exception>(() => Task.Run(() => RustArchonUpdater.DefaultDownload(url, null)));
 
         Assert.Contains("larger than", ex.Message);
         await done;
@@ -726,5 +726,158 @@ public sealed class RustArchonUpdaterTests : IDisposable
         Assert.Equal("loading", updater.State.Phase);
         Assert.Equal(served, File.ReadAllBytes(MainPath));
         await done;
+    }
+
+    // ---- the token in a header, not in the address ---------------------------------------------------------
+
+    private const string GoodToken = "kQ3x9-Zr_AbCdEfGhIjKlMnOpQrStUvWxYz0123456";
+
+    [Fact]
+    public async Task ATokenGivenSeparatelyIsHandedToTheDownloadAndTheAddressIsLeftAlone()
+    {
+        InstallCurrent();
+        string? seenUrl = null;
+        string? seenToken = "unset";
+        var updater = NewUpdater((url, token) => { seenUrl = url; seenToken = token; return Script("0.2.1"); });
+
+        var reply = JsonDocument.Parse(updater.Begin("0.2.1", "http://192.0.2.1/ingest/plugin", GoodToken)).RootElement;
+        await updater.DownloadTask;
+
+        Assert.True(reply.GetProperty("ok").GetBoolean(), reply.ToString());
+        Assert.Equal("http://192.0.2.1/ingest/plugin", seenUrl);
+        Assert.Equal(GoodToken, seenToken);
+    }
+
+    [Fact]
+    public async Task WithNoTokenTheDownloadIsGivenNoneAndTheAddressCarriesTheCredentialAsBefore()
+    {
+        InstallCurrent();
+        string? seenToken = "unset";
+        var updater = NewUpdater((_, token) => { seenToken = token; return Script("0.2.1"); });
+
+        Assert.True(JsonDocument.Parse(updater.Begin("0.2.1", "http://192.0.2.1/ingest/plugin/x/y")).RootElement.GetProperty("ok").GetBoolean());
+        await updater.DownloadTask;
+
+        Assert.Null(seenToken);
+    }
+
+    [Theory]
+    [InlineData("has space")]
+    [InlineData("line\r\nbreak: injected")]
+    [InlineData("slash/inside")]
+    [InlineData("plus+sign")]
+    [InlineData("equals=")]
+    [InlineData("unicodé")]
+    [InlineData("")]
+    public void ATokenThatIsNotUrlSafeBase64IsRefusedBeforeAnythingIsDownloaded(string token)
+    {
+        InstallCurrent();
+        var updater = NewUpdater();
+
+        var reply = JsonDocument.Parse(updater.Begin("0.2.1", "http://192.0.2.1/ingest/plugin", token)).RootElement;
+
+        Assert.Equal("bad_token", reply.GetProperty("err").GetString());
+        Assert.Equal("idle", updater.State.Phase);
+    }
+
+    [Fact]
+    public void ATokenLongerThanTheLimitIsRefused()
+    {
+        InstallCurrent();
+        var updater = NewUpdater();
+
+        var reply = JsonDocument.Parse(updater.Begin("0.2.1", "http://192.0.2.1/ingest/plugin", new string('a', RustArchonUpdater.MaxTokenLength + 1))).RootElement;
+
+        Assert.Equal("bad_token", reply.GetProperty("err").GetString());
+    }
+
+    [Fact]
+    public async Task TheConsoleCommandTakesTheTokenAsItsThirdArgument()
+    {
+        InstallCurrent();
+        string? seenToken = null;
+        var updater = NewUpdater((_, token) => { seenToken = token; return Script("0.2.1"); });
+        var arg = Rcon("0.2.1", "http://192.0.2.1/ingest/plugin", GoodToken);
+
+        updater.CmdUpdate(arg);
+        await updater.DownloadTask;
+
+        Assert.True(Reply(arg).GetProperty("ok").GetBoolean());
+        Assert.Equal(GoodToken, seenToken);
+    }
+
+    [Fact]
+    public async Task TheRealDownloadSendsTheTokenInAHeaderAndNotInTheRequestLine()
+    {
+        var body = Script("0.2.1");
+        var (url, done, request) = ServeCapturing(Http("200 OK", body));
+
+        var got = await Task.Run(() => RustArchonUpdater.DefaultDownload(url, GoodToken));
+        await done;
+
+        Assert.Equal(body, got);
+        var text = await request;
+        var lines = text.Split("\r\n");
+        Assert.DoesNotContain(GoodToken, lines[0]);                                     // not in "GET /ingest/plugin HTTP/1.1"
+        Assert.Contains(lines, l => l == "X-RustArchon-Update-Token: " + GoodToken);
+    }
+
+    [Fact]
+    public async Task TheRealDownloadSendsNoTokenHeaderWhenThereIsNoToken()
+    {
+        var (url, done, request) = ServeCapturing(Http("200 OK", Script("0.2.1")));
+
+        await Task.Run(() => RustArchonUpdater.DefaultDownload(url, null));
+        await done;
+
+        Assert.DoesNotContain("X-RustArchon-Update-Token", await request, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public async Task ARealEndToEndUpdateWithTheTokenInAHeaderSucceeds()
+    {
+        InstallCurrent("0.2.0");
+        var served = Script("0.2.1");
+        var (url, done, request) = ServeCapturing(Http("200 OK", served));
+        var updater = new RustArchonUpdater
+        {
+            PluginDirectory = _plugins,
+            DataDirectory = _data,
+            UtcNow = () => _now,
+            TrustedModulus = Modulus,
+            TrustedExponent = Exponent
+        };
+        typeof(RustArchonUpdater).GetMethod("Init", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)!
+            .Invoke(updater, null);
+
+        Assert.True(JsonDocument.Parse(updater.Begin("0.2.1", url, GoodToken)).RootElement.GetProperty("ok").GetBoolean());
+        await updater.DownloadTask;
+        updater.Tick();
+        await done;
+
+        Assert.Equal("loading", updater.State.Phase);
+        Assert.Equal(served, File.ReadAllBytes(MainPath));
+        Assert.Contains("X-RustArchon-Update-Token: " + GoodToken, await request);
+    }
+
+    // Like Serve, but also hands back what the client sent.
+    private static (string Url, Task Done, Task<string> Request) ServeCapturing(byte[] rawResponse)
+    {
+        var listener = new TcpListener(IPAddress.Loopback, 0);
+        listener.Start();
+        var port = ((IPEndPoint)listener.LocalEndpoint).Port;
+        var captured = new TaskCompletionSource<string>();
+        var done = Task.Run(async () =>
+        {
+            using var client = await listener.AcceptTcpClientAsync();
+            var stream = client.GetStream();
+            var buffer = new byte[8192];
+            var read = await stream.ReadAsync(buffer);
+            captured.SetResult(Encoding.ASCII.GetString(buffer, 0, read));
+            await stream.WriteAsync(rawResponse);
+            await stream.FlushAsync();
+            listener.Stop();
+        });
+        return ($"http://127.0.0.1:{port}/ingest/plugin", done, captured.Task);
     }
 }

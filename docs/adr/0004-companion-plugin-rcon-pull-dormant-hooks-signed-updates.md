@@ -128,3 +128,11 @@ costs a second file and a rarely updated updater, in exchange for a recovery pat
 3. [ ] Implement the signing key, script stamping and signed download (plan Phase 1).
 4. [ ] Implement the Updater plugin and Panel-triggered update (plan Phase 4).
 5. [ ] After Phase 2 goes live, measure `RconEvent` growth and decide whether to change persistence.
+
+## Amendment (2026-09-20): the Updater is replaced by the main plugin
+
+The decision above kept the Updater manual because a failed Updater has no one to recover it. That left a recurring hand-maintenance step for every
+customer, which the product cannot have. The two plugins are now each other's recovery: the main plugin installs or updates the Updater (verifying the
+same signature under the key it trusts, keeping a backup, and putting the backup back if the new Updater's `updater-loaded.txt` marker does not appear
+within 45 seconds), and the Updater continues to do the same for the main plugin. They never replace one another at the same time. What remains manual is
+the first install of the main plugin, which is the trust root. Details and the tests are in the plan, "Updater self-update".

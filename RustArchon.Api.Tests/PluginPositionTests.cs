@@ -482,7 +482,7 @@ public class PluginPositionTests(PostgresFixture postgres) : IClassFixture<Postg
         await h.Repository.AppendAsync(h.TenantId, server, 1, false, Batch(Sample(1, Now.AddDays(-40).ToUnixTimeMilliseconds())), Now);
         await h.Repository.AppendAsync(h.TenantId, server, 1, false, Batch(Sample(2, Now.AddDays(-10).ToUnixTimeMilliseconds())), Now);
 
-        var removed = await new PluginDataRetention(h.Context, NullLogger<PluginDataRetention>.Instance).PruneAsync(Now);
+        var removed = await new PluginDataRetention(h.Context, new Moq.Mock<RustArchon.Api.Infrastructure.ObjectStorage.IObjectStorage>().Object, NullLogger<PluginDataRetention>.Instance).PruneAsync(Now);
 
         Assert.True(removed >= 1);
         var left = await h.Context.PluginPositionChunks.AsNoTracking().Where(c => c.RustServerId == server).ToListAsync();
@@ -497,7 +497,7 @@ public class PluginPositionTests(PostgresFixture postgres) : IClassFixture<Postg
         await a.Repository.AppendAsync(a.TenantId, a.ServerId, 1, false, Batch(Sample(1, Now.AddDays(-40).ToUnixTimeMilliseconds())), Now);
         await b.Repository.AppendAsync(b.TenantId, b.ServerId, 1, false, Batch(Sample(1, Now.AddDays(-1).ToUnixTimeMilliseconds())), Now);
 
-        await new PluginDataRetention(a.Context, NullLogger<PluginDataRetention>.Instance).PruneAsync(Now);
+        await new PluginDataRetention(a.Context, new Moq.Mock<RustArchon.Api.Infrastructure.ObjectStorage.IObjectStorage>().Object, NullLogger<PluginDataRetention>.Instance).PruneAsync(Now);
 
         Assert.False(await a.Context.PluginPositionChunks.AnyAsync(c => c.RustServerId == a.ServerId));
         Assert.True(await b.Context.PluginPositionChunks.AnyAsync(c => c.RustServerId == b.ServerId));

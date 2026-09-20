@@ -99,7 +99,7 @@ public sealed class ApiToUpdaterContractTests : IDisposable
             UtcNow = () => _now,
             TrustedModulus = Extract(updaterText, "TrustedModulus"),
             TrustedExponent = Extract(updaterText, "TrustedExponent"),
-            Download = _ => newMain
+            Download = (_, _) => newMain
         };
         typeof(RustArchonUpdater).GetMethod("Init", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)!
             .Invoke(updater, null);
@@ -159,5 +159,86 @@ public sealed class ApiToUpdaterContractTests : IDisposable
 
         Assert.False(reply.GetProperty("ok").GetBoolean());
         Assert.Equal("not_newer", reply.GetProperty("err").GetString());
+    }
+
+    // ---- the main plugin replacing the Updater, with nothing faked on either side of the wire ------------------
+
+    [Fact]
+    public async Task TheRealMainPluginInstallsTheRealSignedUpdaterTheApiServesAndTheRealUpdaterConfirmsIt()
+    {
+        var signing = NewSigningService();
+        var main = (await new PluginScriptService(signing, new VersionedSource(null)).BuildAsync()).Bytes;
+        var served = await new PluginScriptService(signing, new VersionedSource(null)).BuildUpdaterAsync();
+        var mainPath = Path.Combine(_plugins, "RustArchon.cs");
+        File.WriteAllBytes(mainPath, main);
+
+        // An older Updater is what is installed (only its version matters).
+        var servedText = Encoding.UTF8.GetString(served.Bytes);
+        var older = servedText.Replace("\"" + served.PluginVersion + "\")]", "\"0.0.1\")]");
+        File.WriteAllText(Path.Combine(_plugins, "RustArchonUpdater.cs"), older);
+
+        // The main plugin trusts exactly what is stamped into its own served file.
+        var mainText = Encoding.UTF8.GetString(main);
+        var plugin = new Oxide.Plugins.RustArchon
+        {
+            SettingsFilePath = Path.Combine(_data, "settings.txt"),
+            ScriptFilePath = mainPath,
+            TrustedModulus = Extract(mainText, "TrustedModulus"),
+            TrustedExponent = Extract(mainText, "TrustedExponent"),
+            UtcNow = () => _now,
+            UpdaterDownload = (_, _) => served.Bytes,
+            RunInBackground = work => work()
+        };
+        typeof(Oxide.Plugins.RustArchon).GetMethod("Init", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)!.Invoke(plugin, null);
+        Assert.Equal("valid", plugin.Integrity.State);
+
+        var reply = System.Text.Json.JsonDocument.Parse(
+            plugin.BeginUpdaterUpdate(served.PluginVersion!, "http://192.168.0.46:5200/ingest/plugin", "kQ3x9-Zr_AbCdEfGhIjKlMnOpQrStUvWxYz0123456")).RootElement;
+        Assert.True(reply.GetProperty("ok").GetBoolean(), reply.ToString());
+        plugin.UpdaterTick();
+
+        Assert.Equal("loading", plugin.UpdaterSwap.Phase);
+        Assert.Equal(served.Bytes, File.ReadAllBytes(Path.Combine(_plugins, "RustArchonUpdater.cs")));
+
+        // The real Updater, configured only from its own stamped file, writes the marker the main plugin waits for.
+        var updater = new RustArchonUpdater
+        {
+            PluginDirectory = _plugins, DataDirectory = _data, UtcNow = () => _now.AddSeconds(2),
+            Version = new Oxide.Core.VersionNumber(served.PluginVersion!)
+        };
+        updater.WriteLoadedMarker();
+        plugin.UpdaterTick();
+
+        Assert.Equal("succeeded", plugin.UpdaterSwap.Phase);
+    }
+
+    [Fact]
+    public async Task TheRealMainPluginRefusesAnUpdaterSignedByAnotherPanelsKey()
+    {
+        var mine = NewSigningService();
+        var main = (await new PluginScriptService(mine, new VersionedSource(null)).BuildAsync()).Bytes;
+        _row.Value = "";        // a different Panel: a different key
+        var other = NewSigningService();
+        var foreign = await new PluginScriptService(other, new VersionedSource(null)).BuildUpdaterAsync();
+        var mainPath = Path.Combine(_plugins, "RustArchon.cs");
+        File.WriteAllBytes(mainPath, main);
+        var older = Encoding.UTF8.GetString(foreign.Bytes).Replace("\"" + foreign.PluginVersion + "\")]", "\"0.0.1\")]");
+        File.WriteAllText(Path.Combine(_plugins, "RustArchonUpdater.cs"), older);
+
+        var mainText = Encoding.UTF8.GetString(main);
+        var plugin = new Oxide.Plugins.RustArchon
+        {
+            SettingsFilePath = Path.Combine(_data, "settings.txt"), ScriptFilePath = mainPath,
+            TrustedModulus = Extract(mainText, "TrustedModulus"), TrustedExponent = Extract(mainText, "TrustedExponent"),
+            UtcNow = () => _now, UpdaterDownload = (_, _) => foreign.Bytes, RunInBackground = work => work()
+        };
+        typeof(Oxide.Plugins.RustArchon).GetMethod("Init", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)!.Invoke(plugin, null);
+
+        plugin.BeginUpdaterUpdate(foreign.PluginVersion!, "http://192.168.0.46:5200/ingest/plugin", "kQ3x9-Zr_AbCdEfGhIjKlMnOpQrStUvWxYz0123456");
+        plugin.UpdaterTick();
+
+        Assert.Equal("failed", plugin.UpdaterSwap.Phase);
+        Assert.StartsWith("signature_invalid", plugin.UpdaterSwap.Reason);
+        Assert.Equal(older, File.ReadAllText(Path.Combine(_plugins, "RustArchonUpdater.cs")));
     }
 }

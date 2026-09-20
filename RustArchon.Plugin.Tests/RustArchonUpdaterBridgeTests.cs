@@ -81,7 +81,7 @@ public sealed class RustArchonUpdaterBridgeTests : IDisposable
             UtcNow = () => _now,
             TrustedModulus = Mod(ownStamp),
             TrustedExponent = Exp(ownStamp),
-            Download = _ => served
+            Download = (_, _) => served
         };
         typeof(RustArchonUpdater).GetMethod("Init", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)!
             .Invoke(updater, null);

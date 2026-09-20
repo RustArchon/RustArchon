@@ -104,8 +104,9 @@ server.
   (no silent downgrade), backs up `<name>.cs` to `.bak`, swaps with `File.Replace`, and waits for the new main
   plugin to write a `loaded.<version>` marker; if it does not appear in time it restores `.bak`. (The marker
   uses only `System.IO`, which the spike proved works.)
-- **The Updater itself is updated manually** (re-download from the Panel), because a failed Updater has no one to
-  recover it. The handshake reports its version and the Panel warns when it is old.
+- **The Updater is never updated by itself**, because a failed Updater has no one to recover it. From plugin 0.9.0 the **main plugin**
+  installs and updates the Updater and puts the old one back if the new one does not come up (see "Updater self-update" below), so there is no
+  hand maintenance; the very first install of the main plugin is still by hand. (Earlier text: re-download from the Panel.) The handshake reports its version and the Panel warns when it is old.
 - **Rotation:** a bridge release signed with the old key that embeds the new key. "Regenerate key" without that
   flow would strand every installed plugin, so it is gated behind the flow.
 - RCON frames carrying token URLs are already flagged so only the site owner sees them; tokens are still
@@ -359,8 +360,8 @@ exists locally only; nothing is on GitHub until Scott confirms visibility and li
   constant: the token alone names the server and map, so no server id is in the URL. The plugin streams the file from a background thread,
   refuses redirects, and only accepts a base64url token so it can never inject a header. The Panel door streams (never buffers) to the
   Api, which redeems the token before reading a byte, requires a declared length under 120 MB and a PNG signature, then stores the picture
-  in Garage and records its SHA-256. Live: requested 05:50:15, stored 05:50:17. (The Updater's download still carries its token in the
-  address; moving it is possible but changes the manually-installed Updater.)
+  in Garage and records its SHA-256. Live: requested 05:50:15, stored 05:50:17. (The Updater's download carried its token in the address at
+  first; from Updater 0.3.0 it travels in a header too - see "Hardening pass" below.)
 - Api/Panel: `PluginMap` per server per wipe (an old wipe's picture is kept), `GET api/rustservers/{id}/map` and `.../map/image` (ETag =
   content hash, gated like reading a server), and a Map tab: canvas over the picture with named places, bases and players as separate
   layers (the two sensitive ones hidden with a note when the viewer lacks their permission).
@@ -368,7 +369,7 @@ exists locally only; nothing is on GitHub until Scott confirms visibility and li
   pixel per metre), so the picture spans world size + 1000. Found because the first version drew places in the wrong spots; verified
   against the picture (oil rigs and the underwater lab land on deep water, 33 of 34 checkpoints match; it was 24 of 34 before).
 - **Display copy (2026-09-20).** Serving the 24 MB original through the Api, the Panel and the Blazor connection made the tab take over
-  30 s. The Api now keeps a display-sized JPEG (longest side 2048 px, quality 85, never scaled up) next to the original, made once when the
+  30 s. The Api now keeps a display-sized copy (first a 2048 px JPEG; see the zoom note below for what it became) next to the original, made once when the
   picture arrives (or on first request for one collected before this existed), served by default with its own entity tag; the original stays
   in Garage and is available with `?full=true`. Measured: 24.1 MB -> 536 KB, and opening the tab paints in 60-100 ms. The decode is strict:
   a picture that does not fully decode gets no preview and is served from the original rather than showing half a map. This adds
@@ -404,7 +405,7 @@ exists locally only; nothing is on GitHub until Scott confirms visibility and li
 - Not yet run live (unit and contract tested, including real HTTP): bad signature, wrong key, older version,
   corrupt download, token reuse. The `PluginUpdateAttempt` audit rows and the "updater is out of date" warning are
   not built.
-- The Updater's own updates stay manual by design.
+- The Updater's own updates were manual by design; from plugin 0.9.0 the main plugin does them (see "Updater self-update").
 
 ### Phase 4b - Key rotation that does not strand old plugins
 
@@ -500,6 +501,151 @@ encryption ring, which does not travel), and losing the key strands every instal
   trusted (the developer machine and the dev site), never with production. Verified live (export, download, check, wrong passphrase); the
   cross-Panel case is covered by tests that use two different encryption key rings, not by two running Panels.
 
+### Hardening pass (2026-09-20, unattended)
+
+Built on branch `feature/overnight-hardening` in each repository, tested, **not yet merged**. Nothing here changes the database schema.
+
+- **Map picture size limit (a defect found in review).** The upload door checked the byte size and the PNG signature, but the display-copy
+  maker decoded whatever the header declared: a few hundred bytes claiming 60,000 x 60,000 px would ask for ~14 GB. The declared size is now
+  read from the PNG header (`PngHeader`) and held to 8192 px a side before anything is stored or decoded, a signature without a readable
+  header is refused, and the renderer checks the size again before it allocates. (The game's largest world, 6000 m, is 7000 px.)
+- **Retention grew from chunks to everything the plan advertises.** It lives in the Api, not the Worker: the Worker has no database (data flows
+  Worker -> Api), and the Api already runs the periodic jobs (`PluginDataPruneService`, every 6 hours). It now also removes, per organization
+  by its plan's `RetentionHistory` days (30 when there is no usable plan): console and chat events, kill-feed events, stats snapshots, and
+  **the maps of past wipes** - a server's newest map is never removed; an older one goes once neither its last sighting nor its upload is inside
+  the window, the pictures (original and display copy) are deleted from Garage first and the row only if that worked, so a storage failure
+  retries next pass. Expired upload and update tokens go a day after they expire. Deletes are batched (5000 rows) so the first pass over a
+  table that was never pruned does not hold one huge transaction. Player sessions are not touched.
+- **Empty background answers are not stored.** Every poll's reply was stored as a console row, visible only in the site admin's unfiltered view.
+  A drain that reports nothing new (and nothing lost or reset), an empty list (the player list of a server nobody is on) and a blank reply to a
+  *background* command are now dropped in the Worker before publishing; a person's own command is always stored, as is anything with content,
+  a "lost" or "reset" flag, or an error.
+- **Updater 0.3.0: the download token moves to a header.** `archon.update <version> <url> [token]`; with a third argument the Updater sends
+  `X-RustArchon-Update-Token` and the address carries no credential (`GET /ingest/plugin` on the Panel, `GET internal/plugin/download` on
+  the Api, which finds the server from the token). The token must be URL-safe base64 (letters, digits, `-`, `_`), which also rules out header
+  injection. The Api chooses the form from the Updater version the server reports: 0.3.0 or newer gets the header form, anything older (or
+  unknown) still gets the token in the address, and that door stays. A server gets the new Updater through the Updater self-update below (no
+  hand install); until then updates keep working exactly as before. Checked live against the local Api: a real token redeemed through the header
+  door returned the signed 0.7.0 script with `Cache-Control: no-store`, and the same token answered 404 the second time.
+- **Names on the Bases list.** The game only gives the plugin the ids on a cupboard, so anyone offline showed as a number. The Api now fills
+  the gap when it serves the list, from the name each player used in their latest session on that server (the Worker records every connection),
+  never overriding a name the plugin supplied, and adds the owner's name to each base (the map labels use it too). Stateless: nothing is stored
+  differently, so a name appears the moment a session for that player exists. A player who has never connected since RustArchon began recording
+  stays an id.
+- **Test fixtures fixed** that depended on the checkout: one assumed LF line endings in the embedded plugin source, and the permission matrix
+  sent JSON to the multipart upload endpoint (415 before authorization).
+
+### Plugin update notices from UpdateChecker (2026-09-20, plugin 0.8.0)
+
+Built on the same `feature/overnight-hardening` branches; **not yet run against a real UpdateChecker event** (see "Not verified").
+
+- **What UpdateChecker gives us.** The hook is `OnUpdateCheckerUpdateFound(string name, string currentVersion, string latestVersion, string url, string marketplace)`,
+  fired once per outdated plugin at each scan (documented on the plugin's Codefling page). **`url` is the plugin's marketplace page, not a
+  download**, so it can be offered as a link but cannot drive an install. The class name is used for `name` ("BlueprintShare") where the server's plugin
+  list has the title ("Blueprint Share"), so matching ignores case, spaces and punctuation. Its console report (visible in the stored console
+  history from 2026-09-19) has the same fields, which is how the shape was confirmed on the live server (UpdateChecker 4.6.1, scanning on load
+  and every 1440 minutes).
+- **Plugin (0.8.0, capability `updates`).** Catches the hook and keeps the newest notice per plugin (`ArchonUpdates.Store`: name, current and
+  latest version, url, marketplace, first and last time heard, times heard), bounded (500 plugins) and stripped of control characters because it is
+  another plugin's text. A notice that is news is written to the console with every field; a repeat only refreshes the times. `archon.updates`
+  returns the table. It is a table, not a history: UpdateChecker repeats itself at every scan, so nothing needs to survive a plugin reload.
+- **Worker.** While the capability is offered it reads `archon.updates` every 5 minutes and publishes `PluginUpdatesCaptured` only when there are
+  notices and the reply changed. An empty table is never published (it means "not heard yet", not "up to date") and is not stored as a console row.
+- **Api.** `PluginUpdateNotice` (one row per server per plugin, everything as reported; migration `AddPluginUpdateNotices`), merged by plugin, an
+  older report never replacing a newer one, nothing removed by a report that leaves a plugin out. Each new or newer notice is logged with all its
+  fields. Pruned with the rest by plan retention when not heard again. `GET api/rustservers/{id}/plugin-updates` (same permission as reading the
+  server) returns only notices that still hold - the plugin is still installed and its installed version is not provably at least the newest
+  (versions that cannot be compared show the notice unless written identically) - so updating a plugin removes its notice without waiting for the
+  next scan. The address is passed on only if it is an absolute http or https one without credentials.
+- **Panel.** The Plugins tab shows a count, and for each plugin with a notice an "Update available: x.y.z" badge (its tooltip has the installed and
+  newest versions, first and last heard, times heard) and a "View on <marketplace>" link (opens in a new tab, `noopener noreferrer nofollow`; the page
+  repeats the http/https check). Shown text is never treated as markup.
+- **Checked live** (local Api/Panel against Rusty Amigos, with rows made from the real 2026-09-19 scan output): Blueprint Share (installed v1.4.6, reported
+  "BlueprintShare 1.4.6 -> 1.4.7") and HarborEvent (2.4.4 -> 2.4.6, Codefling) appeared with the right version and link; a hostile row for a plugin that is not
+  installed was not listed. The rows were removed afterwards.
+- **Not verified.** The plugin itself has not been pushed to Rusty Amigos: the update needs the game server to reach the Panel that serves it, and
+  this laptop's only route (a firewall rule and LAN Panel address) is a security-setting change that was not made unattended. Push it from panel-dev
+  once this is merged and the edge image is built (the Updater stays 0.2.0 - no change needed). The first real notice will arrive at the next UpdateChecker scan
+  after the plugin loads (up to 24 hours), since UpdateChecker does not rescan when another plugin loads.
+- **Later: an Update button.** Not possible from what UpdateChecker provides (a page, not a file). Paid marketplaces will not hand a server a file
+  without a login, so this would need a per-marketplace answer (uMod publishes downloads; Codefling and others do not) and a way for the
+  server owner to supply credentials. To be designed separately.
+
+### Updater self-update (2026-09-20, plugin 0.9.0 and Updater 0.3.0)
+
+Scott's requirement: no manual maintenance. The reason the Updater was manual is that it is the only thing that can roll back a bad main-plugin
+update, so a bad Updater would have nothing to recover it. The answer is that each is the other's way back.
+
+- **Who does what.** The **main plugin** downloads, verifies, swaps and watches the Updater (`archon.updater.update <version> <url> <token>`,
+  `archon.updater.status`, capability `updater-update`); the Updater keeps doing the same for the main plugin. Only one is ever replaced at a
+  time: each refuses to start while the other's state file says it is downloading or loading (`update-status.txt` / `updater-swap.txt`).
+- **What is checked.** The last-line signature must verify under the key **this plugin** trusts (its own stamp, which must itself verify), the
+  `[Info("RustArchonUpdater", ...)]` version must be the one asked for and newer than the installed one (no downgrade), and the file must
+  arrive within the 1 MB cap with redirects refused and the token in a header. Otherwise nothing on disk changes.
+- **Rollback.** The previous file is kept as `RustArchonUpdater.cs.bak`. The new Updater writes `updater-loaded.txt` (version and time) when it
+  comes up - a copy that fails to compile never does - and the main plugin waits for that marker for 45 seconds, then restores the backup. The
+  swap survives the main plugin reloading (the state is on disk and resumed at load). If there was no Updater at all (a **fresh install**), the
+  file that did not come up is simply removed.
+- **Key rotation.** The Panel signs the Updater with its active key, which the plugin that installs it must trust, so a server still on an older key
+  is told to **update the plugin first** (`update_plugin_first`); that bridge moves it to the new key, after which the Updater can be updated.
+- **Bootstrap.** No hand-install is needed even for servers running Updater 0.2.0: the old Updater updates the main plugin to 0.9.0 as always, and
+  0.9.0 then updates the Updater. `plugin_too_old` tells the Panel's user to do the plugin first when the capability is missing.
+- **Api.** `POST api/rustservers/{id}/plugin/update-updater` (`PluginUpdateService.StartUpdaterAsync`, same switch, permission and result shape as
+  the plugin update). Preconditions: updates on, handshake known, the plugin's signature valid and its key the Panel's **active** one, the
+  `updater-update` capability, and a newer (or missing) Updater. The token has a **purpose** (`main` or `updater`; new column, migration
+  `AddPluginUpdateTokenPurpose`) so a token minted for one file can never fetch the other; the download door serves the Updater only to an
+  `updater` token whose key is still active. The command always uses the header form (`archon.updater.update <v> <panel>/ingest/plugin <token>`).
+- **Panel.** On the Plugins tab an outdated Updater shows "Update Updater", a missing one "Install Updater" (with the download kept as the by-hand
+  route when the plugin is too old, the key is not the Panel's current one, or updates are off - with a hint to turn them on). The result reads
+  "started" only; the outcome shows in the Updater's version after Refresh.
+- **Tested** with a temp plugins folder (signed, unsigned, wrong key, tampered, wrong version, not newer, busy, timeout, missing/changed file,
+  reload mid-swap, rollback, fresh install, real HTTP with the token in a header) and end to end with the real Api-signed Updater and the real
+  Updater's marker.
+- **Live on Rusty Amigos (2026-09-20).** Plugin 0.8.0 -> 0.9.0 through the Updater 0.2.0 already installed (the version number had to move on:
+  0.8.0 was already installed without the capability, so the Panel saw nothing to update). Then, with no hand install, the Panel's "Update Updater"
+  took the Updater 0.2.0 -> 0.3.0 in about two seconds ("Swapped in RustArchonUpdater 0.3.0" ... "Init v0.3.0" ... "Updater update succeeded",
+  the Updater's header-token download used the LAN address). **Rollback, live:** a deliberately broken Updater 0.3.1 (a syntax error, served from a
+  temporary edit of the source that was reverted afterwards) was swapped in at 19:35:36, Carbon logged `Failed compiling 'RustArchonUpdater.cs'`,
+  and at 19:36:22 - 45 seconds after the swap - the main plugin logged `Updater update 0.3.1 rolled-back`, restored the backup and Carbon
+  loaded Updater 0.3.0 again. Not exercised live: a fresh install (no Updater at all) and a main plugin that reloads mid-swap (both covered by tests).
+
+### Automatic updates (2026-09-20)
+
+Scott's decisions: an opt-in per-server switch (yes); **players being online is not a reason to wait** (a plugin reload is brief; the Worker collects what
+the plugin holds every 30 seconds, so at most about that much recorded data is lost); an update that failed is not retried in a loop but a *different*
+version is always tried (and bridges work as ever); a server on an older key is handled by the bridge, not skipped; release control is needed.
+
+- **Switches.** Per server: "Update automatically" (`RustServer.PluginAutoUpdateEnabled`, off by default, shown only while "Allow updates" is on and
+  turned off with it; the settings endpoint takes it as an *optional* field so a client that does not know about it cannot flip it). Site-wide: the
+  platform setting **Automatic plugin updates** (`PluginAutoUpdatesEnabled`, default on) stops every automatic update at once - the emergency stop.
+- **What it is.** `PluginAutoUpdater` (a background pass every 5 minutes, first one 3 minutes after the Api starts) presses the same buttons a person
+  does: `PluginUpdateService.StartAsync` / `StartUpdaterAsync` with trigger `auto`. Every check (signature, key, version, capability, token) is the
+  service's, so automation can never do what a click could not. It decides only when and in what order.
+- **Order.** Current key and a plugin that can update the Updater: the **Updater first**, then the plugin. An older key: the **plugin first** (that is the
+  bridge to the current key), the Updater after it on a later pass. One update at a time per server; the next waits until the last one's outcome is known
+  (the reported version changed, or ten minutes passed). At most five updates start per pass, so a release does not reach every server at once. Servers
+  whose plugin has not answered in 15 minutes are left alone.
+- **No loops.** `PluginUpdateAttempt` rows (also the audit trail of manual updates: kind, from, to, trigger, state, code, times) record every request that
+  reached a server: started, then succeeded (the version arrived) or failed (it did not - the new one was put back), or refused with the plugin's code.
+  A (kind, version) that is failed, refused or still pending on a server is not sent again until a different version is served. Refusals that say nothing
+  about the version (busy, plugin too old) and servers that could not be reached are not attempts and are simply tried again. Succeeded attempts are pruned
+  by plan retention; failures and refusals are kept so a bad version is not retried when the window passes.
+- **Release control.** The auto updater only ever follows *the version being served*: an uploaded release stays a draft until an administrator publishes it,
+  and withdrawing it returns to the embedded build (never a downgrade: nothing newer than installed means nothing to do). Plus the site-wide switch above.
+  Not built: staged roll-outs by percentage or delay after publishing.
+- **In the Add Server wizard (Scott's request).** An **Updates** step follows the Plugin step for anyone who chose to set the plugin up, gathering every
+  update setting on one page with a plain explanation of each and why someone might want it: "Allow updates from this Panel" (one click instead of a
+  new file each time; only a Panel-signed file is accepted and the previous version is put back if the new one does not start), "Update automatically"
+  (fixes and features without remembering; the same checks as a click; players need not leave; a failed version is put back and not retried; leave it
+  off to choose when the server changes) and a note on the Updater helper (installed already, or installable by the Panel once updates are allowed).
+  Both switches are off unless the server already has them on; the step can be skipped and everything is changeable later on the Plugins tab.
+- **Panel.** The Plugins tab has the "Update automatically" switch under "Allow updates", and a "Recent updates" list (last five: automatic or manual,
+  plugin or Updater, versions, outcome in words, time).
+- **Tests.** Real Postgres for the updater (eligibility, order, one at a time, outcome resolution, failed and refused versions not retried, a fixed
+  release retried, an unreachable server retried, staggering, one server's failure not stopping the others, no downgrade, players online ignored),
+  the service's attempt recording, the settings endpoint (optional field, follows the updates switch), the attempts endpoint, retention, and the Panel.
+  Not yet run live.
+
 ### Phase 5 - Session replay UI (later)
 
 Not in the first delivery, but Phase 2 starts capturing so history exists when it ships. Needs Phase 3's map image
@@ -581,14 +727,18 @@ unblocked by Phase 1's handshake. Plugin-side `OnPlayerReported` internals belon
 - **Combat log storage is the biggest unknown.** Per-hit volume times up to 265 days of retention could dwarf
   everything else in the plan; the row format is not fixed until hits per player-hour are measured on a PvP
   server. The test server is PVE ("Builder-focused PVE"), so it will understate player-vs-player traffic.
-- **No retention enforcement exists yet** for any history. This plan adds the first pruning job.
+- **Retention** is enforced by `PluginDataRetention` in the Api (see "Hardening pass" below): plugin chunks, console and chat, kill feed,
+  stats snapshots, the maps of past wipes and spent tokens. **Player sessions are deliberately not pruned** (they hold the VPN, ban and
+  geolocation lookups and the names the Panel shows); if the plan's "player history" days should cover them too, that is a decision for
+  the owner, not a side effect.
 
 - **Oxide is untested.** Carbon is the first-class target; claim Oxide support only after a compile-and-run test
   on an Oxide server.
 - **Rust updates break plugin internals monthly.** Keep the main plugin's Rust-internal surface small; the
   Updater plus failed-plugin visibility in the Panel is the mitigation.
 - **Boot render delays server opening by ~48 s** on the first boot after a wipe.
-- **`RconEvent` growth:** deliberately unmitigated for now; Phase 2 measurement decides.
+- **`RconEvent` growth:** background polls' empty answers are no longer stored (see "Hardening pass"), and the table is now pruned to the plan's
+  retention; what remains is the non-empty poll answers (server info, player list, tool cupboards) which are one row per poll.
 - **TC index cold start:** cost unmeasured.
 - **No relaunch after RCON restart:** the Panel must not promise a restart, only a stop.
 - **Private signing key** sits in the same database as the Data Protection key ring that protects it; an "import

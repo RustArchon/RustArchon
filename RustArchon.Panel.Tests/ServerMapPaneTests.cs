@@ -224,6 +224,20 @@ public class ServerMapPaneTests : BunitContext
     // ---- the sensitive layers ---------------------------------------------------------------------------------------
 
     [Fact]
+    public void ABaseIsLabelledWithTheOwnersResolvedNameEvenWhenTheyAreNotOnTheirOwnCupboard()
+    {
+        GivenImage();
+        var tc = Base(1, "76561198000000001", 10, 20);
+        tc.OwnerName = "Resolved Owner";
+        GivenBases(tc);
+
+        var cut = RenderPane();
+        cut.WaitForAssertion(() => Assert.NotEmpty(JSInterop.Invocations["serverMap.draw"]));
+
+        Assert.Equal("Resolved Owner", DrawModel().GetProperty("bases")[0].GetProperty("name").GetString());
+    }
+
+    [Fact]
     public void WithoutThePlayerPermissionThePlayersLayerIsLeftOutAndTheRestStillShows()
     {
         GivenImage();

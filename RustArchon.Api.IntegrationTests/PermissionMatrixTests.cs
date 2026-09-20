@@ -105,6 +105,9 @@ public class PermissionMatrixTests(ApiFactory factory) : IClassFixture<ApiFactor
     /// result worth failing on either way: reaching the bus at all means authorization let the
     /// request through, which is what the admission half is asking.
     /// </remarks>
+    /// <summary>Actions that take a multipart form, not JSON (a file upload).</summary>
+    private static readonly HashSet<string> FormActions = new(StringComparer.Ordinal) { "PluginAdmin.Upload" };
+
     private static async Task<HttpStatusCode?> SendAsync(HttpClient client, GuardedEndpoint endpoint)
     {
         client.Timeout = RequestTimeout;
@@ -114,7 +117,10 @@ public class PermissionMatrixTests(ApiFactory factory) : IClassFixture<ApiFactor
 
         if (endpoint.Method is "POST" or "PUT" or "PATCH")
         {
-            request.Content = new StringContent("{}", Encoding.UTF8, "application/json");
+            // A form endpoint answers 415 to a JSON body before authorization is even consulted, which says nothing about its guard.
+            request.Content = FormActions.Contains(endpoint.Action)
+                ? new MultipartFormDataContent { { new StringContent("main"), "kind" } }
+                : new StringContent("{}", Encoding.UTF8, "application/json");
         }
 
         try
