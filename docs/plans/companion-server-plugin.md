@@ -534,6 +534,42 @@ Built on branch `feature/overnight-hardening` in each repository, tested, **not 
 - **Test fixtures fixed** that depended on the checkout: one assumed LF line endings in the embedded plugin source, and the permission matrix
   sent JSON to the multipart upload endpoint (415 before authorization).
 
+### Plugin update notices from UpdateChecker (2026-09-20, plugin 0.8.0)
+
+Built on the same `feature/overnight-hardening` branches; **not yet run against a real UpdateChecker event** (see "Not verified").
+
+- **What UpdateChecker gives us.** The hook is `OnUpdateCheckerUpdateFound(string name, string currentVersion, string latestVersion, string url, string marketplace)`,
+  fired once per outdated plugin at each scan (documented on the plugin's Codefling page). **`url` is the plugin's marketplace page, not a
+  download**, so it can be offered as a link but cannot drive an install. The class name is used for `name` ("BlueprintShare") where the server's plugin
+  list has the title ("Blueprint Share"), so matching ignores case, spaces and punctuation. Its console report (visible in the stored console
+  history from 2026-09-19) has the same fields, which is how the shape was confirmed on the live server (UpdateChecker 4.6.1, scanning on load
+  and every 1440 minutes).
+- **Plugin (0.8.0, capability `updates`).** Catches the hook and keeps the newest notice per plugin (`ArchonUpdates.Store`: name, current and
+  latest version, url, marketplace, first and last time heard, times heard), bounded (500 plugins) and stripped of control characters because it is
+  another plugin's text. A notice that is news is written to the console with every field; a repeat only refreshes the times. `archon.updates`
+  returns the table. It is a table, not a history: UpdateChecker repeats itself at every scan, so nothing needs to survive a plugin reload.
+- **Worker.** While the capability is offered it reads `archon.updates` every 5 minutes and publishes `PluginUpdatesCaptured` only when there are
+  notices and the reply changed. An empty table is never published (it means "not heard yet", not "up to date") and is not stored as a console row.
+- **Api.** `PluginUpdateNotice` (one row per server per plugin, everything as reported; migration `AddPluginUpdateNotices`), merged by plugin, an
+  older report never replacing a newer one, nothing removed by a report that leaves a plugin out. Each new or newer notice is logged with all its
+  fields. Pruned with the rest by plan retention when not heard again. `GET api/rustservers/{id}/plugin-updates` (same permission as reading the
+  server) returns only notices that still hold - the plugin is still installed and its installed version is not provably at least the newest
+  (versions that cannot be compared show the notice unless written identically) - so updating a plugin removes its notice without waiting for the
+  next scan. The address is passed on only if it is an absolute http or https one without credentials.
+- **Panel.** The Plugins tab shows a count, and for each plugin with a notice an "Update available: x.y.z" badge (its tooltip has the installed and
+  newest versions, first and last heard, times heard) and a "View on <marketplace>" link (opens in a new tab, `noopener noreferrer nofollow`; the page
+  repeats the http/https check). Shown text is never treated as markup.
+- **Checked live** (local Api/Panel against Rusty Amigos, with rows made from the real 2026-09-19 scan output): Blueprint Share (installed v1.4.6, reported
+  "BlueprintShare 1.4.6 -> 1.4.7") and HarborEvent (2.4.4 -> 2.4.6, Codefling) appeared with the right version and link; a hostile row for a plugin that is not
+  installed was not listed. The rows were removed afterwards.
+- **Not verified.** The plugin itself has not been pushed to Rusty Amigos: the update needs the game server to reach the Panel that serves it, and
+  this laptop's only route (a firewall rule and LAN Panel address) is a security-setting change that was not made unattended. Push it from panel-dev
+  once this is merged and the edge image is built (the Updater stays 0.2.0 - no change needed). The first real notice will arrive at the next UpdateChecker scan
+  after the plugin loads (up to 24 hours), since UpdateChecker does not rescan when another plugin loads.
+- **Later: an Update button.** Not possible from what UpdateChecker provides (a page, not a file). Paid marketplaces will not hand a server a file
+  without a login, so this would need a per-marketplace answer (uMod publishes downloads; Codefling and others do not) and a way for the
+  server owner to supply credentials. To be designed separately.
+
 ### Phase 5 - Session replay UI (later)
 
 Not in the first delivery, but Phase 2 starts capturing so history exists when it ships. Needs Phase 3's map image
