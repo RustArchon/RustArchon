@@ -48,7 +48,8 @@ public class ServerConnectionActorInteractivityTests
 
     /// <summary>What a plugin would answer to the test's two drain commands; null for anything else (which is simply echoed).</summary>
     private static string? DrainReplyFor(string command) =>
-        command.StartsWith("test.drain.empty", StringComparison.Ordinal) ? EmptyDrain
+        command.StartsWith("test.list.empty", StringComparison.Ordinal) ? "[]"
+        : command.StartsWith("test.drain.empty", StringComparison.Ordinal) ? EmptyDrain
         : command.StartsWith("test.drain.busy", StringComparison.Ordinal) ? BusyDrain
         : null;
 
@@ -230,7 +231,9 @@ public class ServerConnectionActorInteractivityTests
         var empty = await actor.SendCommandAsync("test.drain.empty", TimeSpan.FromSeconds(5), CancellationToken.None, RconCommandContext.Background);
         var busy = await actor.SendCommandAsync("test.drain.busy", TimeSpan.FromSeconds(5), CancellationToken.None, RconCommandContext.Background);
         var typed = await actor.SendCommandAsync("test.drain.empty", TimeSpan.FromSeconds(5), CancellationToken.None, new RconCommandContext(Interactive: true));
-        Assert.True(empty.Success && busy.Success && typed.Success, $"{empty.Error} {busy.Error} {typed.Error}");
+        var emptyList = await actor.SendCommandAsync("test.list.empty", TimeSpan.FromSeconds(5), CancellationToken.None, RconCommandContext.Background);
+        var typedList = await actor.SendCommandAsync("test.list.empty", TimeSpan.FromSeconds(5), CancellationToken.None, new RconCommandContext(Interactive: true));
+        Assert.True(empty.Success && busy.Success && typed.Success && emptyList.Success && typedList.Success, $"{empty.Error} {busy.Error} {typed.Error}");
 
         serverCts.Cancel();
         listener.Stop();
@@ -247,6 +250,18 @@ public class ServerConnectionActorInteractivityTests
         publishEndpoint.Verify(
             p => p.Publish(
                 It.Is<RconFrameCaptured>(f => f.Direction == RconEventDirection.Received && f.Message == BusyDrain && !f.Interactive),
+                It.IsAny<CancellationToken>()),
+            Times.AtLeastOnce);
+
+        // An empty list answering a background poll (nobody online): not stored; the same answer to a person's command is.
+        publishEndpoint.Verify(
+            p => p.Publish(
+                It.Is<RconFrameCaptured>(f => f.Direction == RconEventDirection.Received && f.Message == "[]" && !f.Interactive),
+                It.IsAny<CancellationToken>()),
+            Times.Never);
+        publishEndpoint.Verify(
+            p => p.Publish(
+                It.Is<RconFrameCaptured>(f => f.Direction == RconEventDirection.Received && f.Message == "[]" && f.Interactive),
                 It.IsAny<CancellationToken>()),
             Times.AtLeastOnce);
 
