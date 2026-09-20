@@ -58,6 +58,8 @@ public class PlatformSettingsControllerSecretPurposeTests(PostgresFixture postgr
 
         var secretKeys = (await repository.GetAllAsync())
             .Where(s => s.ValueType == RustArchon.Api.Data.PlatformSettingValueType.Secret)
+            // Deliberately not editable here: it is rotated on the Plugin admin page (see the test below).
+            .Where(s => s.Key != PlatformSettingsRegistry.PluginSigningKey)
             .Select(s => s.Key)
             .ToList();
 
@@ -71,5 +73,27 @@ public class PlatformSettingsControllerSecretPurposeTests(PostgresFixture postgr
                 result.Result is OkObjectResult,
                 $"Saving Secret setting '{key}' failed - is it missing from PlatformSettingsController.SecretPurposeFor?");
         }
+    }
+
+    [Fact]
+    public async Task ThePluginSigningKeyCannotBeOverwrittenThroughTheGenericSettingsEndpoint()
+    {
+        // Typing over it would silently strand every plugin already installed from this Panel; rotating it on the Plugin
+        // admin page keeps the old key. The stored value must be untouched by the refused call.
+        var context = new ApiDbContext(postgres.Options, tenantContext: null);
+        await PlatformSettingsRegistry.EnsureDefaultsAsync(
+            context, new Microsoft.Extensions.Configuration.ConfigurationBuilder().Build(), NullLogger.Instance);
+        var repository = new PlatformSettingRepository(context);
+        var before = (await repository.GetByKeyAsync(PlatformSettingsRegistry.PluginSigningKey))!.Value;
+        var controller = new PlatformSettingsController(
+            repository, Mock.Of<IPlatformSettingsCache>(), Mock.Of<IAppGenerationCache>(), Mock.Of<IApiKeyProtector>(),
+            Mock.Of<IRequestClient<SendTestEmail>>(), CreateMapper());
+
+        var result = await controller.UpdateValue(PlatformSettingsRegistry.PluginSigningKey, new UpdatePlatformSettingValueDto { Value = "junk" });
+
+        var refused = Assert.IsType<BadRequestObjectResult>(result.Result);
+        Assert.Contains("Plugin page", refused.Value!.ToString());
+        Assert.Equal(before, (await new PlatformSettingRepository(new ApiDbContext(postgres.Options, tenantContext: null))
+            .GetByKeyAsync(PlatformSettingsRegistry.PluginSigningKey))!.Value);
     }
 }

@@ -4,9 +4,16 @@
     <File Path=".env.example" />
     <File Path="docker-compose.yml" />
   </Folder>
+  <Folder Name="/RustArchon.Plugin/">
+    <File Path="RustArchon.Plugin/README.md" />
+    <File Path="RustArchon.Plugin/src/RustArchon.cs" />
+    <File Path="RustArchon.Plugin/src/RustArchonUpdater.cs" />
+  </Folder>
   <Folder Name="/Tests/">
     <Project Path="RustArchon.Api.IntegrationTests/RustArchon.Api.IntegrationTests.csproj" />
     <Project Path="RustArchon.Api.Tests/RustArchon.Api.Tests.csproj" />
+    <Project Path="RustArchon.Plugin.CompileCheck/RustArchon.Plugin.CompileCheck.csproj" />
+    <Project Path="RustArchon.Plugin.Tests/RustArchon.Plugin.Tests.csproj" />
     <Project Path="RustArchon.Worker.Tests/RustArchon.Worker.Tests.csproj" />
   </Folder>
   <Project Path="JumpStart/JumpStart/JumpStart.csproj" />

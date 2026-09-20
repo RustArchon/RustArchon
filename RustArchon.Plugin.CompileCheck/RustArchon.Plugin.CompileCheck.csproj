@@ -1,0 +1,30 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    Builds the plugin source at C# 7.3 - the subset the game server's compiler can be relied on to accept. This
+    is a compile check only (no tests): it catches our own use of newer syntax, and nothing about the framework's
+    own restrictions. The tests project compiles the same file at the default language version.
+  -->
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <LangVersion>7.3</LangVersion>
+    <OutputType>Library</OutputType>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <Nullable>disable</Nullable>
+    <IsPackable>false</IsPackable>
+    <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+    <!-- The Updater downloads with HttpWebRequest on purpose: it is the long-standing choice on the game server's Mono
+         runtime, where SYSLIB0014 ("use HttpClient instead") is a modern-.NET notice that does not apply. Only this one
+         diagnostic is silenced; everything else is still an error. -->
+    <NoWarn>$(NoWarn);SYSLIB0014</NoWarn>
+    <Configurations>Debug;Release</Configurations>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Compile Include="..\RustArchon.Plugin\src\RustArchon.cs" Link="RustArchon.cs" />
+    <Compile Include="..\RustArchon.Plugin\src\RustArchonUpdater.cs" Link="RustArchonUpdater.cs" />
+    <Compile Include="..\RustArchon.Plugin.Tests\Stubs\OxideStubs.cs" Link="OxideStubs.cs" />
+  </ItemGroup>
+
+</Project>
