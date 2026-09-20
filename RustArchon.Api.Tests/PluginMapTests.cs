@@ -38,7 +38,17 @@ public class PluginMapTests(PostgresFixture postgres) : IClassFixture<PostgresFi
 {
     private static readonly DateTimeOffset Now = new(2026, 9, 20, 12, 0, 0, TimeSpan.Zero);
 
-    private static readonly byte[] Png = [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 1, 2, 3, 4, 5, 6, 7, 8];
+    /// <summary>The signature and header of a 100 x 100 PNG and nothing else: passes the door, cannot be decoded.</summary>
+    private static readonly byte[] Png = HeaderOnlyPng(100, 100);
+
+    private static byte[] HeaderOnlyPng(uint width, uint height)
+    {
+        var bytes = new byte[24 + 8];
+        new byte[] { 0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0, 0, 0, 13, (byte)'I', (byte)'H', (byte)'D', (byte)'R' }.CopyTo(bytes, 0);
+        System.Buffers.Binary.BinaryPrimitives.WriteUInt32BigEndian(bytes.AsSpan(16), width);
+        System.Buffers.Binary.BinaryPrimitives.WriteUInt32BigEndian(bytes.AsSpan(20), height);
+        return bytes;
+    }
 
     private sealed class TestClock(DateTimeOffset start) : TimeProvider
     {
@@ -708,6 +718,87 @@ public class PluginMapTests(PostgresFixture postgres) : IClassFixture<PostgresFi
         var (h, _, token) = await ReadyToUploadAsync();
 
         Assert.IsType<BadRequestObjectResult>(await Door(h, new MemoryStorage(), [0x89, 0x50]).Upload(token));
+    }
+
+    [Theory]
+    [InlineData(60000u, 60000u)]
+    [InlineData(8193u, 100u)]
+    [InlineData(100u, 8193u)]
+    [InlineData(uint.MaxValue, uint.MaxValue)]
+    [InlineData(0u, 100u)]
+    [InlineData(100u, 0u)]
+    public async Task APictureThatDeclaresAnUnreasonableSizeIsRefusedAndNothingIsStored(uint width, uint height)
+    {
+        var (h, map, token) = await ReadyToUploadAsync();
+        var storage = new MemoryStorage();
+
+        var result = await Door(h, storage, HeaderOnlyPng(width, height)).Upload(token);
+
+        Assert.IsType<BadRequestObjectResult>(result);
+        Assert.Empty(storage.Objects);
+        Assert.Null((await h.Maps.GetByIdAsync(map.Id))!.UploadedAtUtc);
+    }
+
+    [Fact]
+    public async Task APictureAtTheSizeLimitIsAccepted()
+    {
+        var (h, _, token) = await ReadyToUploadAsync();
+
+        Assert.IsType<NoContentResult>(await Door(h, new MemoryStorage(), HeaderOnlyPng(8192, 8192)).Upload(token));
+    }
+
+    [Fact]
+    public async Task ASignatureWithoutAnIhdrHeaderIsRefused()
+    {
+        var (h, _, token) = await ReadyToUploadAsync();
+        var noHeader = new byte[] { 0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18 };
+
+        Assert.IsType<BadRequestObjectResult>(await Door(h, new MemoryStorage(), noHeader).Upload(token));
+    }
+
+    [Fact]
+    public void ARendererRefusesAPictureThatDeclaresAnUnreasonableSizeWithoutAllocatingForIt()
+    {
+        // A tiny, valid-looking header for a 60,000 x 60,000 picture: decoding it would need ~14 GB. It must come back null, fast.
+        var claimsHuge = RealPng(16, 16);
+        System.Buffers.Binary.BinaryPrimitives.WriteUInt32BigEndian(claimsHuge.AsSpan(16), 60000);
+        System.Buffers.Binary.BinaryPrimitives.WriteUInt32BigEndian(claimsHuge.AsSpan(20), 60000);
+        FixIhdrCrc(claimsHuge);            // so the decoder accepts the header and it is the size check that says no
+
+        var before = GC.GetTotalAllocatedBytes(true);
+        var preview = new MapPreviewRenderer().Render(claimsHuge);
+        var allocated = GC.GetTotalAllocatedBytes(true) - before;
+
+        Assert.Null(preview);
+        Assert.True(allocated < 50_000_000, $"allocated {allocated} bytes");
+    }
+
+    /// <summary>Recomputes the CRC of the first (IHDR) chunk after its size was edited.</summary>
+    private static void FixIhdrCrc(byte[] png)
+    {
+        var crc = 0xFFFFFFFFu;
+        for (var i = 12; i < 29; i++)                    // chunk name + 13 data bytes
+        {
+            crc ^= png[i];
+            for (var bit = 0; bit < 8; bit++)
+            {
+                crc = (crc & 1) != 0 ? (crc >> 1) ^ 0xEDB88320u : crc >> 1;
+            }
+        }
+
+        System.Buffers.Binary.BinaryPrimitives.WriteUInt32BigEndian(png.AsSpan(29), ~crc);
+    }
+
+    [Theory]
+    [InlineData(100u, 100u, true)]
+    [InlineData(8192u, 8192u, true)]
+    [InlineData(8193u, 100u, false)]
+    public void PngHeaderReadsTheDeclaredSize(uint width, uint height, bool acceptable)
+    {
+        Assert.True(PngHeader.TryReadSize(HeaderOnlyPng(width, height), out var w, out var h));
+
+        Assert.Equal((width, height), ((uint)w, (uint)h));
+        Assert.Equal(acceptable, PngHeader.IsAcceptableMapSize(w, h));
     }
 
     [Fact]
