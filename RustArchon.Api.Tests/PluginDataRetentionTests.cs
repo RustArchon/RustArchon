@@ -472,4 +472,22 @@ public class PluginDataRetentionTests(PostgresFixture postgres) : IClassFixture<
         Assert.Equal(["fresh-map-token", "just-expired-map-token"], mapTokens.Order().ToList());   // a token stays a day past expiry
         Assert.Equal(["fresh-update-token"], updateTokens);
     }
+
+    [Fact]
+    public async Task UpdateNoticesNotHeardAgainWithinTheWindowAreDeletedAndRecentOnesKept()
+    {
+        var tenant = await TenantAsync(30);
+        await using (var context = PlatformContext())
+        {
+            context.PluginUpdateNotices.Add(new PluginUpdateNotice { TenantId = tenant, RustServerId = Guid.NewGuid(), Name = "Old", NormalizedName = "old", ReportedAtUtc = Now.AddDays(-45) });
+            context.PluginUpdateNotices.Add(new PluginUpdateNotice { TenantId = tenant, RustServerId = Guid.NewGuid(), Name = "Fresh", NormalizedName = "fresh", ReportedAtUtc = Now.AddDays(-2) });
+            await context.SaveChangesAsync();
+        }
+
+        await PruneAsync();
+
+        await using var check = PlatformContext();
+        var left = await check.PluginUpdateNotices.AcrossAllTenants().Where(n => n.TenantId == tenant).Select(n => n.Name).ToListAsync();
+        Assert.Equal(["Fresh"], left);
+    }
 }

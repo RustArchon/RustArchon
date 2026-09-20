@@ -23,7 +23,7 @@ using UnityEngine;
 
 namespace Oxide.Plugins
 {
-    [Info("RustArchon", "RustArchon", "0.7.0")]
+    [Info("RustArchon", "RustArchon", "0.8.0")]
     [Description("RustArchon companion plugin. Dormant until the RustArchon panel asks; every command is RCON-only.")]
     public class RustArchon : RustPlugin
     {
@@ -38,7 +38,7 @@ namespace Oxide.Plugins
         // What this build can actually do. A capability is listed only once its code exists, so the panel
         // never enables a feature the installed plugin cannot perform. "recording" and "combat" arrive with
         // their hooks in a later phase; until then only the settings channel itself is offered.
-        private static readonly string[] Capabilities = { "config", "combat", "tcs", "positions", "map" };
+        private static readonly string[] Capabilities = { "config", "combat", "tcs", "positions", "map", "updates" };
 
         // Set by Init unless something (a test) supplied a path first.
         internal string SettingsFilePath;
@@ -126,6 +126,38 @@ namespace Oxide.Plugins
             ApplyPositionRecording(Settings.Recording);
             _settingsPersisted = SettingsFilePath != null && Settings.TrySave(SettingsFilePath);
             arg.ReplyWith(ArchonJson.Ok(Settings.ToJson(_settingsPersisted)));
+        }
+
+        // ---- plugin update notices ---------------------------------------------------------------------------
+        //
+        // UpdateChecker (a third-party plugin, on servers that run it) calls OnUpdateCheckerUpdateFound once per outdated plugin
+        // each time it scans. This keeps what it says - the plugin, the installed and newest versions, the marketplace and the
+        // address of the plugin's page there (a page to visit, not a file to download) - and hands it to the Worker on request.
+        // It is a table of the latest notice per plugin, not a history: UpdateChecker says it again at every scan, so a plugin that
+        // reloads simply hears it again. Nothing here does any work unless UpdateChecker is loaded, so the hook stays subscribed.
+
+        internal readonly ArchonUpdates.Store UpdateNotices = new ArchonUpdates.Store();
+
+        private void OnUpdateCheckerUpdateFound(string name, string currentVersion, string latestVersion, string url, string marketplace)
+        {
+            var isNew = UpdateNotices.Record(name, currentVersion, latestVersion, url, marketplace, NowMs());
+            if (isNew)
+            {
+                Puts("Update available (reported by UpdateChecker): " + ArchonUpdates.Clean(name, ArchonUpdates.MaxNameLength)
+                    + " " + ArchonUpdates.Clean(currentVersion, ArchonUpdates.MaxVersionLength)
+                    + " -> " + ArchonUpdates.Clean(latestVersion, ArchonUpdates.MaxVersionLength)
+                    + " marketplace=" + ArchonUpdates.Clean(marketplace, ArchonUpdates.MaxMarketplaceLength)
+                    + " url=" + ArchonUpdates.Clean(url, ArchonUpdates.MaxUrlLength));
+            }
+        }
+
+        // archon.updates - the update notices UpdateChecker has reported since this plugin loaded.
+        [ConsoleCommand("archon.updates")]
+        internal void CmdUpdates(ConsoleSystem.Arg arg)
+        {
+            if (arg.Connection != null) { return; }
+
+            arg.ReplyWith(ArchonJson.Ok(UpdateNotices.ToJson()));
         }
 
         // ---- combat log --------------------------------------------------------------------------------------
@@ -1770,6 +1802,121 @@ namespace Oxide.Plugins
             {
                 if (float.IsNaN(value) || float.IsInfinity(value)) { return "0"; }
                 return Math.Round(value, 1).ToString("0.0", System.Globalization.CultureInfo.InvariantCulture);
+            }
+        }
+    }
+
+    // What UpdateChecker reported: one notice per plugin, the newest. Third-party text from another plugin, so every field is
+    // stripped of control characters and bounded before it is kept.
+    internal static class ArchonUpdates
+    {
+        internal const int MaxNotices = 500;
+        internal const int MaxNameLength = 100;
+        internal const int MaxVersionLength = 50;
+        internal const int MaxMarketplaceLength = 50;
+        internal const int MaxUrlLength = 500;
+
+        internal sealed class Notice
+        {
+            public string Name;
+            public string CurrentVersion;
+            public string LatestVersion;
+            public string Url;
+            public string Marketplace;
+            public long FirstSeenMs;
+            public long LastSeenMs;
+            public int TimesSeen;
+        }
+
+        // Control characters removed (a line break in a log line or a header is never wanted), surrounding space trimmed, then cut
+        // to the limit. Null is nothing.
+        internal static string Clean(string value, int maxLength)
+        {
+            if (string.IsNullOrEmpty(value)) { return ""; }
+
+            var sb = new StringBuilder(Math.Min(value.Length, maxLength));
+            foreach (var c in value)
+            {
+                if (c < ' ' || c == (char)127) { continue; }
+                sb.Append(c);
+                if (sb.Length >= maxLength) { break; }
+            }
+            return sb.ToString().Trim();
+        }
+
+        internal sealed class Store
+        {
+            private readonly object _lock = new object();
+            private readonly Dictionary<string, Notice> _byName = new Dictionary<string, Notice>();
+
+            public int Count
+            {
+                get { lock (_lock) { return _byName.Count; } }
+            }
+
+            // True when this is news: a plugin not seen before, or one whose newest version changed. Saying the same thing again
+            // (UpdateChecker does, every scan) only refreshes the times and returns false, so it is not logged again.
+            public bool Record(string name, string currentVersion, string latestVersion, string url, string marketplace, long nowMs)
+            {
+                var cleanName = Clean(name, MaxNameLength);
+                if (cleanName.Length == 0) { return false; }
+
+                var key = cleanName.ToLowerInvariant();
+                var current = Clean(currentVersion, MaxVersionLength);
+                var latest = Clean(latestVersion, MaxVersionLength);
+                var cleanUrl = Clean(url, MaxUrlLength);
+                var cleanMarketplace = Clean(marketplace, MaxMarketplaceLength);
+
+                lock (_lock)
+                {
+                    Notice existing;
+                    if (_byName.TryGetValue(key, out existing) && existing.LatestVersion == latest)
+                    {
+                        existing.CurrentVersion = current;
+                        existing.Url = cleanUrl;
+                        existing.Marketplace = cleanMarketplace;
+                        existing.LastSeenMs = nowMs;
+                        if (existing.TimesSeen < int.MaxValue) { existing.TimesSeen++; }
+                        return false;
+                    }
+
+                    if (existing == null && _byName.Count >= MaxNotices) { return false; }
+
+                    _byName[key] = new Notice
+                    {
+                        Name = cleanName, CurrentVersion = current, LatestVersion = latest, Url = cleanUrl, Marketplace = cleanMarketplace,
+                        FirstSeenMs = nowMs, LastSeenMs = nowMs, TimesSeen = 1
+                    };
+                    return true;
+                }
+            }
+
+            public string ToJson()
+            {
+                List<Notice> notices;
+                lock (_lock)
+                {
+                    notices = new List<Notice>(_byName.Values);
+                }
+                notices.Sort(delegate (Notice a, Notice b) { return string.CompareOrdinal(a.Name.ToLowerInvariant(), b.Name.ToLowerInvariant()); });
+
+                var sb = new StringBuilder(64 + notices.Count * 200);
+                sb.Append("{\"format\":1,\"count\":").Append(notices.Count).Append(",\"updates\":[");
+                for (var i = 0; i < notices.Count; i++)
+                {
+                    var n = notices[i];
+                    if (i > 0) { sb.Append(','); }
+                    sb.Append("{\"n\":").Append(ArchonJson.Quote(n.Name));
+                    sb.Append(",\"c\":").Append(ArchonJson.Quote(n.CurrentVersion));
+                    sb.Append(",\"l\":").Append(ArchonJson.Quote(n.LatestVersion));
+                    sb.Append(",\"u\":").Append(ArchonJson.Quote(n.Url));
+                    sb.Append(",\"m\":").Append(ArchonJson.Quote(n.Marketplace));
+                    sb.Append(",\"f\":").Append(n.FirstSeenMs);
+                    sb.Append(",\"s\":").Append(n.LastSeenMs);
+                    sb.Append(",\"t\":").Append(n.TimesSeen).Append('}');
+                }
+                sb.Append("]}");
+                return sb.ToString();
             }
         }
     }
