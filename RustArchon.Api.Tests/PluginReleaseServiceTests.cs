@@ -75,7 +75,8 @@ public class PluginReleaseServiceTests(PostgresFixture postgres) : IClassFixture
     public async Task TheStoredSourceIsTheNormalizedSourceTheStamperWillSign()
     {
         await using var context = await FreshAsync();
-        var original = Encoding.UTF8.GetString(MainSource("9.1.0")).Replace("\n", "\r\n");
+        // CRLF whatever line endings this checkout gave the embedded source (a Windows checkout already has them).
+        var original = Encoding.UTF8.GetString(MainSource("9.1.0")).Replace("\r\n", "\n").Replace("\n", "\r\n");
         var withBom = Encoding.UTF8.GetPreamble().Concat(Encoding.UTF8.GetBytes(original)).ToArray();
 
         await NewService(context).UploadAsync(PluginReleaseKind.Main, withBom, "a@example.com", null);
