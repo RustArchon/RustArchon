@@ -1471,6 +1471,49 @@ public class ServerDetailPluginCardTests : BunitContext
         Assert.Contains("<img src=x onerror=alert(1)>", cut.Find("[data-testid=base-row]").TextContent);
     }
 
+    [Fact]
+    public void AnOwnerTheApiHasANameForIsShownByThatNameEvenWhenNotOnTheirOwnCupboard()
+    {
+        GivenPluginListed();
+        GivenBasesCapable();
+        var tc = Base(1, "76561198000000001", 0, 0, 0);
+        tc.OwnerName = "Alice From History";
+        GivenBases(true, tc);
+
+        var cut = RenderBasesTab();
+
+        cut.WaitForAssertion(() => Assert.Contains("Alice From History", cut.Find("[data-testid=base-row]").TextContent));
+        Assert.Contains("76561198000000001", cut.Find("[data-testid=base-row]").TextContent);       // the id stays beneath the name
+    }
+
+    [Fact]
+    public void AnOwnerNameIsShownAsTextNeverAsMarkup()
+    {
+        GivenPluginListed();
+        GivenBasesCapable();
+        var tc = Base(1, "76561198000000001", 0, 0, 0);
+        tc.OwnerName = "<b onmouseover=alert(1)>owner</b>";
+        GivenBases(true, tc);
+
+        var cut = RenderBasesTab();
+
+        cut.WaitForAssertion(() => Assert.NotEmpty(cut.FindAll("[data-testid=base-row]")));
+        Assert.Empty(cut.FindAll("[data-testid=base-row] b"));
+        Assert.Contains("<b onmouseover=alert(1)>owner</b>", cut.Find("[data-testid=base-row]").TextContent);
+    }
+
+    [Fact]
+    public void AnApiResolvedAuthorizedNameIsListedLikeAPluginOne()
+    {
+        GivenPluginListed();
+        GivenBasesCapable();
+        GivenBases(true, Base(1, "76561198000000001", 0, 0, 0, ("76561198000000009", "Resolved By Api")));
+
+        var cut = RenderBasesTab();
+
+        cut.WaitForAssertion(() => Assert.Contains("Resolved By Api", cut.Find("[data-testid=base-authorized]").TextContent));
+    }
+
     // ---- the Positions tab --------------------------------------------------------------------------------
 
     private IRenderedComponent<ServerDetail> RenderPositionsTab()

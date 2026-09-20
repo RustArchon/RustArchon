@@ -1,6 +1,7 @@
 // Copyright ©2026 Scott Blomfield
 
 using System;
+using System.Collections.Generic;
 using System.Threading.Tasks;
 using Microsoft.EntityFrameworkCore;
 using RustArchon.Api.Data;
@@ -82,5 +83,76 @@ public class PlayerSessionRepositoryTests
         var repository = new PlayerSessionRepository(context);
 
         Assert.Null(await repository.GetOpenSessionAsync(serverId, "76561198000000003"));
+    }
+
+    // ---- GetLatestNamesAsync -------------------------------------------------------------------------------
+
+    private static PlayerSession Session(Guid tenant, Guid server, string steamId, string name, int minutesAgo) => new()
+    {
+        Id = Guid.NewGuid(), TenantId = tenant, RustServerId = server, SteamId = steamId, DisplayName = name,
+        ConnectedAtUtc = new DateTimeOffset(2026, 9, 20, 12, 0, 0, TimeSpan.Zero).AddMinutes(-minutesAgo)
+    };
+
+    private async Task<PlayerSessionRepository> WithSessionsAsync(params PlayerSession[] sessions)
+    {
+        var context = CreateContext();
+        context.Set<PlayerSession>().AddRange(sessions);
+        await context.SaveChangesAsync();
+        return new PlayerSessionRepository(context);
+    }
+
+    [Fact]
+    public async Task TheLatestNameOfEachRequestedPlayerIsReturned()
+    {
+        var tenant = Guid.NewGuid();
+        var server = Guid.NewGuid();
+        var repository = await WithSessionsAsync(
+            Session(tenant, server, "1", "one old", 500), Session(tenant, server, "1", "one new", 5),
+            Session(tenant, server, "2", "two", 60), Session(tenant, server, "3", "three, not asked for", 60));
+
+        var names = await repository.GetLatestNamesAsync(tenant, server, ["1", "2", "9"]);
+
+        Assert.Equal(new Dictionary<string, string> { ["1"] = "one new", ["2"] = "two" }, names);
+    }
+
+    [Fact]
+    public async Task OtherServersAndOtherOrganizationsSessionsAreNotConsulted()
+    {
+        var tenant = Guid.NewGuid();
+        var server = Guid.NewGuid();
+        var repository = await WithSessionsAsync(
+            Session(tenant, Guid.NewGuid(), "1", "other server", 5),
+            Session(Guid.NewGuid(), server, "1", "other org", 5));
+
+        Assert.Empty(await repository.GetLatestNamesAsync(tenant, server, ["1"]));
+    }
+
+    [Fact]
+    public async Task ASessionWithNoNameIsSkippedRatherThanBlankingAKnownName()
+    {
+        var tenant = Guid.NewGuid();
+        var server = Guid.NewGuid();
+        var repository = await WithSessionsAsync(Session(tenant, server, "1", "named", 100), Session(tenant, server, "1", "", 1));
+
+        Assert.Equal("named", (await repository.GetLatestNamesAsync(tenant, server, ["1"]))["1"]);
+    }
+
+    [Fact]
+    public async Task NoIdsMeansNoNamesAndNoQuery()
+    {
+        var repository = await WithSessionsAsync();
+
+        Assert.Empty(await repository.GetLatestNamesAsync(Guid.NewGuid(), Guid.NewGuid(), []));
+        Assert.Empty(await repository.GetLatestNamesAsync(Guid.NewGuid(), Guid.NewGuid(), ["", ""]));
+    }
+
+    [Fact]
+    public async Task ADuplicatedIdIsFine()
+    {
+        var tenant = Guid.NewGuid();
+        var server = Guid.NewGuid();
+        var repository = await WithSessionsAsync(Session(tenant, server, "1", "one", 5));
+
+        Assert.Equal("one", (await repository.GetLatestNamesAsync(tenant, server, ["1", "1", "1"]))["1"]);
     }
 }
