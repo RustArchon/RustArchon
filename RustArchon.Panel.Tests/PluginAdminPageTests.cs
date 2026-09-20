@@ -130,7 +130,11 @@ public class PluginAdminPageTests : BunitContext
     {
         var cut = RenderPage();
 
-        Assert.DoesNotContain("PRIVATE", cut.Markup, StringComparison.OrdinalIgnoreCase);
+        // No key material of any kind: not a PEM block, and not the base64 a PKCS#8 key starts with. (The key transfer card's warning
+        // says "private signing keys" in words, which is not a key.)
+        Assert.DoesNotContain("PRIVATE KEY", cut.Markup, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("-----BEGIN", cut.Markup);
+        Assert.DoesNotContain("MIIE", cut.Markup);
     }
 
     [Fact]
@@ -352,7 +356,7 @@ public class PluginAdminPageTests : BunitContext
 
         cut.Find("#upload-kind").Change("updater");
         cut.Find("#upload-notes").Input("adds bridging");
-        cut.FindComponent<InputFile>().UploadFiles(InputFileContent.CreateFromText("class X {}", "RustArchonUpdater.cs"));
+        cut.FindComponents<InputFile>().Last().UploadFiles(InputFileContent.CreateFromText("class X {}", "RustArchonUpdater.cs"));
         cut.WaitForAssertion(() => Assert.False(cut.Find("[data-testid=upload-go]").HasAttribute("disabled")));
         cut.Find("[data-testid=upload-go]").Click();
 
@@ -368,7 +372,7 @@ public class PluginAdminPageTests : BunitContext
             .ThrowsAsync(await Refused(HttpStatusCode.BadRequest, "The file already carries a signature line. Upload the raw source; the Panel signs it itself."));
         var cut = RenderPage();
 
-        cut.FindComponent<InputFile>().UploadFiles(InputFileContent.CreateFromText("class X {}", "RustArchon.cs"));
+        cut.FindComponents<InputFile>().Last().UploadFiles(InputFileContent.CreateFromText("class X {}", "RustArchon.cs"));
         cut.WaitForAssertion(() => Assert.False(cut.Find("[data-testid=upload-go]").HasAttribute("disabled")));
         cut.Find("[data-testid=upload-go]").Click();
 
@@ -391,5 +395,317 @@ public class PluginAdminPageTests : BunitContext
         Assert.Contains("2222222222222222", row.TextContent);
         Assert.Contains("admin@example.com", row.TextContent);
         Assert.Contains("leaked", row.TextContent);
+    }
+
+    // ---- backing up and copying the keys -------------------------------------------------------------------
+
+    private const string GoodPassphrase = "a passphrase that is long enough";
+
+    private static PluginKeyImportResultDto Plan(bool dryRun, bool activate, params (string Fingerprint, string InFile, string Action)[] items) => new()
+    {
+        DryRun = dryRun,
+        Items = items.Select(i => new PluginKeyImportItemDto { Fingerprint = i.Fingerprint, BundleState = i.InFile, Action = i.Action }).ToList(),
+        ActiveBefore = "1111111111111111",
+        ActiveAfter = activate ? "9999999999999999" : "1111111111111111",
+        ChangesActiveKey = activate,
+        ChangesAnything = items.Any(i => i.Action is "added" or "revoked" or "activated" or "previous_active_retired")
+    };
+
+    private static HttpResponseMessage FileResponse(string name = "rustarchon-signing-keys-11111111-20260920-120000.json", string body = "{\"bundle\":true}")
+    {
+        var response = new HttpResponseMessage(HttpStatusCode.OK) { Content = new ByteArrayContent(System.Text.Encoding.UTF8.GetBytes(body)) };
+        response.Content.Headers.ContentDisposition = new System.Net.Http.Headers.ContentDispositionHeaderValue("attachment") { FileName = name };
+        return response;
+    }
+
+    private static void TypeExport(IRenderedComponent<Plugin> cut, string passphrase, string? repeat = null)
+    {
+        cut.Find("[data-testid=export-passphrase]").Input(passphrase);
+        cut.Find("[data-testid=export-passphrase-repeat]").Input(repeat ?? passphrase);
+    }
+
+    private static void ChooseKeyFile(IRenderedComponent<Plugin> cut, string text = "{\"format\":\"rustarchon-signing-keys\"}") =>
+        cut.FindComponents<InputFile>().First().UploadFiles(InputFileContent.CreateFromText(text, "keys.json"));
+
+    private IRenderedComponent<Plugin> PlanShown(bool hasActiveInFile = true)
+    {
+        var cut = RenderPage();
+        _client.Setup(c => c.ImportKeysAsync(It.Is<ImportPluginKeysRequestDto>(r => r.DryRun && !r.ActivateBundleKey)))
+            .ReturnsAsync(Plan(true, false,
+                ("2222222222222222", hasActiveInFile ? "active" : "retired", "added"), ("3333333333333333", "retired", "already_present")));
+        ChooseKeyFile(cut);
+        cut.Find("[data-testid=import-passphrase]").Input(GoodPassphrase);
+        cut.Find("[data-testid=check-import]").Click();
+        cut.WaitForAssertion(() => Assert.NotEmpty(cut.FindAll("[data-testid=import-plan]")));
+        return cut;
+    }
+
+    [Fact]
+    public void TheKeyTransferSectionIsShownWithAWarningThatTheFileHoldsPrivateKeys()
+    {
+        var cut = RenderPage();
+
+        Assert.NotEmpty(cut.FindAll("[data-testid=plugin-key-transfer]"));
+        Assert.Contains("private signing keys", cut.Find("[data-testid=key-transfer-warning]").TextContent);
+        Assert.NotEmpty(cut.FindAll("[data-testid=export-keys]"));
+        Assert.NotEmpty(cut.FindAll("[data-testid=check-import]"));
+    }
+
+    [Theory]
+    [InlineData("")]
+    [InlineData("short")]
+    [InlineData("elevenchars")]
+    public void AShortPassphraseIsRefusedOnThePageAndTheApiIsNotAsked(string passphrase)
+    {
+        var cut = RenderPage();
+        TypeExport(cut, passphrase);
+
+        cut.Find("[data-testid=export-keys]").Click();
+
+        Assert.Contains("at least 12", cut.Find("[data-testid=export-problem]").TextContent);
+        _client.Verify(c => c.ExportKeysAsync(It.IsAny<ExportPluginKeysRequestDto>()), Times.Never);
+    }
+
+    [Fact]
+    public void PassphrasesThatDoNotMatchAreRefusedAndTheApiIsNotAsked()
+    {
+        var cut = RenderPage();
+        TypeExport(cut, GoodPassphrase, GoodPassphrase + "x");
+
+        cut.Find("[data-testid=export-keys]").Click();
+
+        Assert.Contains("not the same", cut.Find("[data-testid=export-problem]").TextContent);
+        _client.Verify(c => c.ExportKeysAsync(It.IsAny<ExportPluginKeysRequestDto>()), Times.Never);
+    }
+
+    [Fact]
+    public void AnExportSendsThePassphraseAndHandsTheFileToTheBrowserUnderTheNameTheApiGave()
+    {
+        var module = JSInterop.SetupModule("./js/fileDownload.js");
+        module.SetupVoid("downloadBytes", _ => true).SetVoidResult();
+        _client.Setup(c => c.ExportKeysAsync(It.IsAny<ExportPluginKeysRequestDto>())).ReturnsAsync(FileResponse());
+        var cut = RenderPage();
+        TypeExport(cut, GoodPassphrase);
+
+        cut.Find("[data-testid=export-keys]").Click();
+
+        cut.WaitForAssertion(() => Assert.True(cut.FindAll("[data-testid=plugin-admin-success]").Count > 0, cut.FindAll("[data-testid=plugin-admin-error]").FirstOrDefault()?.TextContent ?? "no message at all"));
+        _client.Verify(c => c.ExportKeysAsync(It.Is<ExportPluginKeysRequestDto>(r => r.Passphrase == GoodPassphrase)), Times.Once);
+        var call = Assert.Single(module.Invocations, i => i.Identifier == "downloadBytes");
+        Assert.Equal("rustarchon-signing-keys-11111111-20260920-120000.json", call.Arguments[0]);
+        Assert.Equal(Convert.ToBase64String(System.Text.Encoding.UTF8.GetBytes("{\"bundle\":true}")), call.Arguments[1]);
+        Assert.Equal("application/json", call.Arguments[2]);
+        Assert.Contains("rustarchon-signing-keys-11111111", cut.Find("[data-testid=plugin-admin-success]").TextContent);
+    }
+
+    [Fact]
+    public void AfterAnExportThePassphraseFieldsAreCleared()
+    {
+        JSInterop.SetupModule("./js/fileDownload.js").SetupVoid("downloadBytes", _ => true).SetVoidResult();
+        _client.Setup(c => c.ExportKeysAsync(It.IsAny<ExportPluginKeysRequestDto>())).ReturnsAsync(FileResponse());
+        var cut = RenderPage();
+        TypeExport(cut, GoodPassphrase);
+
+        cut.Find("[data-testid=export-keys]").Click();
+        cut.WaitForAssertion(() => Assert.NotEmpty(cut.FindAll("[data-testid=plugin-admin-success]")));
+
+        Assert.Equal("", cut.Find("[data-testid=export-passphrase]").GetAttribute("value") ?? "");
+        Assert.Equal("", cut.Find("[data-testid=export-passphrase-repeat]").GetAttribute("value") ?? "");
+    }
+
+    [Fact]
+    public void ARefusedExportShowsTheApisSentenceAndDownloadsNothing()
+    {
+        var module = JSInterop.SetupModule("./js/fileDownload.js");
+        module.SetupVoid("downloadBytes", _ => true).SetVoidResult();
+        _client.Setup(c => c.ExportKeysAsync(It.IsAny<ExportPluginKeysRequestDto>())).ReturnsAsync(
+            new HttpResponseMessage(HttpStatusCode.BadRequest) { Content = new StringContent("A stored signing key cannot be read, so nothing was exported.") });
+        var cut = RenderPage();
+        TypeExport(cut, GoodPassphrase);
+
+        cut.Find("[data-testid=export-keys]").Click();
+
+        cut.WaitForAssertion(() => Assert.Contains("cannot be read", cut.Find("[data-testid=plugin-admin-error]").TextContent));
+        Assert.DoesNotContain(module.Invocations, i => i.Identifier == "downloadBytes");
+    }
+
+    [Fact]
+    public void AnExportThatFailsOutrightIsAnErrorNotACrash()
+    {
+        _client.Setup(c => c.ExportKeysAsync(It.IsAny<ExportPluginKeysRequestDto>())).ThrowsAsync(new HttpRequestException("boom"));
+        var cut = RenderPage();
+        TypeExport(cut, GoodPassphrase);
+
+        cut.Find("[data-testid=export-keys]").Click();
+
+        cut.WaitForAssertion(() => Assert.NotEmpty(cut.FindAll("[data-testid=plugin-admin-error]")));
+        Assert.Empty(cut.FindAll("[data-testid=plugin-admin-success]"));
+    }
+
+    [Fact]
+    public void TheCheckButtonNeedsBothAFileAndAPassphrase()
+    {
+        var cut = RenderPage();
+        Assert.True(cut.Find("[data-testid=check-import]").HasAttribute("disabled"));
+
+        ChooseKeyFile(cut);
+        Assert.True(cut.Find("[data-testid=check-import]").HasAttribute("disabled"));
+
+        cut.Find("[data-testid=import-passphrase]").Input(GoodPassphrase);
+        Assert.False(cut.Find("[data-testid=check-import]").HasAttribute("disabled"));
+    }
+
+    [Fact]
+    public void CheckingAFileShowsThePlanFromADryRunAndChangesNothing()
+    {
+        var cut = PlanShown();
+
+        var rows = cut.FindAll("[data-testid=import-plan-row]");
+        Assert.Equal(2, rows.Count);
+        Assert.Equal("added", rows[0].GetAttribute("data-action"));
+        Assert.Contains("Added to the history", rows[0].TextContent);
+        Assert.Contains("Already here", rows[1].TextContent);
+        _client.Verify(c => c.ImportKeysAsync(It.Is<ImportPluginKeysRequestDto>(r => !r.DryRun)), Times.Never);
+        _client.Verify(c => c.ImportKeysAsync(It.Is<ImportPluginKeysRequestDto>(r => r.DryRun && r.Passphrase == GoodPassphrase && r.Bundle.Contains("rustarchon-signing-keys"))), Times.Once);
+    }
+
+    [Fact]
+    public void ActivationIsOffByDefaultAndTickingItRechecksThePlanWithActivationOn()
+    {
+        var cut = PlanShown();
+        Assert.False(cut.Find("[data-testid=import-activate]").HasAttribute("checked"));
+        _client.Setup(c => c.ImportKeysAsync(It.Is<ImportPluginKeysRequestDto>(r => r.DryRun && r.ActivateBundleKey)))
+            .ReturnsAsync(Plan(true, true, ("2222222222222222", "active", "activated"), ("1111111111111111", "", "previous_active_retired")));
+
+        cut.Find("[data-testid=import-activate]").Change(true);
+
+        cut.WaitForAssertion(() => Assert.Contains("Becomes the active key", cut.Markup));
+        Assert.Contains("Was the active key here", cut.Markup);
+        Assert.Contains("Not in the file", cut.Markup);                                 // the key here that the file does not mention
+        Assert.Contains("change the active key", cut.Find("[data-testid=confirm-import]").TextContent);
+        Assert.Contains("btn-danger", cut.Find("[data-testid=confirm-import]").ClassName);   // changing the signing key looks like the serious thing it is
+    }
+
+    [Fact]
+    public void ImportingWithoutChangingTheActiveKeyIsTheQuietButton()
+    {
+        var cut = PlanShown();
+
+        var button = cut.Find("[data-testid=confirm-import]");
+
+        Assert.Equal("Import keys", button.TextContent.Trim());
+        Assert.DoesNotContain("btn-danger", button.ClassName);
+    }
+
+    [Fact]
+    public void AFileWithNoActiveKeyOffersNoActivationAndSaysWhy()
+    {
+        var cut = PlanShown(hasActiveInFile: false);
+
+        Assert.Empty(cut.FindAll("[data-testid=import-activate]"));
+        Assert.NotEmpty(cut.FindAll("[data-testid=import-no-active]"));
+    }
+
+    [Fact]
+    public void APlanWithNothingToDoSaysSoAndOffersNoImport()
+    {
+        var cut = RenderPage();
+        _client.Setup(c => c.ImportKeysAsync(It.IsAny<ImportPluginKeysRequestDto>()))
+            .ReturnsAsync(Plan(true, false, ("1111111111111111", "active", "already_active")));
+        ChooseKeyFile(cut);
+        cut.Find("[data-testid=import-passphrase]").Input(GoodPassphrase);
+
+        cut.Find("[data-testid=check-import]").Click();
+
+        cut.WaitForAssertion(() => Assert.NotEmpty(cut.FindAll("[data-testid=import-nothing]")));
+        Assert.Empty(cut.FindAll("[data-testid=confirm-import]"));
+    }
+
+    [Fact]
+    public void ConfirmingSendsARealImportWithTheNoteThenClearsEverythingSecret()
+    {
+        var cut = PlanShown();
+        _client.Setup(c => c.ImportKeysAsync(It.Is<ImportPluginKeysRequestDto>(r => !r.DryRun)))
+            .ReturnsAsync(Plan(false, false, ("2222222222222222", "active", "added")));
+        cut.Find("[data-testid=import-note]").Change("sync dev with the VS panel");
+
+        cut.Find("[data-testid=confirm-import]").Click();
+
+        cut.WaitForAssertion(() => Assert.Contains("Imported 1 key(s)", cut.Find("[data-testid=plugin-admin-success]").TextContent));
+        _client.Verify(c => c.ImportKeysAsync(It.Is<ImportPluginKeysRequestDto>(r =>
+            !r.DryRun && !r.ActivateBundleKey && r.Note == "sync dev with the VS panel" && r.Passphrase == GoodPassphrase)), Times.Once);
+        Assert.Empty(cut.FindAll("[data-testid=import-plan]"));                          // the plan is gone
+        Assert.Equal("", cut.Find("[data-testid=import-passphrase]").GetAttribute("value") ?? "");
+        Assert.True(cut.Find("[data-testid=check-import]").HasAttribute("disabled"));    // and so is the file: choose it again to go on
+    }
+
+    [Fact]
+    public void ImportingAndChangingTheActiveKeyNamesTheNewActiveKey()
+    {
+        var cut = PlanShown();
+        _client.Setup(c => c.ImportKeysAsync(It.Is<ImportPluginKeysRequestDto>(r => r.DryRun && r.ActivateBundleKey)))
+            .ReturnsAsync(Plan(true, true, ("9999999999999999", "active", "activated")));
+        cut.Find("[data-testid=import-activate]").Change(true);
+        cut.WaitForAssertion(() => Assert.Contains("btn-danger", cut.Find("[data-testid=confirm-import]").ClassName));
+        _client.Setup(c => c.ImportKeysAsync(It.Is<ImportPluginKeysRequestDto>(r => !r.DryRun && r.ActivateBundleKey)))
+            .ReturnsAsync(Plan(false, true, ("9999999999999999", "active", "activated")));
+
+        cut.Find("[data-testid=confirm-import]").Click();
+
+        cut.WaitForAssertion(() => Assert.Contains("The active key is now 9999999999999999", cut.Find("[data-testid=plugin-admin-success]").TextContent));
+    }
+
+    [Fact]
+    public async Task ARefusedCheckShowsTheApisSentenceAndNoPlan()
+    {
+        var cut = RenderPage();
+        _client.Setup(c => c.ImportKeysAsync(It.IsAny<ImportPluginKeysRequestDto>())).ThrowsAsync(
+            await Refused(HttpStatusCode.BadRequest, "The file could not be opened: the passphrase is wrong, or the file has been changed or damaged."));
+        ChooseKeyFile(cut);
+        cut.Find("[data-testid=import-passphrase]").Input("the wrong passphrase");
+
+        cut.Find("[data-testid=check-import]").Click();
+
+        cut.WaitForAssertion(() => Assert.Contains("passphrase is wrong", cut.Find("[data-testid=plugin-admin-error]").TextContent));
+        Assert.Empty(cut.FindAll("[data-testid=import-plan]"));
+    }
+
+    [Fact]
+    public async Task ARefusedImportShowsTheApisSentenceAndTheDataStaysUntouched()
+    {
+        var cut = PlanShown();
+        _client.Setup(c => c.ImportKeysAsync(It.Is<ImportPluginKeysRequestDto>(r => !r.DryRun))).ThrowsAsync(
+            await Refused(HttpStatusCode.BadRequest, "The signing keys changed while importing; nothing was changed. Try again."));
+
+        cut.Find("[data-testid=confirm-import]").Click();
+
+        cut.WaitForAssertion(() => Assert.Contains("nothing was changed", cut.Find("[data-testid=plugin-admin-error]").TextContent));
+        Assert.Empty(cut.FindAll("[data-testid=plugin-admin-success]"));
+    }
+
+    [Fact]
+    public void AFileTooBigToBeAKeyFileIsRefusedBeforeItIsRead()
+    {
+        var cut = RenderPage();
+
+        cut.FindComponents<InputFile>().First().UploadFiles(InputFileContent.CreateFromText(new string('x', 200 * 1024), "huge.json"));
+
+        cut.WaitForAssertion(() => Assert.Contains("too large", cut.Find("[data-testid=plugin-admin-error]").TextContent));
+        Assert.True(cut.Find("[data-testid=check-import]").HasAttribute("disabled"));
+    }
+
+    [Fact]
+    public void KeyExportsAndImportsAppearInTheAuditLogWithReadableNames()
+    {
+        _client.Setup(c => c.GetEventsAsync(It.IsAny<int>())).ReturnsAsync(
+        [
+            new PluginAdminEventDto { AtUtc = DateTimeOffset.UtcNow, Kind = "KeysExported", Subject = "1111111111111111", Actor = "boss@example.com", Detail = "2 key(s)" },
+            new PluginAdminEventDto { AtUtc = DateTimeOffset.UtcNow, Kind = "KeysImported", Subject = "2222222222222222", Actor = "boss@example.com", Detail = "1 added" }
+        ]);
+
+        var cut = RenderPage();
+
+        Assert.Contains("Keys exported", cut.Markup);
+        Assert.Contains("Keys imported", cut.Markup);
     }
 }

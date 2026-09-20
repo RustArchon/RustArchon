@@ -483,6 +483,23 @@ key=82b49184449c98f6` and `update succeeded`. One hop across two rotations, and 
   scheduled-rotation reminder.
 - Live bridge test (Rusty Amigos): install Updater 0.2.0 by hand, rotate twice, publish a newer release, update.
 
+**Signing key export and import (2026-09-20, built and tested; not yet released).** Why: one game server can be connected to several Panels
+(a developer machine, a dev site and production), but a plugin trusts exactly one Panel's key, so the others can read from it and
+cannot update it. Sharing a key makes them interchangeable; it is also the only way to back a key up (a Panel keeps its keys under its own
+encryption ring, which does not travel), and losing the key strands every installed plugin.
+- **Export** (site admin, audit-logged): every key (active, retired, revoked, with reasons and times) sealed into one JSON file: PBKDF2-
+  HMAC-SHA256 (600,000 iterations, random salt) derives an AES-256-GCM key from a passphrase (12 to 256 characters); the header, including
+  the list of fingerprints, is authenticated with the ciphertext, so changing anything makes the file unreadable. A wrong passphrase and a
+  damaged file are indistinguishable on purpose. Unreadable stored keys stop the export rather than being left out of a "backup".
+- **Import** (site admin, audit-logged, dry run first): merges by fingerprint. Keys new here join the history (they can sign a bridge, not
+  new files); a revocation in the file is applied and a key revoked here is never brought back; the active key changes only if the admin
+  ticks "make the file's active key active here", through the same compare-and-swap path as a rotation (the old active key is kept; a
+  retired key that is reactivated leaves the history). Every key is re-checked on the way in (real RSA private key, 2048 to 4096 bits,
+  fingerprint recomputed and matched, at most one active), all or nothing. Re-encrypted under the receiving Panel's own key ring.
+- **What it does not do:** it moves private keys, so it widens who can sign. Guidance: share a key only between Panels that are equally
+  trusted (the developer machine and the dev site), never with production. Verified live (export, download, check, wrong passphrase); the
+  cross-Panel case is covered by tests that use two different encryption key rings, not by two running Panels.
+
 ### Phase 5 - Session replay UI (later)
 
 Not in the first delivery, but Phase 2 starts capturing so history exists when it ships. Needs Phase 3's map image
