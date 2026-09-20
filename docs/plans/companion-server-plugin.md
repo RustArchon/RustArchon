@@ -359,8 +359,8 @@ exists locally only; nothing is on GitHub until Scott confirms visibility and li
   constant: the token alone names the server and map, so no server id is in the URL. The plugin streams the file from a background thread,
   refuses redirects, and only accepts a base64url token so it can never inject a header. The Panel door streams (never buffers) to the
   Api, which redeems the token before reading a byte, requires a declared length under 120 MB and a PNG signature, then stores the picture
-  in Garage and records its SHA-256. Live: requested 05:50:15, stored 05:50:17. (The Updater's download still carries its token in the
-  address; moving it is possible but changes the manually-installed Updater.)
+  in Garage and records its SHA-256. Live: requested 05:50:15, stored 05:50:17. (The Updater's download carried its token in the address at
+  first; from Updater 0.3.0 it travels in a header too - see "Hardening pass" below.)
 - Api/Panel: `PluginMap` per server per wipe (an old wipe's picture is kept), `GET api/rustservers/{id}/map` and `.../map/image` (ETag =
   content hash, gated like reading a server), and a Map tab: canvas over the picture with named places, bases and players as separate
   layers (the two sensitive ones hidden with a note when the viewer lacks their permission).
@@ -368,7 +368,7 @@ exists locally only; nothing is on GitHub until Scott confirms visibility and li
   pixel per metre), so the picture spans world size + 1000. Found because the first version drew places in the wrong spots; verified
   against the picture (oil rigs and the underwater lab land on deep water, 33 of 34 checkpoints match; it was 24 of 34 before).
 - **Display copy (2026-09-20).** Serving the 24 MB original through the Api, the Panel and the Blazor connection made the tab take over
-  30 s. The Api now keeps a display-sized JPEG (longest side 2048 px, quality 85, never scaled up) next to the original, made once when the
+  30 s. The Api now keeps a display-sized copy (first a 2048 px JPEG; see the zoom note below for what it became) next to the original, made once when the
   picture arrives (or on first request for one collected before this existed), served by default with its own entity tag; the original stays
   in Garage and is available with `?full=true`. Measured: 24.1 MB -> 536 KB, and opening the tab paints in 60-100 ms. The decode is strict:
   a picture that does not fully decode gets no preview and is served from the original rather than showing half a map. This adds
@@ -500,6 +500,40 @@ encryption ring, which does not travel), and losing the key strands every instal
   trusted (the developer machine and the dev site), never with production. Verified live (export, download, check, wrong passphrase); the
   cross-Panel case is covered by tests that use two different encryption key rings, not by two running Panels.
 
+### Hardening pass (2026-09-20, unattended)
+
+Built on branch `feature/overnight-hardening` in each repository, tested, **not yet merged**. Nothing here changes the database schema.
+
+- **Map picture size limit (a defect found in review).** The upload door checked the byte size and the PNG signature, but the display-copy
+  maker decoded whatever the header declared: a few hundred bytes claiming 60,000 x 60,000 px would ask for ~14 GB. The declared size is now
+  read from the PNG header (`PngHeader`) and held to 8192 px a side before anything is stored or decoded, a signature without a readable
+  header is refused, and the renderer checks the size again before it allocates. (The game's largest world, 6000 m, is 7000 px.)
+- **Retention grew from chunks to everything the plan advertises.** It lives in the Api, not the Worker: the Worker has no database (data flows
+  Worker -> Api), and the Api already runs the periodic jobs (`PluginDataPruneService`, every 6 hours). It now also removes, per organization
+  by its plan's `RetentionHistory` days (30 when there is no usable plan): console and chat events, kill-feed events, stats snapshots, and
+  **the maps of past wipes** - a server's newest map is never removed; an older one goes once neither its last sighting nor its upload is inside
+  the window, the pictures (original and display copy) are deleted from Garage first and the row only if that worked, so a storage failure
+  retries next pass. Expired upload and update tokens go a day after they expire. Deletes are batched (5000 rows) so the first pass over a
+  table that was never pruned does not hold one huge transaction. Player sessions are not touched.
+- **Empty background answers are not stored.** Every poll's reply was stored as a console row, visible only in the site admin's unfiltered view.
+  A drain that reports nothing new (and nothing lost or reset), an empty list (the player list of a server nobody is on) and a blank reply to a
+  *background* command are now dropped in the Worker before publishing; a person's own command is always stored, as is anything with content,
+  a "lost" or "reset" flag, or an error.
+- **Updater 0.3.0: the download token moves to a header.** `archon.update <version> <url> [token]`; with a third argument the Updater sends
+  `X-RustArchon-Update-Token` and the address carries no credential (`GET /ingest/plugin` on the Panel, `GET internal/plugin/download` on
+  the Api, which finds the server from the token). The token must be URL-safe base64 (letters, digits, `-`, `_`), which also rules out header
+  injection. The Api chooses the form from the Updater version the server reports: 0.3.0 or newer gets the header form, anything older (or
+  unknown) still gets the token in the address, and that door stays. **The new Updater has to be installed by hand** (the Updater is never
+  self-updated); until then updates keep working exactly as before. Checked live against the local Api: a real token redeemed through the header
+  door returned the signed 0.7.0 script with `Cache-Control: no-store`, and the same token answered 404 the second time.
+- **Names on the Bases list.** The game only gives the plugin the ids on a cupboard, so anyone offline showed as a number. The Api now fills
+  the gap when it serves the list, from the name each player used in their latest session on that server (the Worker records every connection),
+  never overriding a name the plugin supplied, and adds the owner's name to each base (the map labels use it too). Stateless: nothing is stored
+  differently, so a name appears the moment a session for that player exists. A player who has never connected since RustArchon began recording
+  stays an id.
+- **Test fixtures fixed** that depended on the checkout: one assumed LF line endings in the embedded plugin source, and the permission matrix
+  sent JSON to the multipart upload endpoint (415 before authorization).
+
 ### Phase 5 - Session replay UI (later)
 
 Not in the first delivery, but Phase 2 starts capturing so history exists when it ships. Needs Phase 3's map image
@@ -581,14 +615,18 @@ unblocked by Phase 1's handshake. Plugin-side `OnPlayerReported` internals belon
 - **Combat log storage is the biggest unknown.** Per-hit volume times up to 265 days of retention could dwarf
   everything else in the plan; the row format is not fixed until hits per player-hour are measured on a PvP
   server. The test server is PVE ("Builder-focused PVE"), so it will understate player-vs-player traffic.
-- **No retention enforcement exists yet** for any history. This plan adds the first pruning job.
+- **Retention** is enforced by `PluginDataRetention` in the Api (see "Hardening pass" below): plugin chunks, console and chat, kill feed,
+  stats snapshots, the maps of past wipes and spent tokens. **Player sessions are deliberately not pruned** (they hold the VPN, ban and
+  geolocation lookups and the names the Panel shows); if the plan's "player history" days should cover them too, that is a decision for
+  the owner, not a side effect.
 
 - **Oxide is untested.** Carbon is the first-class target; claim Oxide support only after a compile-and-run test
   on an Oxide server.
 - **Rust updates break plugin internals monthly.** Keep the main plugin's Rust-internal surface small; the
   Updater plus failed-plugin visibility in the Panel is the mitigation.
 - **Boot render delays server opening by ~48 s** on the first boot after a wipe.
-- **`RconEvent` growth:** deliberately unmitigated for now; Phase 2 measurement decides.
+- **`RconEvent` growth:** background polls' empty answers are no longer stored (see "Hardening pass"), and the table is now pruned to the plan's
+  retention; what remains is the non-empty poll answers (server info, player list, tool cupboards) which are one row per poll.
 - **TC index cold start:** cost unmeasured.
 - **No relaunch after RCON restart:** the Panel must not promise a restart, only a stop.
 - **Private signing key** sits in the same database as the Data Protection key ring that protects it; an "import
