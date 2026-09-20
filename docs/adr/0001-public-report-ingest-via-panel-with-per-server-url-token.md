@@ -114,7 +114,12 @@ complexity without changing the game-server-compromise case.
 
 ## Action Items
 
-1. [ ] Add `RustServer.ReportsSecret` (encrypted via `IApiKeyProtector`, new purpose), null until first generated.
-2. [ ] Implement Panel `/ingest/reports/{serverId}/{token}` and Api `/internal/reports/ingest`.
-3. [ ] Exclude the ingest path from request logging.
-4. [ ] Tests: token for server A rejected at server B; missing/wrong/no-secret all give the same generic rejection.
+1. [x] Add `RustServer.ReportsSecret` (encrypted via `IApiKeyProtector`, new purpose), null until first generated.
+2. [x] Implement Panel `/ingest/reports/{serverId}/{token}` and the Api's internal endpoint (`POST /internal/reports/{serverId}`, secret
+   carried in the `X-RustArchon-Report-Token` header so it is not in the Api's own addresses).
+3. [x] Exclude the ingest path from request logging - satisfied by the Panel's existing `Microsoft.AspNetCore: Warning` log level, which
+   suppresses ASP.NET's request-starting lines; nothing in the Panel logs the address. A reverse proxy in front may still record it.
+4. [x] Tests: token for server A rejected at server B; missing/wrong/no-secret all give the same generic rejection (unit, and through the
+   real Api pipeline in `ReportIngestPipelineTests`, including a 6 MB screenshot to prove the default form limits do not drop it).
+
+*Implemented 2026-09-20. Rate limits are constants (Panel: per address; Api: per server, after authentication), not Platform Settings.*

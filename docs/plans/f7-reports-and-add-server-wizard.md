@@ -1,6 +1,8 @@
 # Plan: F7 report support and the Add Server wizard
 
-Status: agreed with Scott 2026-09-19, not yet started. Nothing here is built.
+Status: agreed with Scott 2026-09-19. **Delivery steps 1 and 2, and the RustArchon side of wizard step 5, were built on 2026-09-20** on branch
+`feature/f7-reports-and-server-wizard` (umbrella + Api, Shared and Panel submodules), committed locally and not pushed. **Track B's plugin-report
+consumer is not built** - see "Implementation notes" at the end for what was built, where it deviates from this plan, and what is still open.
 
 This plan covers two related pieces of work that ship together:
 
@@ -233,3 +235,43 @@ is what lets the first real report from a consenting customer server settle the 
 - The Oxide `OnPlayerReported` hook signature and that it carries target details for player reports (from a
   search summary; plugin session owns confirming this).
 - Whether the native endpoint really omits player-targeted reports (the wiki's claim; unverifiable by us).
+
+## Implementation notes (2026-09-20)
+
+Built and tested (Api 1,386 unit + 49 integration, Panel 421, Worker 285, all passing). Nothing was run against a live server or a live
+database: the migration is generated (`20260920142426_AddServerReports`) but **not applied**, and no Api/Panel process was started.
+
+**Deviations from the plan above, and why**
+
+- **Verifying forwarding needs no new Worker or Messaging pieces.** The Api reads `server.reportsServerEndpoint` back with the existing
+  `SendRconCommand` request/response (sent non-interactive) and compares the reply itself. Only the Api's `ReportForwardingService.Interpret`
+  parses it. Nothing in `RustArchon.Worker` or `RustArchon.Messaging` changed, so neither submodule has a branch.
+- **Discard reuses the existing `DELETE /api/rustservers/{id}`**, not a new endpoint. A new `ServerReportCleanupConsumer` (on
+  `ServerLifecycleChanged` = Deleted) removes the server's reports and screenshots.
+- **The wizard polls the server's status once a second** rather than subscribing to the hub. Simpler, and it survives a page refresh.
+- **Changing a report's status is a direct button, not a confirmation modal.** It is trivially reversible (there is a Reopen button); a
+  modal would only add friction. Rotating the report address and discarding a half-made server *do* confirm.
+- **Live push carries no report.** `RconHub` sends `ReceiveServerReportsChanged` with no payload: the group it goes to is everyone who may see
+  the server, wider than everyone who may read its reports, so the Panel re-reads through the endpoint that checks the permission.
+- **Rate limits are constants, not Platform Settings** (Panel 120 requests/minute per address on `/ingest/reports`; Api 60 reports/minute per
+  server, applied only after the secret is verified; 20 key checks/minute per user). The plan said limits would be Platform Settings; that
+  is still open.
+- **The forwarding card is collapsed on the Reports tab** and only fetches (which mints the secret) when opened; the wizard opens it at once.
+- **`GET .../report-forwarding` mints the secret on first read**, as planned - and nothing else does (a check on a server that has never had
+  one answers "not set" without minting).
+- **Geolocation Verify is only as good as the providers' documentation.** None of the three document how a bad key is signalled. iphub.info
+  and ipinfo.io are "valid" only on a 200 with the fields an authorised call returns; proxycheck.io answers a good and an unrecognised key
+  identically, so it can only ever be refused or "could not confirm". None of it has been run against a live provider.
+
+**Not built: Track B's plugin-report consumer (wizard step 5 is built).** The plugin's handshake reports no `reports` capability and there is
+no reports command to poll, so there is nothing for the Worker to consume yet. What *is* done and tested: `ReportIngestService.IngestPluginAsync`
+and the merge rule (ADR-0003), so once the plugin exposes reports the Worker poll and an Api consumer are small. Wizard step 5 uses the
+plugin machinery that already exists (plugin list, `plugin-status`, the signed download, `PluginSigningStates`).
+
+**Still open**
+
+1. Abandoned wizard servers: a "Finish setup" link now appears on any enabled server that is not connected (no persisted "setup complete"
+   flag, no auto-delete). Whether that is enough is unconfirmed.
+2. Rate limits as Platform Settings (above).
+3. The unverified assumptions listed in the section above, especially what `server.reportsServerEndpoint` prints and how each geolocation
+   provider signals a bad key.

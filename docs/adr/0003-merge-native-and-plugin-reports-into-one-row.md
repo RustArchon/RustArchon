@@ -78,7 +78,8 @@ matching risk to keep the data complete and the inbox clean.
 
 ## Action Items
 
-1. [ ] Build a single ingestion service used by both the native endpoint and the plugin consumer.
-2. [ ] Store a raw payload per source on `ServerReport`.
-3. [ ] Tests for merge, non-merge (different reporter/type/subject/outside window), and audit of both raw payloads.
+1. [x] Build a single ingestion service used by both the native endpoint and the plugin consumer (`ReportIngestService`; the plugin
+   *consumer* that would call `IngestPluginAsync` is not built - the plugin reports no `reports` capability yet).
+2. [x] Store a raw payload per source on `ServerReport` (`NativePayload`, `PluginPayload`).
+3. [x] Tests for merge, non-merge (different reporter/type/subject/outside window), and audit of both raw payloads.
 4. [ ] Revisit the match window after real traffic exists.
