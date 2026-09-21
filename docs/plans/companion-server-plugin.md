@@ -34,7 +34,8 @@ report path; see "Boundary with the F7 work".
   - **No detail levels: everything or nothing.** One recording switch. "Everything" is defined in Phase 2.
 - **Map is generated automatically after a wipe** (see Phase 3), once per wipe, with an existence check and a
   `force` override.
-- **Self-update is off by default and admin-triggered from the Panel.** Signing: RSA-2048/SHA-256/PKCS#1 v1.5,
+- **Self-update is admin-triggered from the Panel, or automatic per server.** (Off by default when this was decided; since 2026-09-20 a *new* server has it on -
+  see the ADR-0004 amendment - and an existing one keeps what it had.) Signing: RSA-2048/SHA-256/PKCS#1 v1.5,
   per-deployment key embedded in the served script, private key a Secret Platform Setting, signing UI
   platform-admin-only and audit-logged, key rotation via a bridge release. Production servers only trust our key.
 - **`RconEvent` growth:** leave frame persistence as is and measure before reacting.
@@ -143,8 +144,8 @@ regression tests: `PlatformSetting.Value` was `varchar(1000)` and an encrypted k
 `SetValueIfEmptyAsync`'s `ExecuteUpdate` bypassed the EF change tracker so a same-context re-read returned the stale
 empty value (the repository now reloads tracked copies).
 
-**Not yet built in Phase 1:** the signing UI for self-hosters' custom builds, key rotation (the bridge-release flow),
-audit logging of signing, and the `c.plugins` hook-time and failed-plugins extension. The `RustArchon.Plugin` repo
+**Not yet built in Phase 1 (built since - see "Plugin admin, defaults and failed plugins" below):** the signing UI for self-hosters' custom builds, key
+rotation (the bridge-release flow), audit logging of signing, and the failed-plugins extension. Still not built: the `c.plugins` hook-time columns. The `RustArchon.Plugin` repo
 exists locally only; nothing is on GitHub until Scott confirms visibility and license.
 
 - Create `RustArchon.Plugin` (Scott confirms visibility/license at creation), submodule it, embed the sources in
@@ -389,7 +390,7 @@ exists locally only; nothing is on GitHub until Scott confirms visibility and li
 ### Phase 4 - Updater and self-update
 
 - `RustArchonUpdater.cs`, the update flow above, the Panel Update button (with a per-server "allow updates"
-  setting, off by default), `PluginUpdateAttempt` audit rows, and the "updater is out of date" warning.
+  setting; off by default when built, on for a new server since 2026-09-20), `PluginUpdateAttempt` audit rows, and the "updater is out of date" warning.
 - Failure paths tested end to end on the test server: bad signature, wrong key, older version, corrupt download,
   main plugin that fails to compile (must roll back).
 
@@ -480,8 +481,7 @@ key=82b49184449c98f6` and `update succeeded`. One hop across two rotations, and 
   `PluginAdminController` (Site Admin); the generic settings endpoint refuses to overwrite the signing key.
 - Panel: `/Admin/Plugin` (keys, releases, audit log), retired/revoked states and an outdated-Updater prompt on the
   server's plugin card.
-- Not built: Roslyn syntax check of uploads (a broken release is caught by the Updater's rollback instead), a
-  scheduled-rotation reminder.
+- Built later (see "Plugin admin, defaults and failed plugins"): the syntax check of uploads and the rotation reminder.
 - Live bridge test (Rusty Amigos): install Updater 0.2.0 by hand, rotate twice, publish a newer release, update.
 
 **Signing key export and import (2026-09-20, built and tested; not yet released).** Why: one game server can be connected to several Panels
@@ -615,7 +615,7 @@ Scott's decisions: an opt-in per-server switch (yes); **players being online is 
 the plugin holds every 30 seconds, so at most about that much recorded data is lost); an update that failed is not retried in a loop but a *different*
 version is always tried (and bridges work as ever); a server on an older key is handled by the bridge, not skipped; release control is needed.
 
-- **Switches.** Per server: "Update automatically" (`RustServer.PluginAutoUpdateEnabled`, off by default, shown only while "Allow updates" is on and
+- **Switches.** Per server: "Update automatically" (`RustServer.PluginAutoUpdateEnabled`, off when built and on for a new server since 2026-09-20, shown only while "Allow updates" is on and
   turned off with it; the settings endpoint takes it as an *optional* field so a client that does not know about it cannot flip it). Site-wide: the
   platform setting **Automatic plugin updates** (`PluginAutoUpdatesEnabled`, default on) stops every automatic update at once - the emergency stop.
 - **What it is.** `PluginAutoUpdater` (a background pass every 5 minutes, first one 3 minutes after the Api starts) presses the same buttons a person
@@ -632,19 +632,67 @@ version is always tried (and bridges work as ever); a server on an older key is 
   by plan retention; failures and refusals are kept so a bad version is not retried when the window passes.
 - **Release control.** The auto updater only ever follows *the version being served*: an uploaded release stays a draft until an administrator publishes it,
   and withdrawing it returns to the embedded build (never a downgrade: nothing newer than installed means nothing to do). Plus the site-wide switch above.
-  Not built: staged roll-outs by percentage or delay after publishing.
+  Staged roll-outs are built (see "Plugin admin, defaults and failed plugins").
 - **In the Add Server wizard (Scott's request).** An **Updates** step follows the Plugin step for anyone who chose to set the plugin up, gathering every
   update setting on one page with a plain explanation of each and why someone might want it: "Allow updates from this Panel" (one click instead of a
   new file each time; only a Panel-signed file is accepted and the previous version is put back if the new one does not start), "Update automatically"
   (fixes and features without remembering; the same checks as a click; players need not leave; a failed version is put back and not retried; leave it
   off to choose when the server changes) and a note on the Updater helper (installed already, or installable by the Panel once updates are allowed).
-  Both switches are off unless the server already has them on; the step can be skipped and everything is changeable later on the Plugins tab.
+  Both switches start on for a new server (2026-09-20, see the defaults note below) and the page says so; "Keep as they are" leaves them, and everything is
+  changeable later on the Plugins tab.
 - **Panel.** The Plugins tab has the "Update automatically" switch under "Allow updates", and a "Recent updates" list (last five: automatic or manual,
   plugin or Updater, versions, outcome in words, time).
 - **Tests.** Real Postgres for the updater (eligibility, order, one at a time, outcome resolution, failed and refused versions not retried, a fixed
   release retried, an unreachable server retried, staggering, one server's failure not stopping the others, no downgrade, players online ignored),
   the service's attempt recording, the settings endpoint (optional field, follows the updates switch), the attempts endpoint, retention, and the Panel.
   Not yet run live.
+
+### Plugin admin, defaults and failed plugins (built 2026-09-20)
+
+Built and tested together (Plugin 473, Api 1568, Panel 511, Worker 316, integration 49 tests). One migration (`AddPluginRolloutAndLoadFailures`: two new tables).
+Not yet run live.
+
+- **Syntax check on release uploads.** `PluginSourceSyntax` (Roslyn, the `Microsoft.CodeAnalysis.CSharp` package, nothing is run) reads an uploaded file as C# 7.3: the
+  parser finds syntax errors, and the language-version errors ("Feature 'x' is not available in C# 7.3": switch expressions, `using var`, `??=`, ranges, ...) come
+  from compiling it against the .NET core library only and keeping just those. A refusal is `syntax_error` with the first five problems and their lines. It cannot
+  see calls into the game's own libraries (a type Rust renamed); that stays with the plugin's real-DLL compile check and the Updater's rollback. Applies to
+  upload and to signing a file, so a hand-signed file is held to exactly what a published release is.
+- **Signing UI for custom builds.** "Sign a file without publishing it" on `/Admin/Plugin`: choose the file, say why (required, 3 or more characters), get it back
+  stamped with the active key, signed, and downloaded byte for byte. Nothing is stored or delivered. A stored draft or published release also has a download
+  button (signed, to test on a server before publishing); a withdrawn one is refused. Site Admin only.
+- **Audit logging of signing.** New audit lines: `FileSigned` (who, what version, checksum, key, why), `ReleaseSigned` (a stored release downloaded signed) and
+  `KeyGenerated` (the first key, actor "system"). Deliberately **not** logged: the signing the Panel does for every ordinary download or update of the served
+  file, which is the same public file every time and would only bury the lines that matter.
+- **Rotation reminder.** `PluginKeyRotationReminderDays` (Platform Setting, 365 by default, 0 turns it off). The key's age counts from when it became active: the
+  latest rotation or import that replaced the one before it, else the `KeyGenerated` line, else (a key made before that line existed) the setting row's creation.
+  Shown in the keys card and as a dismissible banner on every page for site administrators (`PluginKeyReminderBanner`, silent for everyone else, who get a 403).
+  It only reminds: rotating decides what every installed plugin trusts next, so nothing rotates by itself. Not emailed - that would need an email template.
+- **Staged roll-outs.** `PluginRolloutHours` (Platform Setting, **0 by default: everyone at once**). When set, a newly served version becomes eligible for
+  *automatic* updates on a growing share of servers over those hours (a straight line; a hash of server, file and version fixes who comes first, so it is stable
+  across passes and instances and a different order for each version). The start is recorded once per (file, version) in `PluginRollout` the first time the
+  automatic updater has servers to consider; a version that returns later is not put through the ramp again. A person's click is never held back; the emergency
+  stop is still the site-wide "Automatic plugin updates" switch or withdrawing the release. The Plugin page shows the ramp's progress beside what is served.
+- **Failed-plugin visibility.** Carbon prints a "failed plugins" section after the table in `c.plugins` (file, line:column, compiler message, long messages cut with
+  `...` and carried on the next line). `CarbonFailedPluginParser` (Worker, tested on a reply captured from Rusty Amigos) reads it; `ServerPluginsCaptured` carries
+  the list (`null` = not reported, empty = none failed); the Api keeps the server's current set in `PluginLoadFailure` (a fixed plugin disappears, an older
+  report never brings one back, a server no longer on Carbon has none); `GET api/rustservers/{id}/plugin-failures` (same permission as reading the server); the
+  Plugins tab shows "Failed to load" with each file's reasons, plainly saying so when the file is the RustArchon plugin or its Updater. A Carbon server whose every
+  plugin failed is still recognized as Carbon. Oxide reports no such list. Compiler text is shown as text, never as markup.
+- **Setup complete.** See the F7 plan, "Still open" 1: a saved flag, not the connection state, decides who is offered "Finish setup".
+- **Defaults.** A **new** server now has "Allow updates" and "Update automatically" on (the entity default; the column's own default is still off, so no migration
+  and no existing server changed). The Add Server wizard's Updates step shows them on, explains each, and offers "Keep as they are".
+- **Rate limits as Platform Settings** (category Reports): `ReportsPerServerPerMinute` (60, applied by the Api after the secret is verified),
+  `ReportsPerAddressPerMinute` (120, applied by the Panel's public report door; the Panel asks the Api for it and remembers it for a minute, using the default
+  until the first answer and keeping the last good value if the Api is unreachable) and `IntegrationChecksPerUserPerMinute` (20). Per-server limits are a later step.
+- **Console rows.** Background poll answers that carry data are no longer all stored: a poll's answer is kept when it differs from the last one kept (plugin list,
+  plugin status, tool cupboard pages) or once every 10 minutes (server info, stats, player list, drains), and always when it reports a failure, a stack trace, or
+  a drain that lost events. The data itself is stored in its own tables; the console record's copy only has to show the poll happens. A person's own command is
+  never thinned.
+- **Recording disclosure.** Shown as a feature, in the customer's terms, where recording is offered (open in the wizard's plugin step) and where it is switched
+  (folded beside the switches on the Plugins tab): what it gives you (live map, combat log, base locations, evidence in a dispute), what is recorded (positions a few
+  seconds apart, fights, tool cupboard authorizations), who can see it (only your organization; positions need their own permission that the Owner holds and can
+  delegate, every look logged), how long it is kept (the plan's days, then deleted), how to turn it off, and a line for the server's own rules. Every claim is one the
+  code makes true today; if any of those change, this text changes with them.
 
 ### Phase 5 - Session replay UI (later)
 
@@ -720,7 +768,8 @@ unblocked by Phase 1's handshake. Plugin-side `OnPlayerReported` internals belon
 - **Replay data volume and privacy.** Continuous recording is the biggest new cost and obligation in the plan:
   storage grows with players and retention (estimate only), and it is behavioral data about identifiable players.
   Mitigations: opt-out per server with visible status, retention bounded by plan, chunked storage, owner-only
-  access with audit logging. Note recording is **on by default**, which raises the disclosure obligation.
+  access with audit logging. Note recording is **on by default**, which raises the disclosure obligation - met as a feature, in the customer's terms
+  (see "Recording disclosure" below).
 - **Sampler and damage-hook cost are unmeasured.** They are the only always-on work the plugin does, and there are
   no levels to fall back on; measure before shipping (see the cost gate). The damage hook is the one to worry
   about: it fires for all combat entities and damage cannot be dropped.
@@ -729,8 +778,8 @@ unblocked by Phase 1's handshake. Plugin-side `OnPlayerReported` internals belon
   server. The test server is PVE ("Builder-focused PVE"), so it will understate player-vs-player traffic.
 - **Retention** is enforced by `PluginDataRetention` in the Api (see "Hardening pass" below): plugin chunks, console and chat, kill feed,
   stats snapshots, the maps of past wipes and spent tokens. **Player sessions are deliberately not pruned** (they hold the VPN, ban and
-  geolocation lookups and the names the Panel shows); if the plan's "player history" days should cover them too, that is a decision for
-  the owner, not a side effect.
+  geolocation lookups and the names the Panel shows). **Decided (Scott, 2026-09-20): kept indefinitely** - the history is the purpose of the
+  service and is disclosed in the privacy policy - so the plan's "player history" days do not apply to them.
 
 - **Oxide is untested.** Carbon is the first-class target; claim Oxide support only after a compile-and-run test
   on an Oxide server.

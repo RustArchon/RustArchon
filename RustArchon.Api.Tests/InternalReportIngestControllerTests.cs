@@ -10,6 +10,7 @@ using Microsoft.AspNetCore.Mvc;
 using Moq;
 using RustArchon.Api.Controllers;
 using RustArchon.Api.Data;
+using RustArchon.Api.Infrastructure;
 using RustArchon.Api.Repositories;
 using RustArchon.Api.Services;
 
@@ -28,12 +29,13 @@ public class InternalReportIngestControllerTests
     private readonly Mock<IReportIngestService> _ingest = new();
     private readonly Mock<IRustServerRepository> _servers = new();
     private readonly Mock<IReportIngestThrottle> _throttle = new();
+    private readonly Mock<IPlatformSettingsCache> _settings = new();
 
     public InternalReportIngestControllerTests()
     {
         _forwarding.Setup(f => f.IsTokenValidAsync(ServerId, Token)).ReturnsAsync(true);
         _servers.Setup(s => s.GetByIdAcrossTenantsAsync(ServerId)).ReturnsAsync(new RustServer { Id = ServerId, TenantId = Guid.NewGuid() });
-        _throttle.Setup(t => t.TryAcquire(ServerId)).Returns(true);
+        _throttle.Setup(t => t.TryAcquire(ServerId, It.IsAny<int>())).Returns(true);
     }
 
     /// <summary>A stream that fails the test if anything reads it.</summary>
@@ -58,7 +60,7 @@ public class InternalReportIngestControllerTests
         var http = new DefaultHttpContext();
         http.Request.Body = body;
         http.Request.ContentType = contentType;
-        return new InternalReportIngestController(_forwarding.Object, _ingest.Object, _servers.Object, _throttle.Object)
+        return new InternalReportIngestController(_forwarding.Object, _ingest.Object, _servers.Object, _throttle.Object, _settings.Object)
         {
             ControllerContext = new ControllerContext { HttpContext = http }
         };
@@ -116,7 +118,7 @@ public class InternalReportIngestControllerTests
         Assert.IsType<NotFoundResult>(result);
         Assert.False(body.WasRead);
         _ingest.VerifyNoOtherCalls();
-        _throttle.Verify(t => t.TryAcquire(It.IsAny<Guid>()), Times.Never); // an unauthenticated caller cannot spend the budget
+        _throttle.Verify(t => t.TryAcquire(It.IsAny<Guid>(), It.IsAny<int>()), Times.Never); // an unauthenticated caller cannot spend the budget
     }
 
     [Fact]
@@ -133,12 +135,48 @@ public class InternalReportIngestControllerTests
     [Fact]
     public async Task AServerOverItsBudgetIsToldToSlowDownAndNothingIsFiled()
     {
-        _throttle.Setup(t => t.TryAcquire(ServerId)).Returns(false);
+        _throttle.Setup(t => t.TryAcquire(ServerId, It.IsAny<int>())).Returns(false);
 
         var result = await Create(Form("userid=1&data=%7B%7D")).Ingest(ServerId, Token);
 
         Assert.Equal(StatusCodes.Status429TooManyRequests, Assert.IsType<StatusCodeResult>(result).StatusCode);
         _ingest.VerifyNoOtherCalls();
+    }
+
+    [Fact]
+    public async Task TheServersBudgetIsThePlatformSettingAndTheDefaultWhenItIsUnsetOrNonsense()
+    {
+        _settings.Setup(s => s.GetStringAsync(PlatformSettingsRegistry.ReportsPerServerPerMinute)).ReturnsAsync("7");
+        await Create(Form("userid=1&data=%7B%7D")).Ingest(ServerId, Token);
+        _throttle.Verify(t => t.TryAcquire(ServerId, 7), Times.Once);
+
+        foreach (var junk in new[] { null, "", "abc", "0", "-5" })
+        {
+            _throttle.Invocations.Clear();
+            _settings.Setup(s => s.GetStringAsync(PlatformSettingsRegistry.ReportsPerServerPerMinute)).ReturnsAsync(junk);
+            await Create(Form("userid=1&data=%7B%7D")).Ingest(ServerId, Token);
+            _throttle.Verify(t => t.TryAcquire(ServerId, PlatformSettingsRegistry.DefaultReportsPerServerPerMinute), Times.Once, $"for '{junk}'");
+        }
+    }
+
+    [Fact]
+    public async Task TheLimitsEndpointTellsThePanelThePerAddressSetting()
+    {
+        _settings.Setup(s => s.GetStringAsync(PlatformSettingsRegistry.ReportsPerAddressPerMinute)).ReturnsAsync("45");
+
+        var result = await Create(Form("")).Limits();
+
+        Assert.Equal(45, result.Value!.PerAddressPerMinute);
+    }
+
+    [Fact]
+    public async Task TheLimitsEndpointFallsBackToTheDefaultForANonsensicalSetting()
+    {
+        _settings.Setup(s => s.GetStringAsync(PlatformSettingsRegistry.ReportsPerAddressPerMinute)).ReturnsAsync("0");
+
+        var result = await Create(Form("")).Limits();
+
+        Assert.Equal(PlatformSettingsRegistry.DefaultReportsPerAddressPerMinute, result.Value!.PerAddressPerMinute);
     }
 
     [Fact]

@@ -106,7 +106,7 @@ public class PermissionMatrixTests(ApiFactory factory) : IClassFixture<ApiFactor
     /// request through, which is what the admission half is asking.
     /// </remarks>
     /// <summary>Actions that take a multipart form, not JSON (a file upload).</summary>
-    private static readonly HashSet<string> FormActions = new(StringComparer.Ordinal) { "PluginAdmin.Upload" };
+    private static readonly HashSet<string> FormActions = new(StringComparer.Ordinal) { "PluginAdmin.Upload", "PluginAdmin.SignFile" };
 
     private static async Task<HttpStatusCode?> SendAsync(HttpClient client, GuardedEndpoint endpoint)
     {

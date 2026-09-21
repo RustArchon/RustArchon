@@ -256,9 +256,10 @@ database: the migration is generated (`20260920142426_AddServerReports`) but **n
   modal would only add friction. Rotating the report address and discarding a half-made server *do* confirm.
 - **Live push carries no report.** `RconHub` sends `ReceiveServerReportsChanged` with no payload: the group it goes to is everyone who may see
   the server, wider than everyone who may read its reports, so the Panel re-reads through the endpoint that checks the permission.
-- **Rate limits are constants, not Platform Settings** (Panel 120 requests/minute per address on `/ingest/reports`; Api 60 reports/minute per
-  server, applied only after the secret is verified; 20 key checks/minute per user). The plan said limits would be Platform Settings; that
-  is still open.
+- **Rate limits are Platform Settings** (category Reports; done 2026-09-20): `ReportsPerAddressPerMinute` (Panel, 120 per address on `/ingest/reports`),
+  `ReportsPerServerPerMinute` (Api, 60, applied only after the secret is verified) and `IntegrationChecksPerUserPerMinute` (20). One number for everyone;
+  per-server limits are deliberately a later step. The Panel cannot read Platform Settings itself, so it asks the Api (`GET /internal/reports/limits`) and
+  remembers the answer for a minute.
 - **The forwarding card is collapsed on the Reports tab** and only fetches (which mints the secret) when opened; the wizard opens it at once.
 - **`GET .../report-forwarding` mints the secret on first read**, as planned - and nothing else does (a check on a server that has never had
   one answers "not set" without minting).
@@ -273,8 +274,9 @@ plugin machinery that already exists (plugin list, `plugin-status`, the signed d
 
 **Still open**
 
-1. Abandoned wizard servers: a "Finish setup" link now appears on any enabled server that is not connected (no persisted "setup complete"
-   flag, no auto-delete). Whether that is enough is unconfirmed.
-2. Rate limits as Platform Settings (above).
+1. ~~Abandoned wizard servers~~ - done 2026-09-20: `RustServer.SetupCompletedAtUtc` is stamped (`POST api/rustservers/{id}/setup-complete`, idempotent) when the
+   wizard reaches its end, and the servers list offers "Finish setup" on exactly the servers without it. Servers that existed before were backfilled as complete
+   from their creation date (migration `AddServerSetupCompleted`). A failed save leaves the link, which is the safe direction. No auto-delete; Discard still frees the plan slot.
+2. ~~Rate limits as Platform Settings~~ - done (above).
 3. The unverified assumptions listed in the section above, especially what `server.reportsServerEndpoint` prints and how each geolocation
    provider signals a bad key.

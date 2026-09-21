@@ -1,0 +1,15 @@
+#  package                                                                          author                                           version  hook time  hook fires  hook memory  hook lag  hook exceptions  compile time      uptime
+1  Carbon Community (1)
+   Core                                                                             Carbon Community                                 v1.0.0              171         19.8mb                                                    8h15m28s
+2  Scripts (61)
+*  unloaded plugins (0)
+*  failed plugins (4)   line      stacktrace
+   BotReSpawn.cs        1436:59   Cannot implicitly convert type 'System.Func<Item, int, bool>' to 'System.Func<BasePlayer, Item, int, bool>'
+   BotReSpawn.cs        2645:48   The name 'RustNavMesh' does not exist in the current context
+   BotReSpawn.cs        3673:215  'BasePlayer' does not contain a definition for 'isInAir' and no accessible extension method 'isInAir' accepting a first argument of type 'BasePlayer' ...
+                                  could be found (are you missing a using directive or an assembly reference?)
+   CopyPaste.cs         3645:31   'Sprinkler' does not contain a definition for 'TurnOn' and no accessible extension method 'TurnOn' accepting a first argument of type 'Sprinkler' coul...
+                                  d be found (are you missing a using directive or an assembly reference?)
+   MapNoteTeleport.cs   321:20    'BasePlayer' does not contain a definition for 'flyhackPauseTime' and no accessible extension method 'flyhackPauseTime' accepting a first argument of ...
+                                  type 'BasePlayer' could be found (are you missing a using directive or an assembly reference?)
+   ScrapHeliStorage.cs  101:9     No overload for method 'SendNetworkUpdateImmediate' takes 1 arguments

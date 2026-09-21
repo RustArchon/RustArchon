@@ -31,16 +31,33 @@ public class ReportSupportTests
 
     // ---- throttle ----
 
+    private const int PerWindow = PlatformSettingsRegistry.DefaultReportsPerServerPerMinute;
+
     [Fact]
     public void AServerGetsItsBudgetPerWindowAndThenIsToldToWait()
     {
         var throttle = new ReportIngestThrottle(new MutableClock(DateTimeOffset.UnixEpoch));
         var server = Guid.NewGuid();
 
-        var accepted = Enumerable.Range(0, ReportIngestThrottle.PerWindow).Count(_ => throttle.TryAcquire(server));
+        var accepted = Enumerable.Range(0, PerWindow).Count(_ => throttle.TryAcquire(server, PerWindow));
 
-        Assert.Equal(ReportIngestThrottle.PerWindow, accepted);
-        Assert.False(throttle.TryAcquire(server));
+        Assert.Equal(PerWindow, accepted);
+        Assert.False(throttle.TryAcquire(server, PerWindow));
+    }
+
+    [Fact]
+    public void TheLimitIsWhateverTheCallerSaysAndAChangeAppliesAtOnce()
+    {
+        var throttle = new ReportIngestThrottle(new MutableClock(DateTimeOffset.UnixEpoch));
+        var server = Guid.NewGuid();
+
+        Assert.Equal(3, Enumerable.Range(0, 10).Count(_ => throttle.TryAcquire(server, 3)));
+        Assert.False(throttle.TryAcquire(server, 3));
+
+        // The administrator raises it to 5 in the middle of the window: the two more reports are let through, the next is not.
+        Assert.True(throttle.TryAcquire(server, 5));
+        Assert.True(throttle.TryAcquire(server, 5));
+        Assert.False(throttle.TryAcquire(server, 5));
     }
 
     [Fact]
@@ -48,13 +65,13 @@ public class ReportSupportTests
     {
         var throttle = new ReportIngestThrottle(new MutableClock(DateTimeOffset.UnixEpoch));
         var busy = Guid.NewGuid();
-        for (var i = 0; i < ReportIngestThrottle.PerWindow; i++)
+        for (var i = 0; i < PerWindow; i++)
         {
-            throttle.TryAcquire(busy);
+            throttle.TryAcquire(busy, PerWindow);
         }
 
-        Assert.False(throttle.TryAcquire(busy));
-        Assert.True(throttle.TryAcquire(Guid.NewGuid()));
+        Assert.False(throttle.TryAcquire(busy, PerWindow));
+        Assert.True(throttle.TryAcquire(Guid.NewGuid(), PerWindow));
     }
 
     [Fact]
@@ -63,16 +80,16 @@ public class ReportSupportTests
         var clock = new MutableClock(DateTimeOffset.UnixEpoch);
         var throttle = new ReportIngestThrottle(clock);
         var server = Guid.NewGuid();
-        for (var i = 0; i < ReportIngestThrottle.PerWindow; i++)
+        for (var i = 0; i < PerWindow; i++)
         {
-            throttle.TryAcquire(server);
+            throttle.TryAcquire(server, PerWindow);
         }
 
         clock.Now += ReportIngestThrottle.Window - TimeSpan.FromSeconds(1);
-        Assert.False(throttle.TryAcquire(server));
+        Assert.False(throttle.TryAcquire(server, PerWindow));
 
         clock.Now += TimeSpan.FromSeconds(1);
-        Assert.True(throttle.TryAcquire(server));
+        Assert.True(throttle.TryAcquire(server, PerWindow));
     }
 
     // ---- cleanup ----
