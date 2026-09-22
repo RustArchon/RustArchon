@@ -19,6 +19,7 @@ using RustArchon.Api.Infrastructure;
 using RustArchon.Api.Infrastructure.Security;
 using RustArchon.Api.Mapping;
 using RustArchon.Api.Repositories;
+using RustArchon.Api.Services;
 using RustArchon.Messaging.Contracts;
 using RustArchon.Shared.DTOs;
 
@@ -91,7 +92,8 @@ public class RustServersControllerPluginStatusTests(PostgresFixture postgres) : 
             statuses,
             script.Object,
             update.Object,
-            subscriptionRepository.Object);
+            subscriptionRepository.Object,
+            Mock.Of<IServerPollService>());
 
         controller.ControllerContext = new Microsoft.AspNetCore.Mvc.ControllerContext { HttpContext = new Microsoft.AspNetCore.Http.DefaultHttpContext() };
 

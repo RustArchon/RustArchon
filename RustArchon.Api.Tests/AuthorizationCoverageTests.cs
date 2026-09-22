@@ -93,7 +93,13 @@ public class AuthorizationCoverageTests
         // scope a permission to. Each acts only on the caller and can name nobody else.
         "OrganizationController.Create",
         "OrganizationController.PlanOptions",
-        "OrganizationController.Founded"
+        "OrganizationController.Founded",
+
+        // A person's own settings (their language). Belongs to the person, not to any organization, so there is no tenant to scope a permission to - and
+        // a permission here would mean somebody could be refused the setting of their own language. The person is whoever the request is signed in as; the
+        // route names nobody, so it can neither read nor change anyone else's.
+        "UserProfileController.Get",
+        "UserProfileController.Put"
     ];
 
     private static readonly System.Reflection.Assembly ApiAssembly =

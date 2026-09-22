@@ -16,6 +16,7 @@ using RustArchon.Api.Data;
 using RustArchon.Api.Infrastructure.ObjectStorage;
 using RustArchon.Api.Mapping;
 using RustArchon.Api.Repositories;
+using RustArchon.Api.Services;
 using RustArchon.Shared.DTOs;
 
 namespace RustArchon.Api.Tests;
@@ -32,6 +33,8 @@ public class ServerReportsControllerTests
 
     private readonly Mock<IRustServerRepository> _servers = new();
     private readonly Mock<IServerReportRepository> _reports = new();
+    private readonly Mock<IServerReportNoteRepository> _notes = new();
+    private readonly Mock<IReportAssigneeService> _assignees = new();
     private readonly Mock<IObjectStorage> _storage = new();
     private readonly IMapper _mapper =
         new MapperConfiguration(c => c.AddProfile<ServerReportMappingProfile>(), NullLoggerFactory.Instance).CreateMapper();
@@ -45,12 +48,13 @@ public class ServerReportsControllerTests
     {
         _servers.Setup(s => s.GetByIdAsync(ServerId, null)).ReturnsAsync(new RustServer { Id = ServerId });
         _reports.Setup(r => r.UpdateAsync(It.IsAny<ServerReport>())).ReturnsAsync((ServerReport r) => r);
+        _notes.Setup(n => n.AddAsync(It.IsAny<ServerReportNote>())).ReturnsAsync((ServerReportNote n) => n);
     }
 
     private ServerReportsController Create(Guid? user = null)
     {
         var claims = user is { } id ? [new Claim(ClaimTypes.NameIdentifier, id.ToString())] : Array.Empty<Claim>();
-        return new ServerReportsController(_servers.Object, _reports.Object, _storage.Object, _mapper, new FixedClock(Now))
+        return new ServerReportsController(_servers.Object, _reports.Object, _notes.Object, _assignees.Object, _storage.Object, _mapper, new FixedClock(Now))
         {
             ControllerContext = new ControllerContext
             {
@@ -115,6 +119,11 @@ public class ServerReportsControllerTests
         Assert.IsType<NotFoundResult>((await controller.Get(other, reportId)).Result);
         Assert.IsType<NotFoundResult>(await controller.Screenshot(other, reportId));
         Assert.IsType<NotFoundResult>((await controller.SetStatus(other, reportId, new UpdateServerReportStatusDto { Status = ServerReportStatus.Actioned })).Result);
+        Assert.IsType<NotFoundResult>((await controller.Assignees(other, default)).Result);
+        Assert.IsType<NotFoundResult>((await controller.Assign(other, reportId, new AssignServerReportDto { AssignedToUserId = null }, default)).Result);
+        Assert.IsType<NotFoundResult>((await controller.GetNotes(other, reportId)).Result);
+        Assert.IsType<NotFoundResult>((await controller.AddNote(other, reportId, new SaveServerReportNoteDto { Content = "x" })).Result);
+        _notes.Verify(n => n.AddAsync(It.IsAny<ServerReportNote>()), Times.Never);
         _reports.Verify(r => r.GetForServerAsync(It.IsAny<Guid>(), It.IsAny<int>(), It.IsAny<int>(), It.IsAny<ServerReportType?>(), It.IsAny<ServerReportStatus?>(), It.IsAny<string?>()), Times.Never);
     }
 
@@ -219,6 +228,187 @@ public class ServerReportsControllerTests
 
         Assert.IsType<BadRequestObjectResult>(result.Result);
         _reports.Verify(r => r.UpdateAsync(It.IsAny<ServerReport>()), Times.Never);
+    }
+
+    // ---- assignment ----
+
+    [Fact]
+    public async Task AReportCanBeAssignedToSomeoneWhoCanActOnIt()
+    {
+        var assignee = Guid.NewGuid();
+        var report = GivenReport();
+        _assignees.Setup(a => a.CanBeAssignedAsync(assignee, default)).ReturnsAsync(true);
+
+        var ok = Assert.IsType<OkObjectResult>(
+            (await Create().Assign(ServerId, report.Id, new AssignServerReportDto { AssignedToUserId = assignee }, default)).Result);
+
+        Assert.Equal(assignee, Assert.IsType<ServerReportDto>(ok.Value).AssignedToUserId);
+        Assert.Equal(assignee, report.AssignedToUserId);
+    }
+
+    [Fact]
+    public async Task ARefusedAssigneeLeavesTheReportAsItWasAndSavesNothing()
+    {
+        var previous = Guid.NewGuid();
+        var report = GivenReport();
+        report.AssignedToUserId = previous;
+        _assignees.Setup(a => a.CanBeAssignedAsync(It.IsAny<Guid>(), default)).ReturnsAsync(false);
+
+        var result = await Create().Assign(ServerId, report.Id, new AssignServerReportDto { AssignedToUserId = Guid.NewGuid() }, default);
+
+        Assert.IsType<BadRequestObjectResult>(result.Result);
+        Assert.Equal(previous, report.AssignedToUserId);
+        _reports.Verify(r => r.UpdateAsync(It.IsAny<ServerReport>()), Times.Never);
+    }
+
+    [Fact]
+    public async Task AssigningNobodyTakesTheAssignmentBackWithoutAskingWhoIsAllowed()
+    {
+        var report = GivenReport();
+        report.AssignedToUserId = Guid.NewGuid();
+
+        var ok = Assert.IsType<OkObjectResult>(
+            (await Create().Assign(ServerId, report.Id, new AssignServerReportDto { AssignedToUserId = null }, default)).Result);
+
+        Assert.Null(Assert.IsType<ServerReportDto>(ok.Value).AssignedToUserId);
+        Assert.Null(report.AssignedToUserId);
+        _assignees.Verify(a => a.CanBeAssignedAsync(It.IsAny<Guid>(), default), Times.Never);
+    }
+
+    [Fact]
+    public async Task AssigningAReportOfAnotherServerIsANotFoundAndSavesNothing()
+    {
+        var elsewhere = GivenReport(serverId: Guid.NewGuid());
+        _assignees.Setup(a => a.CanBeAssignedAsync(It.IsAny<Guid>(), default)).ReturnsAsync(true);
+
+        var result = await Create().Assign(ServerId, elsewhere.Id, new AssignServerReportDto { AssignedToUserId = Guid.NewGuid() }, default);
+
+        Assert.IsType<NotFoundResult>(result.Result);
+        _reports.Verify(r => r.UpdateAsync(It.IsAny<ServerReport>()), Times.Never);
+    }
+
+    [Fact]
+    public async Task TheAssigneeListIsWhoTheServiceSays()
+    {
+        var people = new[] { Guid.NewGuid(), Guid.NewGuid() };
+        _assignees.Setup(a => a.ListAsync(default)).ReturnsAsync(people);
+
+        var ok = Assert.IsType<OkObjectResult>((await Create().Assignees(ServerId, default)).Result);
+
+        Assert.Equal(people, Assert.IsAssignableFrom<IReadOnlyList<Guid>>(ok.Value));
+    }
+
+    [Fact]
+    public async Task AssigningDoesNotTouchTheStatusOrWhoReviewedIt()
+    {
+        var report = GivenReport(status: ServerReportStatus.Reviewing);
+        var reviewer = Guid.NewGuid();
+        report.ReviewedByUserId = reviewer;
+        _assignees.Setup(a => a.CanBeAssignedAsync(It.IsAny<Guid>(), default)).ReturnsAsync(true);
+
+        await Create(Guid.NewGuid()).Assign(ServerId, report.Id, new AssignServerReportDto { AssignedToUserId = Guid.NewGuid() }, default);
+
+        Assert.Equal(ServerReportStatus.Reviewing, report.Status);
+        Assert.Equal(reviewer, report.ReviewedByUserId);
+    }
+
+    // ---- notes ----
+
+    [Fact]
+    public async Task ANoteIsSavedAgainstTheReportTrimmedAndReturnedWithItsAuthor()
+    {
+        var report = GivenReport();
+        var author = Guid.NewGuid();
+        _notes.Setup(n => n.AddAsync(It.IsAny<ServerReportNote>())).ReturnsAsync((ServerReportNote n) =>
+        {
+            n.Id = Guid.NewGuid();
+            n.CreatedById = author;
+            n.CreatedOn = Now;
+            return n;
+        });
+
+        var ok = Assert.IsType<OkObjectResult>(
+            (await Create(author).AddNote(ServerId, report.Id, new SaveServerReportNoteDto { Content = "  Checked the demo; clean.  " })).Result);
+
+        var dto = Assert.IsType<ServerReportNoteDto>(ok.Value);
+        Assert.Equal("Checked the demo; clean.", dto.Content);
+        Assert.Equal(author, dto.AuthorUserId);
+        Assert.Equal(Now, dto.CreatedOn);
+        _notes.Verify(n => n.AddAsync(It.Is<ServerReportNote>(x => x.ServerReportId == report.Id && x.Content == "Checked the demo; clean.")), Times.Once);
+    }
+
+    [Theory]
+    [InlineData(null)]
+    [InlineData("")]
+    [InlineData("   ")]
+    public async Task ABlankNoteIsRefusedAndNothingIsSaved(string? content)
+    {
+        var report = GivenReport();
+
+        var result = await Create().AddNote(ServerId, report.Id, new SaveServerReportNoteDto { Content = content! });
+
+        Assert.IsType<BadRequestObjectResult>(result.Result);
+        _notes.Verify(n => n.AddAsync(It.IsAny<ServerReportNote>()), Times.Never);
+    }
+
+    [Fact]
+    public async Task ANoteOverTheLengthLimitIsRefusedAndNothingIsSaved()
+    {
+        var report = GivenReport();
+
+        var result = await Create().AddNote(ServerId, report.Id, new SaveServerReportNoteDto { Content = new string('x', ServerReportNote.MaxContentLength + 1) });
+
+        Assert.IsType<BadRequestObjectResult>(result.Result);
+        _notes.Verify(n => n.AddAsync(It.IsAny<ServerReportNote>()), Times.Never);
+    }
+
+    [Fact]
+    public async Task ANoteOnAReportOfAnotherServerIsANotFoundAndNothingIsSaved()
+    {
+        var elsewhere = GivenReport(serverId: Guid.NewGuid());
+
+        var result = await Create().AddNote(ServerId, elsewhere.Id, new SaveServerReportNoteDto { Content = "x" });
+
+        Assert.IsType<NotFoundResult>(result.Result);
+        _notes.Verify(n => n.AddAsync(It.IsAny<ServerReportNote>()), Times.Never);
+    }
+
+    [Fact]
+    public async Task TheNotesOfAReportAreListedOldestFirstAsTheRepositoryReturnsThem()
+    {
+        var report = GivenReport();
+        var first = new ServerReportNote { Id = Guid.NewGuid(), ServerReportId = report.Id, Content = "one", CreatedById = Guid.NewGuid(), CreatedOn = Now };
+        var second = new ServerReportNote { Id = Guid.NewGuid(), ServerReportId = report.Id, Content = "two", CreatedById = Guid.NewGuid(), CreatedOn = Now.AddMinutes(1) };
+        _notes.Setup(n => n.GetForReportAsync(report.Id)).ReturnsAsync([first, second]);
+
+        var ok = Assert.IsType<OkObjectResult>((await Create().GetNotes(ServerId, report.Id)).Result);
+
+        var list = Assert.IsAssignableFrom<IReadOnlyList<ServerReportNoteDto>>(ok.Value);
+        Assert.Equal(["one", "two"], list.Select(n => n.Content));
+        Assert.Equal(first.CreatedById, list[0].AuthorUserId);
+    }
+
+    [Fact]
+    public async Task NotesOfAReportOfAnotherServerAreNotReadable()
+    {
+        var elsewhere = GivenReport(serverId: Guid.NewGuid());
+
+        Assert.IsType<NotFoundResult>((await Create().GetNotes(ServerId, elsewhere.Id)).Result);
+        _notes.Verify(n => n.GetForReportAsync(It.IsAny<Guid>()), Times.Never);
+    }
+
+    [Fact]
+    public void AssigningAndAddingNotesNeedTheManagePermissionWhileReadingNotesOnlyNeedsViewing()
+    {
+        static string? PermissionOf(string method) =>
+            typeof(ServerReportsController).GetMethod(method)!
+                .GetCustomAttributes(typeof(JumpStart.Authorization.RequirePermissionAttribute), inherit: false)
+                .Cast<JumpStart.Authorization.RequirePermissionAttribute>().SingleOrDefault()?.Permission;
+
+        Assert.Equal(Infrastructure.PermissionCatalog.ServerManageReports, PermissionOf(nameof(ServerReportsController.Assign)));
+        Assert.Equal(Infrastructure.PermissionCatalog.ServerManageReports, PermissionOf(nameof(ServerReportsController.AddNote)));
+        Assert.Equal(Infrastructure.PermissionCatalog.ServerManageReports, PermissionOf(nameof(ServerReportsController.Assignees)));
+        Assert.Null(PermissionOf(nameof(ServerReportsController.GetNotes)));
     }
 
     [Fact]

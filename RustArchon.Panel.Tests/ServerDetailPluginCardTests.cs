@@ -88,6 +88,8 @@ public class ServerDetailPluginCardTests : BunitContext
 
         var localizer = new Mock<IStringLocalizer<SharedResource>>();
         localizer.Setup(l => l[It.IsAny<string>()]).Returns((string key) => new LocalizedString(key, key));
+        localizer.Setup(l => l[It.IsAny<string>(), It.IsAny<object[]>()])
+            .Returns((string key, object[] args) => new LocalizedString(key, string.Format(key, args)));
 
         Services.AddSingleton(_client.Object);
         Services.AddSingleton(hubClient.Object);
@@ -1272,248 +1274,50 @@ public class ServerDetailPluginCardTests : BunitContext
         Assert.Contains("<img src=x onerror=alert(1)>", cut.Find("[data-testid=combat-row]").TextContent);
     }
 
-    // ---- the Bases tab ------------------------------------------------------------------------------------
+    // ---- the Bases tab is gone: the bases are on the Map tab ----------------------------------------------
 
-    private IRenderedComponent<ServerDetail> RenderBasesTab()
+    [Fact]
+    public void ThereIsNoBasesTabBecauseTheBasesAreOnTheMap()
+    {
+        var cut = RenderPluginsTab();
+
+        Assert.Empty(cut.FindAll("[data-testid=tab-bases]"));
+        Assert.NotEmpty(cut.FindAll("[data-testid=tab-map]"));
+    }
+
+    /// <summary>An old bookmark or shared link to ?tab=bases must not land on the console: it opens the map, where the bases now are.</summary>
+    [Fact]
+    public void AnOldBasesAddressOpensTheMapTab()
     {
         Services.GetRequiredService<NavigationManager>().NavigateTo($"/servers/{_serverId}?tab=bases");
-        return Render<ServerDetail>(parameters => parameters.Add(p => p.Id, _serverId));
+
+        var cut = Render<ServerDetail>(parameters => parameters.Add(p => p.Id, _serverId));
+
+        cut.WaitForAssertion(() => Assert.NotEmpty(cut.FindAll("[data-testid=map-pane]")));
+        Assert.Empty(cut.FindAll("[data-testid=bases-pane]"));
+        Assert.Contains("active", cut.Find("[data-testid=tab-map]").ClassList);
     }
 
-    private void GivenBasesCapable() => GivenHandshake(capabilities: [RustArchonPlugin.ConfigCapability, RustArchonPlugin.TcsCapability]);
-
-    private static BaseTcDto Base(int id, string owner = "76561198000000001", double x = 100.4, double y = 25.6, double z = -300.7, params (string Id, string Name)[] authorized) => new()
+    /// <summary>
+    /// The Bases tab used to warn when recording was off (the list was going stale). That warning now belongs to the map, which needs
+    /// to be told: the server's own setting is handed down to it.
+    /// </summary>
+    [Theory]
+    [InlineData(false, true)]
+    [InlineData(true, false)]
+    public void TheMapIsToldWhetherRecordingIsOnSoItCanWarnThatPlayersAndBasesAreGoingStale(bool recording, bool warned)
     {
-        Id = id, X = x, Y = y, Z = z, OwnerId = owner,
-        Authorized = authorized.Select(a => new BaseAuthorizedPlayerDto { PlayerId = a.Id, Name = a.Name }).ToList()
-    };
-
-    private void GivenBases(bool ready, params BaseTcDto[] tcs) =>
-        _client.Setup(c => c.GetBasesAsync(_serverId)).ReturnsAsync(new BasesDto
-        {
-            Ready = ready, CapturedAtUtc = new DateTimeOffset(2026, 9, 20, 12, 0, 0, TimeSpan.Zero), Tcs = [.. tcs]
-        });
-
-    private void VerifyBasesNeverAsked() => _client.Verify(c => c.GetBasesAsync(It.IsAny<Guid>()), Times.Never);
-
-    [Fact]
-    public void TheBasesTabIsAlwaysOfferedSoAServerWithoutThePluginIsToldWhatItNeeds()
-    {
-        Assert.NotEmpty(RenderPluginsTab().FindAll("[data-testid=tab-bases]"));
-    }
-
-    [Fact]
-    public void WithoutThePluginTheBasesTabSaysSoAndAsksForNothing()
-    {
-        var cut = RenderBasesTab();
-
-        cut.WaitForAssertion(() => Assert.NotEmpty(cut.FindAll("[data-testid=bases-needs-plugin]")));
-        VerifyBasesNeverAsked();
-    }
-
-    [Fact]
-    public void AListedPluginThatHasNotAnsweredGetsTheWaitMessageAndNoQueryForBases()
-    {
+        _server.PluginRecordingEnabled = recording;
+        Services.GetRequiredService<NavigationManager>().NavigateTo($"/servers/{_serverId}?tab=map");
         GivenPluginListed();
+        GivenHandshake(capabilities: [RustArchonPlugin.ConfigCapability, RustArchonPlugin.MapCapability]);
+        _client.Setup(c => c.GetMapAsync(_serverId)).ReturnsAsync(new MapDto { Available = true, WorldSize = 4500, WorldSeed = 1, Monuments = [] });
 
-        var cut = RenderBasesTab();
+        var cut = Render<ServerDetail>(parameters => parameters.Add(p => p.Id, _serverId));
 
-        cut.WaitForAssertion(() => Assert.NotEmpty(cut.FindAll("[data-testid=bases-no-handshake]")));
-        VerifyBasesNeverAsked();
+        cut.WaitForAssertion(() => Assert.NotEmpty(cut.FindAll("[data-testid=map-info]")));   // the map itself is up
+        Assert.Equal(warned, cut.FindAll("[data-testid=map-recording-off]").Count > 0);
     }
-
-    [Fact]
-    public void APluginThatDoesNotReportTheTcsCapabilityIsToldToUpdateAndNothingIsQueried()
-    {
-        GivenPluginListed();
-        GivenHandshake(capabilities: [RustArchonPlugin.ConfigCapability, RustArchonPlugin.CombatCapability]); // combat, but no tcs
-
-        var cut = RenderBasesTab();
-
-        cut.WaitForAssertion(() => Assert.NotEmpty(cut.FindAll("[data-testid=bases-not-supported]")));
-        VerifyBasesNeverAsked();
-    }
-
-    [Fact]
-    public void WithTheCapabilityEveryBaseIsListedWithItsOwnerLocationAndWhoIsAuthorized()
-    {
-        GivenPluginListed();
-        GivenBasesCapable();
-        GivenBases(true,
-            Base(2, "76561198000000002", 5, 6, 7),
-            Base(1, "76561198000000001", 100.4, 25.6, -300.7, ("76561198000000001", "Alice"), ("76561198000000003", "Carol")));
-
-        var cut = RenderBasesTab();
-
-        cut.WaitForAssertion(() => Assert.Equal(2, cut.FindAll("[data-testid=base-row]").Count));
-        var rows = cut.FindAll("[data-testid=base-row]");
-        Assert.Contains("Alice", rows[0].TextContent);                 // the owner's name, from the authorized list
-        Assert.Contains("76561198000000001", rows[0].TextContent);
-        Assert.Contains("x 100", rows[0].TextContent);
-        Assert.Contains("z -301", rows[0].TextContent);
-        Assert.Contains("Alice, Carol", cut.FindAll("[data-testid=base-authorized]")[0].TextContent);
-        Assert.Contains("76561198000000002", rows[1].TextContent);     // no name known: the id stands in
-        Assert.Contains("Nobody", cut.FindAll("[data-testid=base-authorized]")[1].TextContent);
-    }
-
-    [Fact]
-    public void AnAuthorizedPlayerWithNoNameIsShownByTheirId()
-    {
-        GivenPluginListed();
-        GivenBasesCapable();
-        GivenBases(true, Base(1, "76561198000000001", 0, 0, 0, ("76561198000000009", "")));
-
-        var cut = RenderBasesTab();
-
-        cut.WaitForAssertion(() => Assert.Contains("76561198000000009", cut.Find("[data-testid=base-authorized]").TextContent));
-    }
-
-    [Fact]
-    public void WithoutThePermissionTheTabSaysYouAreNotAllowedNotThatSomethingFailed()
-    {
-        GivenPluginListed();
-        GivenBasesCapable();
-        _client.Setup(c => c.GetBasesAsync(_serverId)).ThrowsAsync(
-            Refit.ApiException.Create(new HttpRequestMessage(), HttpMethod.Get, new HttpResponseMessage(HttpStatusCode.Forbidden), new Refit.RefitSettings()).GetAwaiter().GetResult());
-
-        var cut = RenderBasesTab();
-
-        cut.WaitForAssertion(() => Assert.NotEmpty(cut.FindAll("[data-testid=bases-forbidden]")));
-        Assert.Empty(cut.FindAll("[data-testid=bases-error]"));
-        Assert.Empty(cut.FindAll("[data-testid=bases-table]"));
-        Assert.Empty(cut.FindAll("[data-testid=bases-refresh]"));
-    }
-
-    [Fact]
-    public void AFailedBasesLoadShowsAnErrorInsteadOfCrashingThePage()
-    {
-        GivenPluginListed();
-        GivenBasesCapable();
-        _client.Setup(c => c.GetBasesAsync(_serverId)).ThrowsAsync(new HttpRequestException("boom"));
-
-        var cut = RenderBasesTab();
-
-        cut.WaitForAssertion(() => Assert.Contains("Failed to load the bases.", cut.Find("[data-testid=bases-error]").TextContent));
-        Assert.Empty(cut.FindAll("[data-testid=bases-forbidden]"));
-    }
-
-    [Fact]
-    public void AListFromAnUnfinishedScanCarriesAWarningAndACompleteOneDoesNot()
-    {
-        GivenPluginListed();
-        GivenBasesCapable();
-        GivenBases(false, Base(1));
-
-        var partial = RenderBasesTab();
-        partial.WaitForAssertion(() => Assert.NotEmpty(partial.FindAll("[data-testid=base-row]")));
-        Assert.NotEmpty(partial.FindAll("[data-testid=bases-not-ready]"));
-
-        GivenBases(true, Base(1));
-        var complete = RenderBasesTab();
-        complete.WaitForAssertion(() => Assert.NotEmpty(complete.FindAll("[data-testid=base-row]")));
-        Assert.Empty(complete.FindAll("[data-testid=bases-not-ready]"));
-    }
-
-    [Fact]
-    public void ANeverReadServerSaysNoBasesYetWithoutTheScanWarning()
-    {
-        GivenPluginListed();
-        GivenBasesCapable();
-        _client.Setup(c => c.GetBasesAsync(_serverId)).ReturnsAsync(new BasesDto { Ready = false, CapturedAtUtc = null, Tcs = [] });
-
-        var cut = RenderBasesTab();
-
-        cut.WaitForAssertion(() => Assert.NotEmpty(cut.FindAll("[data-testid=bases-empty]")));
-        Assert.Empty(cut.FindAll("[data-testid=bases-not-ready]"));   // nothing was read, so there is no partial list to warn about
-        Assert.Empty(cut.FindAll("[data-testid=bases-captured]"));
-    }
-
-    [Fact]
-    public void WithRecordingOffItWarnsThatTheListIsNotBeingKeptUpToDate()
-    {
-        _server.PluginRecordingEnabled = false;
-        GivenPluginListed();
-        GivenBasesCapable();
-        GivenBases(true, Base(1));
-
-        var cut = RenderBasesTab();
-
-        cut.WaitForAssertion(() => Assert.NotEmpty(cut.FindAll("[data-testid=base-row]")));
-        Assert.NotEmpty(cut.FindAll("[data-testid=bases-recording-off]"));
-    }
-
-    [Fact]
-    public void RefreshAsksAgainAndShowsWhenTheListWasTaken()
-    {
-        GivenPluginListed();
-        GivenBasesCapable();
-        GivenBases(true, Base(1));
-        var cut = RenderBasesTab();
-        cut.WaitForAssertion(() => Assert.NotEmpty(cut.FindAll("[data-testid=base-row]")));
-        Assert.Contains("2026-09-20 12:00:00 UTC", cut.Find("[data-testid=bases-captured]").TextContent);
-
-        cut.Find("[data-testid=bases-refresh]").Click();
-
-        cut.WaitForAssertion(() => _client.Verify(c => c.GetBasesAsync(_serverId), Times.Exactly(2)));
-    }
-
-    [Fact]
-    public void PlayerNamesAreShownAsTextNeverAsMarkupOnTheBasesTab()
-    {
-        GivenPluginListed();
-        GivenBasesCapable();
-        GivenBases(true, Base(1, "76561198000000001", 0, 0, 0, ("76561198000000001", "<img src=x onerror=alert(1)>")));
-
-        var cut = RenderBasesTab();
-
-        cut.WaitForAssertion(() => Assert.NotEmpty(cut.FindAll("[data-testid=base-row]")));
-        Assert.Empty(cut.FindAll("[data-testid=base-row] img"));
-        Assert.Contains("<img src=x onerror=alert(1)>", cut.Find("[data-testid=base-row]").TextContent);
-    }
-
-    [Fact]
-    public void AnOwnerTheApiHasANameForIsShownByThatNameEvenWhenNotOnTheirOwnCupboard()
-    {
-        GivenPluginListed();
-        GivenBasesCapable();
-        var tc = Base(1, "76561198000000001", 0, 0, 0);
-        tc.OwnerName = "Alice From History";
-        GivenBases(true, tc);
-
-        var cut = RenderBasesTab();
-
-        cut.WaitForAssertion(() => Assert.Contains("Alice From History", cut.Find("[data-testid=base-row]").TextContent));
-        Assert.Contains("76561198000000001", cut.Find("[data-testid=base-row]").TextContent);       // the id stays beneath the name
-    }
-
-    [Fact]
-    public void AnOwnerNameIsShownAsTextNeverAsMarkup()
-    {
-        GivenPluginListed();
-        GivenBasesCapable();
-        var tc = Base(1, "76561198000000001", 0, 0, 0);
-        tc.OwnerName = "<b onmouseover=alert(1)>owner</b>";
-        GivenBases(true, tc);
-
-        var cut = RenderBasesTab();
-
-        cut.WaitForAssertion(() => Assert.NotEmpty(cut.FindAll("[data-testid=base-row]")));
-        Assert.Empty(cut.FindAll("[data-testid=base-row] b"));
-        Assert.Contains("<b onmouseover=alert(1)>owner</b>", cut.Find("[data-testid=base-row]").TextContent);
-    }
-
-    [Fact]
-    public void AnApiResolvedAuthorizedNameIsListedLikeAPluginOne()
-    {
-        GivenPluginListed();
-        GivenBasesCapable();
-        GivenBases(true, Base(1, "76561198000000001", 0, 0, 0, ("76561198000000009", "Resolved By Api")));
-
-        var cut = RenderBasesTab();
-
-        cut.WaitForAssertion(() => Assert.Contains("Resolved By Api", cut.Find("[data-testid=base-authorized]").TextContent));
-    }
-
     // ---- the Positions tab --------------------------------------------------------------------------------
 
     private IRenderedComponent<ServerDetail> RenderPositionsTab()
@@ -2004,8 +1808,15 @@ public class ServerDetailPluginCardTests : BunitContext
     private void GivenFailures(params ServerPluginFailureDto[] failures) =>
         _client.Setup(c => c.GetPluginFailuresAsync(_serverId)).ReturnsAsync([.. failures]);
 
+    private static string[] RowLoaded(IRenderedComponent<ServerDetail> cut) =>
+        cut.FindAll("[data-testid=plugin-row]").Select(r => r.QuerySelector("td")!.TextContent.Trim() + "=" + r.GetAttribute("data-loaded")).ToArray();
+
+    private static void OpenWhy(IRenderedComponent<ServerDetail> cut, string plugin) =>
+        cut.FindAll("[data-testid=plugin-row]").First(r => r.QuerySelector("td")!.TextContent.Trim() == plugin)
+            .QuerySelector("[data-testid=plugin-not-loaded]")!.Click();
+
     [Fact]
-    public void FailedPluginsAreListedByFileWithEveryReasonAndItsPlace()
+    public void ARunningPluginIsALoadedYesAndAFailedFileIsANoRowOfItsOwn()
     {
         GivenPluginListed("Kits");
         GivenFailures(
@@ -2015,53 +1826,131 @@ public class ServerDetailPluginCardTests : BunitContext
 
         var cut = RenderPluginsTab();
 
-        cut.WaitForAssertion(() => Assert.NotEmpty(cut.FindAll("[data-testid=plugin-failures]")));
-        Assert.Equal("2", cut.Find("[data-testid=plugin-failures-count]").TextContent.Trim());     // two files, three reasons
-        var files = cut.FindAll("[data-testid=plugin-failure]");
-        Assert.Equal(["BotReSpawn.cs", "CopyPaste.cs"], files.Select(f => f.GetAttribute("data-file")).ToArray());
-        var reasons = files[0].QuerySelectorAll("[data-testid=plugin-failure-reason]");
+        cut.WaitForAssertion(() => Assert.Equal(3, cut.FindAll("[data-testid=plugin-row]").Count));
+        Assert.Equal(["BotReSpawn=no", "CopyPaste=no", "Kits=yes"], RowLoaded(cut));         // one row per plugin, sorted; three reasons, two files
+        Assert.Single(cut.FindAll("[data-testid=plugin-loaded]"));
+        Assert.Contains("Yes", cut.Find("[data-testid=plugin-loaded]").TextContent);
+        Assert.Equal(2, cut.FindAll("[data-testid=plugin-not-loaded]").Count);
+    }
+
+    [Fact]
+    public void TheLoadedChipIsGreenAndTheNoChipIsRedAndClickable()
+    {
+        GivenPluginListed("Kits");
+        GivenFailures(Failed("BotReSpawn.cs"));
+
+        var cut = RenderPluginsTab();
+
+        cut.WaitForAssertion(() => Assert.NotEmpty(cut.FindAll("[data-testid=plugin-not-loaded]")));
+        Assert.Contains("text-bg-success", cut.Find("[data-testid=plugin-loaded]").ClassList);
+        var no = cut.Find("[data-testid=plugin-not-loaded]");
+        Assert.Equal("button", no.TagName.ToLowerInvariant());                    // reachable from the keyboard
+        Assert.Contains("text-bg-danger", no.ClassList);
+    }
+
+    [Fact]
+    public void ThereIsNoSeparateFailedToLoadSectionAnyMore()
+    {
+        GivenPluginListed("Kits");
+        GivenFailures(Failed("BotReSpawn.cs"));
+
+        var cut = RenderPluginsTab();
+
+        cut.WaitForAssertion(() => Assert.NotEmpty(cut.FindAll("[data-testid=plugin-not-loaded]")));
+        Assert.Empty(cut.FindAll("[data-testid=plugin-failures]"));
+        Assert.Empty(cut.FindAll("[data-testid=plugin-failure-modal]"));          // and nothing is open until a No is chosen
+    }
+
+    [Fact]
+    public void ChoosingNoShowsEveryReasonAndItsPlaceForThatPluginOnly()
+    {
+        GivenPluginListed("Kits");
+        GivenFailures(
+            Failed("BotReSpawn.cs", 1436, 59, "Cannot implicitly convert type"),
+            Failed("BotReSpawn.cs", 2645, 48, "The name 'RustNavMesh' does not exist"),
+            Failed("CopyPaste.cs", 3645, 31, "'Sprinkler' does not contain a definition"));
+        var cut = RenderPluginsTab();
+        cut.WaitForAssertion(() => Assert.Equal(3, cut.FindAll("[data-testid=plugin-row]").Count));
+
+        OpenWhy(cut, "BotReSpawn");
+
+        var modal = cut.Find("[data-testid=plugin-failure-modal]");
+        Assert.Contains("Why BotReSpawn did not load", modal.TextContent);
+        Assert.Contains("BotReSpawn.cs", modal.TextContent);
+        var reasons = modal.QuerySelectorAll("[data-testid=plugin-failure-reason]");
         Assert.Equal(2, reasons.Length);
         Assert.Contains("1436:59", reasons[0].TextContent);
         Assert.Contains("Cannot implicitly convert type", reasons[0].TextContent);
         Assert.Contains("2645:48", reasons[1].TextContent);
+        Assert.DoesNotContain("Sprinkler", modal.TextContent);
     }
 
     [Fact]
-    public void WhenNothingFailedThereIsNoFailedSection()
+    public void ThePopupClosesWithItsCloseButtonItsCrossOrAClickOutsideIt()
     {
         GivenPluginListed("Kits");
-        GivenFailures();
-
+        GivenFailures(Failed("BotReSpawn.cs"));
         var cut = RenderPluginsTab();
+        cut.WaitForAssertion(() => Assert.NotEmpty(cut.FindAll("[data-testid=plugin-not-loaded]")));
 
-        cut.WaitForAssertion(() => Assert.NotEmpty(cut.FindAll("[data-testid=plugin-row]")));
-        Assert.Empty(cut.FindAll("[data-testid=plugin-failures]"));
+        OpenWhy(cut, "BotReSpawn");
+        cut.Find("[data-testid=plugin-failure-modal] .modal-footer .btn").Click();
+        Assert.Empty(cut.FindAll("[data-testid=plugin-failure-modal]"));
+
+        OpenWhy(cut, "BotReSpawn");
+        cut.Find("[data-testid=plugin-failure-modal] .btn-close").Click();
+        Assert.Empty(cut.FindAll("[data-testid=plugin-failure-modal]"));
+
+        OpenWhy(cut, "BotReSpawn");
+        cut.Find("[data-testid=plugin-failure-modal]").Click();                     // the backdrop, not the dialog
+        Assert.Empty(cut.FindAll("[data-testid=plugin-failure-modal]"));
+        Assert.Empty(cut.FindAll(".modal-backdrop"));
     }
 
     [Fact]
-    public void AServerWhoseEveryPluginFailedStillShowsWhyEvenThoughTheLoadedListIsEmpty()
+    public void AServerWhoseEveryPluginFailedStillListsThemEvenThoughTheLoadedListIsEmpty()
     {
         _client.Setup(c => c.GetPluginsAsync(_serverId)).ReturnsAsync([]);
         GivenFailures(Failed("Kits.cs"));
 
         var cut = RenderPluginsTab();
 
-        cut.WaitForAssertion(() => Assert.NotEmpty(cut.FindAll("[data-testid=plugin-failures]")));
-        Assert.NotEmpty(cut.FindAll("[data-testid=plugin-failure]"));
+        cut.WaitForAssertion(() => Assert.Equal(["Kits=no"], RowLoaded(cut)));
+        Assert.Empty(cut.FindAll(".console-empty"));
+    }
+
+    [Fact]
+    public void AFailedFileAndARunningPluginOfTheSameNameAreOneRowAndItIsANo()
+    {
+        _client.Setup(c => c.GetPluginsAsync(_serverId)).ReturnsAsync(
+            [new ServerPluginDto { Name = "Better Chat", Author = "LaserHydra", Version = "5.2.14", Framework = ServerModFramework.Carbon, CapturedAtUtc = DateTimeOffset.UtcNow }]);
+        GivenFailures(Failed("BetterChat.cs"));
+
+        var cut = RenderPluginsTab();
+
+        cut.WaitForAssertion(() => Assert.Equal(["Better Chat=no"], RowLoaded(cut)));
+        var cells = cut.Find("[data-testid=plugin-row]").QuerySelectorAll("td").Select(td => td.TextContent.Trim()).ToArray();
+        Assert.Equal("LaserHydra", cells[1]);
+        Assert.Contains("5.2.14", cells[2]);
+        OpenWhy(cut, "Better Chat");
+        Assert.Contains("BetterChat.cs", cut.Find("[data-testid=plugin-failure-modal]").TextContent);
     }
 
     [Theory]
     [InlineData("RustArchon.cs")]
     [InlineData("rustarchon.cs")]
     [InlineData("RustArchonUpdater.cs")]
-    public void OurOwnPluginFailingIsSaidPlainlyWithWhatToDo(string file)
+    public void OurOwnPluginFailingIsSaidPlainlyInThePopupWithWhatToDo(string file)
     {
         GivenPluginListed("Kits");
         GivenFailures(Failed(file));
-
         var cut = RenderPluginsTab();
+        var name = System.IO.Path.GetFileNameWithoutExtension(file);
+        cut.WaitForAssertion(() => Assert.NotEmpty(cut.FindAll("[data-testid=plugin-not-loaded]")));
 
-        cut.WaitForAssertion(() => Assert.NotEmpty(cut.FindAll("[data-testid=plugin-failure-own]")));
+        OpenWhy(cut, name);
+
+        Assert.NotEmpty(cut.FindAll("[data-testid=plugin-failure-own]"));
         Assert.Contains("replace the file on the server", cut.Find("[data-testid=plugin-failure-own-hint]").TextContent);
     }
 
@@ -2070,10 +1959,11 @@ public class ServerDetailPluginCardTests : BunitContext
     {
         GivenPluginListed("Kits");
         GivenFailures(Failed("BotReSpawn.cs"));
-
         var cut = RenderPluginsTab();
+        cut.WaitForAssertion(() => Assert.NotEmpty(cut.FindAll("[data-testid=plugin-not-loaded]")));
 
-        cut.WaitForAssertion(() => Assert.NotEmpty(cut.FindAll("[data-testid=plugin-failure]")));
+        OpenWhy(cut, "BotReSpawn");
+
         Assert.Empty(cut.FindAll("[data-testid=plugin-failure-own]"));
     }
 
@@ -2082,15 +1972,21 @@ public class ServerDetailPluginCardTests : BunitContext
     {
         GivenPluginListed("Kits");
         GivenFailures(Failed("Evil.cs", message: "<img src=x onerror=alert(1)><b>bold</b>"), Failed("<script>alert(1)</script>.cs"));
-
         var cut = RenderPluginsTab();
+        cut.WaitForAssertion(() => Assert.Equal(3, cut.FindAll("[data-testid=plugin-row]").Count));
 
-        cut.WaitForAssertion(() => Assert.NotEmpty(cut.FindAll("[data-testid=plugin-failure]")));
-        Assert.Empty(cut.FindAll("[data-testid=plugin-failures] img"));
-        Assert.Empty(cut.FindAll("[data-testid=plugin-failures] b"));
-        Assert.Empty(cut.FindAll("[data-testid=plugin-failures] script"));
-        var evil = cut.FindAll("[data-testid=plugin-failure]").First(f => f.GetAttribute("data-file") == "Evil.cs");
+        OpenWhy(cut, "Evil");
+        var evil = cut.Find("[data-testid=plugin-failure-modal]");
+        Assert.Empty(cut.FindAll(".plugins-pane img"));
+        Assert.Empty(cut.FindAll(".plugins-pane b"));
+        Assert.Empty(cut.FindAll(".plugins-pane script"));
         Assert.Contains("<img src=x onerror=alert(1)>", evil.TextContent);
+
+        // A file name is text too, in the row and in the popup.
+        cut.Find("[data-testid=plugin-failure-modal] .btn-close").Click();
+        OpenWhy(cut, "<script>alert(1)</script>");
+        Assert.Empty(cut.FindAll(".plugins-pane script"));
+        Assert.Contains("<script>alert(1)</script>.cs", cut.Find("[data-testid=plugin-failure-modal]").TextContent);
     }
 
     [Fact]
@@ -2101,8 +1997,8 @@ public class ServerDetailPluginCardTests : BunitContext
 
         var cut = RenderPluginsTab();
 
-        cut.WaitForAssertion(() => Assert.NotEmpty(cut.FindAll("[data-testid=plugin-row]")));
-        Assert.Empty(cut.FindAll("[data-testid=plugin-failures]"));
+        cut.WaitForAssertion(() => Assert.Equal(["Kits=yes"], RowLoaded(cut)));
+        Assert.Empty(cut.FindAll("[data-testid=plugin-not-loaded]"));
         Assert.Empty(cut.FindAll(".plugins-pane .alert"));
     }
 

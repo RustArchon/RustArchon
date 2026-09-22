@@ -63,6 +63,7 @@ public class ServerDetailReportsTabTests : BunitContext
         Services.AddSingleton(tokenStore.Object);
         Services.AddSingleton(new SiteBrandingService(valkeyCache.Object, new Mock<ISiteBrandingApiClient>().Object));
         Services.AddSingleton(ReportTestSupport.Localizer());
+        Services.AddSingleton(ReportTestSupport.UserNames());
 
         AddAuthorization().SetAuthorized("test-admin");
     }
