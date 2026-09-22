@@ -331,11 +331,12 @@ exists locally only; nothing is on GitHub until Scott confirms visibility and li
 
 ### Phase 3 - Map
 
-- **Auto-render after a wipe** (Scott's decision). Mechanism proven by the spike: in `OnServerInitialized`, if
-  `map_<size>_<seed>.png` is missing **and no players are online**, run `world.rendermap`; otherwise do not
-  freeze anyone. Adds ~48 s to that boot; on a wipe day that is a delay before the server opens, which the
-  Panel setting text must say. A per-server on/off setting is pushed to the plugin's local config by the Worker
-  (`archon.config`), since the plugin cannot ask the Panel at boot.
+- **Auto-render when the picture is missing.** The first time the server boots (or the plugin loads) and the image is
+  not there, generate it. Mechanism proven by the spike: in `OnServerInitialized`, if `map_<size>_<seed>.png` is
+  missing, run `world.rendermap`, whoever is online. Adds ~48 s to that boot, or a ~50 s pause if the plugin is loaded
+  onto a running server; on a wipe day that is a delay before the server opens, which the Panel setting text must say.
+  A per-server on/off setting is pushed to the plugin's local config by the Worker (`archon.config`), since the plugin
+  cannot ask the Panel at boot.
 - **Manual render** from the Panel with a players-online guard (refuse unless overridden) and `force` to
   overwrite. The Worker must expect ~1 minute of a slow/unresponsive server and must not mark it down.
 - **Upload, decoupled from boot:** the plugin holds no standing credential. After a render, `archon.map.status`

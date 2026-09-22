@@ -24,6 +24,8 @@ public class ServerReportsPaneTests : BunitContext
 {
     private readonly Mock<IRustServerApiClient> _client = new();
     private readonly Guid _serverId = Guid.NewGuid();
+    private readonly Guid _alice = Guid.NewGuid();
+    private readonly Guid _bob = Guid.NewGuid();
     private int _lastNewCount = -1;
 
     public ServerReportsPaneTests()
@@ -31,19 +33,36 @@ public class ServerReportsPaneTests : BunitContext
         JSInterop.Mode = JSRuntimeMode.Loose;
         Services.AddSingleton(_client.Object);
         Services.AddSingleton(ReportTestSupport.Localizer());
+        Services.AddSingleton(ReportTestSupport.UserNames((_alice, "alice@example.com"), (_bob, "bob@example.com")));
         GivenReports();
         _client.Setup(c => c.GetReportCountAsync(_serverId)).ReturnsAsync(new ServerReportCountDto { New = 2 });
+        _client.Setup(c => c.GetReportAssigneesAsync(_serverId)).ReturnsAsync([_alice, _bob]);
+        _client.Setup(c => c.GetReportNotesAsync(_serverId, It.IsAny<Guid>())).ReturnsAsync([]);
     }
 
     private static ServerReportDto Report(
         string subject = "Cheating", ServerReportType type = ServerReportType.Cheat, ServerReportStatus status = ServerReportStatus.New,
         string message = "aimbot", string? reporter = "Reporter", string? target = "Cheater", bool screenshot = false,
-        string? pluginDetail = null, bool parseFailed = false, ServerReportSource source = ServerReportSource.Native) => new()
+        string? pluginDetail = null, bool parseFailed = false, ServerReportSource source = ServerReportSource.Native,
+        Guid? assignedTo = null) => new()
     {
         Id = Guid.NewGuid(), RustServerId = Guid.Empty, ReceivedAtUtc = new DateTimeOffset(2026, 9, 20, 12, 0, 0, TimeSpan.Zero),
         Type = type, Status = status, Subject = subject, Message = message, ReporterName = reporter, ReporterSteamId = "76561198000000002",
         TargetName = target, TargetSteamId = "76561198000000001", Position = "(10, 20, 30)", MinutesPlayed = 42,
-        HasScreenshot = screenshot, PluginDetailJson = pluginDetail, ParseFailed = parseFailed, Source = source
+        HasScreenshot = screenshot, PluginDetailJson = pluginDetail, ParseFailed = parseFailed, Source = source, AssignedToUserId = assignedTo
+    };
+
+    /// <summary>What the Api answers once a report has been assigned: the same report, a different assignee.</summary>
+    private static ServerReportDto AssignedTo(ServerReportDto report, Guid? assignee)
+    {
+        var copy = System.Text.Json.JsonSerializer.Deserialize<ServerReportDto>(System.Text.Json.JsonSerializer.Serialize(report))!;
+        copy.AssignedToUserId = assignee;
+        return copy;
+    }
+
+    private static ServerReportNoteDto Note(Guid author, string content, int minute = 0) => new()
+    {
+        Id = Guid.NewGuid(), AuthorUserId = author, Content = content, CreatedOn = new DateTimeOffset(2026, 9, 20, 13, minute, 0, TimeSpan.Zero)
     };
 
     private void GivenReports(params ServerReportDto[] reports) =>
@@ -435,6 +454,282 @@ public class ServerReportsPaneTests : BunitContext
         cut.Find("[data-testid=report-set-actioned]").Click();
 
         Assert.Contains("Failed to change", cut.WaitForElement("[data-testid=reports-error]").TextContent);
+    }
+
+    // ---- assignment ----
+
+    private static string[] OptionTexts(IRenderedComponent<ServerReportsPane> cut) =>
+        cut.FindAll("[data-testid=report-assignee] option").Select(o => o.TextContent.Trim()).ToArray();
+
+    [Fact]
+    public void TheListShowsWhoEachReportIsAssignedToOrADashWhenNobodyIs()
+    {
+        GivenReports(Report(assignedTo: _alice), Report());
+
+        var cut = RenderPane();
+
+        var cells = cut.FindAll("[data-testid=report-assignee-cell]");
+        Assert.Contains("alice@example.com", cells[0].TextContent);
+        Assert.Equal("—", cells[1].TextContent.Trim());
+    }
+
+    [Fact]
+    public void OpeningAReportOffersTheMembersWhoCanActOnItWithTheCurrentAssigneeChosen()
+    {
+        GivenReports(Report(assignedTo: _bob));
+        var cut = RenderPane();
+
+        OpenFirst(cut);
+
+        Assert.Equal(["Unassigned", "alice@example.com", "bob@example.com"], OptionTexts(cut));
+        var chosen = cut.FindAll("[data-testid=report-assignee] option").Single(o => o.HasAttribute("selected"));
+        Assert.Equal("bob@example.com", chosen.TextContent.Trim());
+    }
+
+    [Fact]
+    public void AnAssigneeWhoCanNoLongerActOnReportsIsStillShownSoThePickerTellsTheTruth()
+    {
+        var gone = Guid.NewGuid();
+        GivenReports(Report(assignedTo: gone));
+        var cut = RenderPane();
+
+        OpenFirst(cut);
+
+        Assert.Contains(gone.ToString()[..8], OptionTexts(cut));
+    }
+
+    [Fact]
+    public void ChoosingSomeoneAssignsTheReportToThemAndTheListShowsIt()
+    {
+        var report = Report();
+        GivenReports(report);
+        _client.Setup(c => c.AssignReportAsync(_serverId, report.Id, It.Is<AssignServerReportDto>(d => d.AssignedToUserId == _alice)))
+            .ReturnsAsync(AssignedTo(report, _alice));
+        var cut = RenderPane();
+        OpenFirst(cut);
+
+        cut.Find("[data-testid=report-assignee]").Change(_alice.ToString());
+
+        cut.WaitForAssertion(() => Assert.Contains("alice@example.com", cut.Find("[data-testid=report-assignee-cell]").TextContent));
+        _client.Verify(c => c.AssignReportAsync(_serverId, report.Id, It.Is<AssignServerReportDto>(d => d.AssignedToUserId == _alice)), Times.Once);
+    }
+
+    [Fact]
+    public void ChoosingUnassignedTakesTheAssignmentBack()
+    {
+        var report = Report(assignedTo: _alice);
+        GivenReports(report);
+        _client.Setup(c => c.AssignReportAsync(_serverId, report.Id, It.Is<AssignServerReportDto>(d => d.AssignedToUserId == null)))
+            .ReturnsAsync(AssignedTo(report, null));
+        var cut = RenderPane();
+        OpenFirst(cut);
+
+        cut.Find("[data-testid=report-assignee]").Change("");
+
+        cut.WaitForAssertion(() => Assert.Equal("—", cut.Find("[data-testid=report-assignee-cell]").TextContent.Trim()));
+    }
+
+    [Fact]
+    public void ACallerWhoCannotManageReportsSeesTheAssigneeButCannotChangeIt()
+    {
+        GivenReports(Report(assignedTo: _alice));
+        _client.Setup(c => c.GetReportAssigneesAsync(_serverId)).ThrowsAsync(ReportTestSupport.Forbidden);
+        var cut = RenderPane();
+
+        OpenFirst(cut);
+
+        Assert.Contains("alice@example.com", cut.Find("[data-testid=report-assignee-text]").TextContent);
+        Assert.Empty(cut.FindAll("[data-testid=report-assignee]"));
+        Assert.Empty(cut.FindAll("[data-testid=reports-error]"));
+    }
+
+    [Fact]
+    public void ARefusedAssignmentIsExplainedAndTheAssigneeStaysAsItWas()
+    {
+        var report = Report(assignedTo: _alice);
+        GivenReports(report);
+        _client.Setup(c => c.AssignReportAsync(It.IsAny<Guid>(), It.IsAny<Guid>(), It.IsAny<AssignServerReportDto>()))
+            .ThrowsAsync(ReportTestSupport.Refused(HttpStatusCode.BadRequest));
+        var cut = RenderPane();
+        OpenFirst(cut);
+
+        cut.Find("[data-testid=report-assignee]").Change(_bob.ToString());
+
+        Assert.Contains("cannot be assigned", cut.WaitForElement("[data-testid=report-assign-error]").TextContent);
+        Assert.Contains("alice@example.com", cut.Find("[data-testid=report-assignee-cell]").TextContent);
+    }
+
+    [Fact]
+    public void AFailedAssignmentIsShownAsAnError()
+    {
+        GivenReports(Report());
+        _client.Setup(c => c.AssignReportAsync(It.IsAny<Guid>(), It.IsAny<Guid>(), It.IsAny<AssignServerReportDto>()))
+            .ThrowsAsync(new InvalidOperationException("boom"));
+        var cut = RenderPane();
+        OpenFirst(cut);
+
+        cut.Find("[data-testid=report-assignee]").Change(_alice.ToString());
+
+        Assert.Contains("Failed to assign", cut.WaitForElement("[data-testid=report-assign-error]").TextContent);
+    }
+
+    [Fact]
+    public void TheAssigneeChoicesAreFetchedOnceNotForEveryReportOpened()
+    {
+        GivenReports(Report("One"), Report("Two"));
+        var cut = RenderPane();
+
+        cut.FindAll("[data-testid=report-row]")[0].Click();
+        cut.FindAll("[data-testid=report-row]")[1].Click();
+
+        _client.Verify(c => c.GetReportAssigneesAsync(_serverId), Times.Once);
+    }
+
+    // ---- notes ----
+
+    [Fact]
+    public void OpeningAReportShowsItsNotesWithWhoWroteThemOldestFirst()
+    {
+        var report = Report();
+        GivenReports(report);
+        _client.Setup(c => c.GetReportNotesAsync(_serverId, report.Id)).ReturnsAsync([Note(_alice, "Watched the demo."), Note(_bob, "Agreed - banning.", minute: 5)]);
+        var cut = RenderPane();
+
+        OpenFirst(cut);
+
+        var notes = cut.FindAll("[data-testid=report-note]");
+        Assert.Equal(2, notes.Count);
+        Assert.Contains("Watched the demo.", notes[0].TextContent);
+        Assert.Contains("alice@example.com", notes[0].TextContent);
+        Assert.Contains("Agreed - banning.", notes[1].TextContent);
+        Assert.Contains("bob@example.com", notes[1].TextContent);
+    }
+
+    [Fact]
+    public void AReportWithNoNotesSaysSo()
+    {
+        GivenReports(Report());
+        var cut = RenderPane();
+
+        OpenFirst(cut);
+
+        Assert.Contains("No notes yet", cut.Find("[data-testid=report-notes-empty]").TextContent);
+    }
+
+    /// <summary>A note is typed by a member, but it is still text into a page: markup in it must render as text.</summary>
+    [Fact]
+    public void MarkupInANoteIsShownAsTextNeverExecuted()
+    {
+        var report = Report();
+        GivenReports(report);
+        _client.Setup(c => c.GetReportNotesAsync(_serverId, report.Id)).ReturnsAsync([Note(_alice, "<script>alert('xss')</script><b>bold</b>")]);
+        var cut = RenderPane();
+
+        OpenFirst(cut);
+
+        Assert.Empty(cut.FindAll("[data-testid=report-notes] script"));
+        Assert.Empty(cut.FindAll("[data-testid=report-notes] b"));
+        Assert.Contains("<script>alert('xss')</script>", cut.Find("[data-testid=report-note]").TextContent);
+    }
+
+    [Fact]
+    public void AddingANoteSavesItShowsItAndClearsTheBox()
+    {
+        var report = Report();
+        GivenReports(report);
+        _client.Setup(c => c.AddReportNoteAsync(_serverId, report.Id, It.IsAny<SaveServerReportNoteDto>()))
+            .ReturnsAsync(Note(_bob, "Checked the demo; clean."));
+        var cut = RenderPane();
+        OpenFirst(cut);
+
+        cut.Find("[data-testid=report-note-input]").Input("Checked the demo; clean.");
+        cut.Find("[data-testid=report-note-add]").Click();
+
+        cut.WaitForAssertion(() => Assert.Contains("Checked the demo; clean.", cut.Find("[data-testid=report-note]").TextContent));
+        _client.Verify(c => c.AddReportNoteAsync(_serverId, report.Id, It.Is<SaveServerReportNoteDto>(d => d.Content == "Checked the demo; clean.")), Times.Once);
+        Assert.True(cut.Find("[data-testid=report-note-add]").HasAttribute("disabled")); // the box is empty again
+    }
+
+    [Fact]
+    public void ABlankNoteCannotBeAdded()
+    {
+        GivenReports(Report());
+        var cut = RenderPane();
+        OpenFirst(cut);
+
+        Assert.True(cut.Find("[data-testid=report-note-add]").HasAttribute("disabled"));
+
+        cut.Find("[data-testid=report-note-input]").Input("   ");
+        Assert.True(cut.Find("[data-testid=report-note-add]").HasAttribute("disabled"));
+
+        cut.Find("[data-testid=report-note-input]").Input("something");
+        Assert.False(cut.Find("[data-testid=report-note-add]").HasAttribute("disabled"));
+    }
+
+    [Fact]
+    public void ACallerWhoMayViewButNotChangeCannotAddANoteAndIsToldSo()
+    {
+        GivenReports(Report());
+        _client.Setup(c => c.AddReportNoteAsync(It.IsAny<Guid>(), It.IsAny<Guid>(), It.IsAny<SaveServerReportNoteDto>()))
+            .ThrowsAsync(ReportTestSupport.Forbidden);
+        var cut = RenderPane();
+        OpenFirst(cut);
+
+        cut.Find("[data-testid=report-note-input]").Input("hello");
+        cut.Find("[data-testid=report-note-add]").Click();
+
+        Assert.Contains("not allowed", cut.WaitForElement("[data-testid=report-notes-error]").TextContent);
+        Assert.Empty(cut.FindAll("[data-testid=report-note]"));
+    }
+
+    [Fact]
+    public void AFailedNoteIsShownAsAnErrorAndTheTextIsKept()
+    {
+        GivenReports(Report());
+        _client.Setup(c => c.AddReportNoteAsync(It.IsAny<Guid>(), It.IsAny<Guid>(), It.IsAny<SaveServerReportNoteDto>()))
+            .ThrowsAsync(new InvalidOperationException("boom"));
+        var cut = RenderPane();
+        OpenFirst(cut);
+
+        cut.Find("[data-testid=report-note-input]").Input("hello");
+        cut.Find("[data-testid=report-note-add]").Click();
+
+        Assert.Contains("Failed to add", cut.WaitForElement("[data-testid=report-notes-error]").TextContent);
+        Assert.False(cut.Find("[data-testid=report-note-add]").HasAttribute("disabled")); // still has text to retry with
+    }
+
+    [Fact]
+    public void NotesThatCannotBeLoadedAreSaidSoWithoutBreakingTheReport()
+    {
+        var report = Report(message: "still readable");
+        GivenReports(report);
+        _client.Setup(c => c.GetReportNotesAsync(_serverId, report.Id)).ThrowsAsync(new InvalidOperationException("boom"));
+        var cut = RenderPane();
+
+        OpenFirst(cut);
+
+        Assert.Contains("Failed to load the notes", cut.WaitForElement("[data-testid=report-notes-error]").TextContent);
+        Assert.Contains("still readable", cut.Find("[data-testid=report-message]").TextContent);
+    }
+
+    [Fact]
+    public void OpeningAnotherReportShowsItsOwnNotesAndDropsTheDraft()
+    {
+        var first = Report("One");
+        var second = Report("Two");
+        GivenReports(first, second);
+        _client.Setup(c => c.GetReportNotesAsync(_serverId, first.Id)).ReturnsAsync([Note(_alice, "about the first")]);
+        _client.Setup(c => c.GetReportNotesAsync(_serverId, second.Id)).ReturnsAsync([Note(_bob, "about the second")]);
+        var cut = RenderPane();
+        cut.FindAll("[data-testid=report-row]")[0].Click();
+        cut.Find("[data-testid=report-note-input]").Input("half-written");
+
+        cut.FindAll("[data-testid=report-row]")[1].Click();
+
+        var notes = cut.FindAll("[data-testid=report-note]");
+        Assert.Single(notes);
+        Assert.Contains("about the second", notes[0].TextContent);
+        Assert.True(cut.Find("[data-testid=report-note-add]").HasAttribute("disabled")); // the draft was for the other report
     }
 
     // ---- the address card ----

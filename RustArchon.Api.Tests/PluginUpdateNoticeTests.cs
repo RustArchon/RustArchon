@@ -9,11 +9,13 @@ using JumpStart.Data;
 using JumpStart.Repositories;
 using MassTransit;
 using Microsoft.AspNetCore.Mvc;
+using Microsoft.AspNetCore.SignalR;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Logging.Abstractions;
 using Moq;
 using RustArchon.Api.Controllers;
 using RustArchon.Api.Data;
+using RustArchon.Api.Hubs;
 using RustArchon.Api.Messaging;
 using RustArchon.Api.Repositories;
 using RustArchon.Messaging.Contracts;
@@ -226,6 +228,26 @@ public class PluginUpdateNoticeTests(PostgresFixture postgres) : IClassFixture<P
         public override DateTimeOffset GetUtcNow() => now;
     }
 
+    // What the watchers of a server hear: the hub, the group it addresses, and what is sent down it.
+    private readonly Mock<IClientProxy> _group = new();
+    private readonly Mock<IHubClients> _clients = new();
+
+    private PluginUpdatesCapturedConsumer NewConsumer(
+        IPluginUpdateNoticeRepository repository, Microsoft.Extensions.Logging.ILogger<PluginUpdatesCapturedConsumer>? logger = null)
+    {
+        _clients.Setup(c => c.Group(It.IsAny<string>())).Returns(_group.Object);
+        var hub = new Mock<IHubContext<RconHub>>();
+        hub.Setup(h => h.Clients).Returns(_clients.Object);
+        return new PluginUpdatesCapturedConsumer(repository, hub.Object, new FixedClock(T0), logger ?? new CapturingLogger<PluginUpdatesCapturedConsumer>());
+    }
+
+    private void VerifyWatchersToldTimes(Guid server, Times times)
+    {
+        _clients.Verify(c => c.Group(RconHub.GroupName(server)), times);
+        _group.Verify(
+            g => g.SendCoreAsync("ReceivePluginUpdatesChanged", It.Is<object?[]>(args => args.Length == 0), It.IsAny<CancellationToken>()), times);
+    }
+
     private static Task Consume(PluginUpdatesCapturedConsumer consumer, Guid tenant, Guid server, params PluginUpdateNoticeInfo[] infos)
     {
         var context = new Mock<ConsumeContext<PluginUpdatesCaptured>>();
@@ -238,7 +260,7 @@ public class PluginUpdateNoticeTests(PostgresFixture postgres) : IClassFixture<P
     {
         var h = await CreateAsync();
         var logger = new CapturingLogger<PluginUpdatesCapturedConsumer>();
-        var consumer = new PluginUpdatesCapturedConsumer(h.Repository, new FixedClock(T0), logger);
+        var consumer = NewConsumer(h.Repository, logger);
 
         await Consume(consumer, h.TenantId, h.ServerId, Info());
         await Consume(consumer, h.TenantId, h.ServerId, Info(lastMin: 5, times: 2));
@@ -255,7 +277,7 @@ public class PluginUpdateNoticeTests(PostgresFixture postgres) : IClassFixture<P
     {
         var h = await CreateAsync();
         var logger = new CapturingLogger<PluginUpdatesCapturedConsumer>();
-        var consumer = new PluginUpdatesCapturedConsumer(h.Repository, new FixedClock(T0), logger);
+        var consumer = NewConsumer(h.Repository, logger);
 
         await Consume(consumer, h.TenantId, h.ServerId, Info());
         await Consume(consumer, h.TenantId, h.ServerId, Info(latest: "4.0.0", lastMin: 60));
@@ -269,11 +291,62 @@ public class PluginUpdateNoticeTests(PostgresFixture postgres) : IClassFixture<P
     public async Task AnEmptyReportDoesNothing()
     {
         var h = await CreateAsync();
-        var consumer = new PluginUpdatesCapturedConsumer(h.Repository, new FixedClock(T0), new CapturingLogger<PluginUpdatesCapturedConsumer>());
+        var consumer = NewConsumer(h.Repository);
 
         await Consume(consumer, h.TenantId, h.ServerId);
 
         Assert.Empty(await RowsAsync(h));
+        VerifyWatchersToldTimes(h.ServerId, Times.Never());
+    }
+
+    // ---- telling the watchers (the Plugins tab's chip) ------------------------------------------------------
+
+    [Fact]
+    public async Task ANewNoticeTellsTheServersWatchersSomethingChangedAndNothingMore()
+    {
+        var h = await CreateAsync();
+        var consumer = NewConsumer(h.Repository);
+
+        await Consume(consumer, h.TenantId, h.ServerId, Info());
+
+        VerifyWatchersToldTimes(h.ServerId, Times.Once());
+    }
+
+    [Fact]
+    public async Task ANoticeThatMovesToANewerVersionTellsThemAgain()
+    {
+        var h = await CreateAsync();
+        var consumer = NewConsumer(h.Repository);
+        await Consume(consumer, h.TenantId, h.ServerId, Info());
+
+        await Consume(consumer, h.TenantId, h.ServerId, Info(latest: "4.0.0", lastMin: 60));
+
+        VerifyWatchersToldTimes(h.ServerId, Times.Exactly(2));
+    }
+
+    [Fact]
+    public async Task ARepeatOfWhatIsAlreadyHeldSaysNothingSoTheChipIsNotRefreshedForNoReason()
+    {
+        var h = await CreateAsync();
+        var consumer = NewConsumer(h.Repository);
+        await Consume(consumer, h.TenantId, h.ServerId, Info());
+
+        await Consume(consumer, h.TenantId, h.ServerId, Info(lastMin: 5, times: 2));
+
+        VerifyWatchersToldTimes(h.ServerId, Times.Once());   // only the first
+    }
+
+    [Fact]
+    public async Task AFailureToTellWatchersDoesNotLoseTheNotice()
+    {
+        var h = await CreateAsync();
+        var consumer = NewConsumer(h.Repository);
+        _group.Setup(g => g.SendCoreAsync(It.IsAny<string>(), It.IsAny<object?[]>(), It.IsAny<CancellationToken>()))
+            .ThrowsAsync(new InvalidOperationException("hub down"));
+
+        await Consume(consumer, h.TenantId, h.ServerId, Info());
+
+        Assert.Single(await RowsAsync(h));
     }
 
     [Fact]
@@ -283,7 +356,7 @@ public class PluginUpdateNoticeTests(PostgresFixture postgres) : IClassFixture<P
         var other = await CreateAsync();
         await Merge(owner, Info());
         var logger = new CapturingLogger<PluginUpdatesCapturedConsumer>();
-        var consumer = new PluginUpdatesCapturedConsumer(other.Repository, new FixedClock(T0), logger);
+        var consumer = NewConsumer(other.Repository, logger);
 
         await Consume(consumer, other.TenantId, owner.ServerId, Info(latest: "6.6.6", lastMin: 50));
 
@@ -294,7 +367,7 @@ public class PluginUpdateNoticeTests(PostgresFixture postgres) : IClassFixture<P
     // ---- the endpoint --------------------------------------------------------------------------------------
 
     private ServerPluginUpdatesController Controller(Harness h) =>
-        new(new RustServerRepository(h.Context), h.Repository, new ServerPluginRepository(h.Context));
+        new(new RustServerRepository(h.Context), h.Repository, new ServerPluginRepository(h.Context), new PluginDownloadLookupRepository(h.Context));
 
     private async Task AddServerAsync(Harness h, params (string Name, string Version)[] installed)
     {

@@ -59,6 +59,13 @@ public class ServerMapPaneTests : BunitContext
     private void GivenBases(params BaseTcDto[] tcs) =>
         _client.Setup(c => c.GetBasesAsync(_serverId)).ReturnsAsync(new BasesDto { Ready = true, Tcs = [.. tcs] });
 
+    /// <summary>What the Api answers while the plugin's first scan is still running: something was read, but it is not all of them.</summary>
+    private void GivenBasesStillBeingScanned(bool captured = true, params BaseTcDto[] tcs) =>
+        _client.Setup(c => c.GetBasesAsync(_serverId)).ReturnsAsync(new BasesDto
+        {
+            Ready = false, CapturedAtUtc = captured ? DateTimeOffset.UtcNow : null, Tcs = [.. tcs]
+        });
+
     private void GivenPlayers(params PositionSampleDto[] samples) =>
         _client.Setup(c => c.GetPositionsAsync(_serverId, It.IsAny<DateTimeOffset?>(), It.IsAny<DateTimeOffset?>(), It.IsAny<string?>(), It.IsAny<int>()))
             .ReturnsAsync(new PositionsDto { Samples = [.. samples] });
@@ -222,6 +229,242 @@ public class ServerMapPaneTests : BunitContext
     }
 
     // ---- the sensitive layers ---------------------------------------------------------------------------------------
+
+    // ---- the tooltip over a base -----------------------------------------------------------------------------------
+
+    [Fact]
+    public void EachBaseCarriesTheOwnerAndEveryoneAuthorizedOnItsCupboardForTheTooltip()
+    {
+        GivenImage();
+        var tc = Base(1, "76561198000000001", 10, 20, "Alice");
+        tc.Authorized = [
+            new BaseAuthorizedPlayerDto { PlayerId = "76561198000000001", Name = "Alice" },
+            new BaseAuthorizedPlayerDto { PlayerId = "76561198000000002", Name = "Bob" },
+            new BaseAuthorizedPlayerDto { PlayerId = "76561198000000003", Name = "" }];
+        GivenBases(tc);
+
+        var cut = RenderPane();
+        cut.WaitForAssertion(() => Assert.NotEmpty(JSInterop.Invocations["serverMap.draw"]));
+        var marker = DrawModel().GetProperty("bases")[0];
+
+        Assert.Equal("Alice", marker.GetProperty("owner").GetString());
+        // Someone with no known name is listed by their id rather than dropped or shown blank.
+        var authorized = marker.GetProperty("authorized").EnumerateArray().ToList();
+        Assert.Equal(["Alice", "Bob", "76561198000000003"], authorized.Select(a => a.GetProperty("name").GetString()));
+        // ...and every name keeps its id, which is what the pinned tooltip links it to that player's page by.
+        Assert.Equal(["76561198000000001", "76561198000000002", "76561198000000003"], authorized.Select(a => a.GetProperty("id").GetString()));
+    }
+
+    [Fact]
+    public void TheOwnersIdTravelsWithTheirNameSoTheTooltipCanLinkThemAndTheAddressItLinksToIsThePlayersPage()
+    {
+        GivenImage();
+        GivenBases(Base(1, "76561198000000001", 10, 20, "Alice"));
+
+        var cut = RenderPane();
+        cut.WaitForAssertion(() => Assert.NotEmpty(JSInterop.Invocations["serverMap.draw"]));
+        var model = DrawModel();
+
+        Assert.Equal("76561198000000001", model.GetProperty("bases")[0].GetProperty("ownerId").GetString());
+        // The same address the Players tab and the reports list link to, less the id (the script appends it, encoded).
+        Assert.Equal($"/servers/{_serverId}/players/", model.GetProperty("playerUrl").GetString());
+    }
+
+    [Fact]
+    public void EachBaseCarriesAllThreeCoordinatesForTheTooltipNotJustTheTwoTheMapDraws()
+    {
+        GivenImage();
+        var tc = Base(1, "76561198000000001", 379.2, -610.9, "CyberKnet");
+        tc.Y = 12.6;
+        GivenBases(tc);
+
+        var cut = RenderPane();
+        cut.WaitForAssertion(() => Assert.NotEmpty(JSInterop.Invocations["serverMap.draw"]));
+        var marker = DrawModel().GetProperty("bases")[0];
+
+        Assert.Equal(379.2, marker.GetProperty("x").GetDouble());
+        Assert.Equal(12.6, marker.GetProperty("y").GetDouble());
+        Assert.Equal(-610.9, marker.GetProperty("z").GetDouble());
+    }
+
+    [Fact]
+    public void ABaseNobodyIsAuthorizedOnStillHasAnOwnerAndAnEmptyList()
+    {
+        GivenImage();
+        GivenBases(Base(1, "76561198000000009", 10, 20));
+
+        var cut = RenderPane();
+        cut.WaitForAssertion(() => Assert.NotEmpty(JSInterop.Invocations["serverMap.draw"]));
+        var marker = DrawModel().GetProperty("bases")[0];
+
+        Assert.Equal("76561198000000009", marker.GetProperty("owner").GetString()); // no name known: the id, not blank
+        Assert.Equal(0, marker.GetProperty("authorized").GetArrayLength());
+    }
+
+    [Fact]
+    public void TheOwnersResolvedNameIsWhatTheTooltipCallsThem()
+    {
+        GivenImage();
+        var tc = Base(1, "76561198000000001", 10, 20);
+        tc.OwnerName = "Resolved Owner";
+        GivenBases(tc);
+
+        var cut = RenderPane();
+        cut.WaitForAssertion(() => Assert.NotEmpty(JSInterop.Invocations["serverMap.draw"]));
+
+        Assert.Equal("Resolved Owner", DrawModel().GetProperty("bases")[0].GetProperty("owner").GetString());
+    }
+
+    [Fact]
+    public void TheModelCarriesTheWordsTheTooltipNeedsBecauseTheCanvasScriptCannotTranslate()
+    {
+        GivenImage();
+
+        var cut = RenderPane();
+        cut.WaitForAssertion(() => Assert.NotEmpty(JSInterop.Invocations["serverMap.draw"]));
+        var labels = DrawModel().GetProperty("labels");
+
+        Assert.Equal("Owner", labels.GetProperty("owner").GetString());
+        Assert.Equal("Authorized", labels.GetProperty("authorized").GetString());
+        Assert.Equal("Nobody", labels.GetProperty("nobody").GetString());
+        Assert.Contains("{0}", labels.GetProperty("more").GetString());
+        Assert.Equal("Close", labels.GetProperty("close").GetString()); // the pinned tooltip's close button
+        Assert.Equal("Location", labels.GetProperty("location").GetString());
+        Assert.Equal("height", labels.GetProperty("height").GetString());
+    }
+
+    // ---- the "being generated" note and the recording warning --------------------------------------------------------
+
+    [Fact]
+    public void WhileTheMapIsBeingGeneratedTheNoteSaysSoWithAnEstimate()
+    {
+        GivenMap(available: false);
+
+        var cut = RenderPane();
+
+        var note = cut.WaitForElement("[data-testid=map-pending]").TextContent;
+        Assert.Contains("being generated", note);
+        Assert.Contains("15 minutes", note);
+    }
+
+    [Fact]
+    public void WithRecordingOffTheMapWarnsThatPlayersAndBasesAreNotBeingKeptUpToDate()
+    {
+        GivenImage();
+
+        var cut = Render<ServerMapPane>(p => p
+            .Add(x => x.ServerId, _serverId).Add(x => x.PluginListed, true).Add(x => x.PluginSupportsMap, true).Add(x => x.RecordingEnabled, false));
+
+        Assert.Contains("not being kept up to date", cut.WaitForElement("[data-testid=map-recording-off]").TextContent);
+    }
+
+    [Fact]
+    public void WithRecordingOnThereIsNoRecordingWarning()
+    {
+        GivenImage();
+
+        var cut = RenderPane();
+        cut.WaitForAssertion(() => Assert.NotEmpty(JSInterop.Invocations["serverMap.draw"]));
+
+        Assert.Empty(cut.FindAll("[data-testid=map-recording-off]"));
+    }
+
+    // ---- the "still scanning" notice --------------------------------------------------------------------------------
+
+    [Fact]
+    public void WhileThePluginIsStillScanningTheWorldTheMapSaysItMayNotShowEveryBase()
+    {
+        GivenImage();
+        GivenBasesStillBeingScanned(captured: true, Base(1, "76561198000000001", 10, 20, "Alice"));
+
+        var cut = RenderPane();
+        cut.WaitForAssertion(() => Assert.NotEmpty(JSInterop.Invocations["serverMap.draw"]));
+
+        Assert.Contains("still scanning", cut.Find("[data-testid=map-bases-not-ready]").TextContent);
+        Assert.Single(DrawModel().GetProperty("bases").EnumerateArray()); // and what was found is still drawn
+    }
+
+    [Fact]
+    public void OnceTheScanIsCompleteThereIsNoNotice()
+    {
+        GivenImage();
+        GivenBases(Base(1, "76561198000000001", 10, 20, "Alice")); // Ready = true
+
+        var cut = RenderPane();
+        cut.WaitForAssertion(() => Assert.NotEmpty(JSInterop.Invocations["serverMap.draw"]));
+
+        Assert.Empty(cut.FindAll("[data-testid=map-bases-not-ready]"));
+    }
+
+    [Fact]
+    public void NothingReadYetIsAnEmptyMapNotAnIncompleteOneSoThereIsNoNotice()
+    {
+        GivenImage();
+        GivenBasesStillBeingScanned(captured: false);
+
+        var cut = RenderPane();
+        cut.WaitForAssertion(() => Assert.NotEmpty(JSInterop.Invocations["serverMap.draw"]));
+
+        Assert.Empty(cut.FindAll("[data-testid=map-bases-not-ready]"));
+    }
+
+    [Fact]
+    public void TheNoticeGoesWhenTheBasesLayerIsSwitchedOffAndComesBackWhenItIsSwitchedOn()
+    {
+        GivenImage();
+        GivenBasesStillBeingScanned();
+        var cut = RenderPane();
+        cut.WaitForAssertion(() => Assert.NotEmpty(cut.FindAll("[data-testid=map-bases-not-ready]")));
+
+        cut.Find("[data-testid=map-toggle-bases]").Change(false);
+        cut.WaitForAssertion(() => Assert.Empty(cut.FindAll("[data-testid=map-bases-not-ready]")));
+
+        cut.Find("[data-testid=map-toggle-bases]").Change(true);
+        cut.WaitForAssertion(() => Assert.NotEmpty(cut.FindAll("[data-testid=map-bases-not-ready]")));
+    }
+
+    [Fact]
+    public void WithoutTheBasesPermissionThereIsNoNoticeAboutAListThePersonCannotSee()
+    {
+        GivenImage();
+        _client.Setup(c => c.GetBasesAsync(_serverId)).ThrowsAsync(Forbidden);
+
+        var cut = RenderPane();
+        cut.WaitForAssertion(() => Assert.NotEmpty(cut.FindAll("[data-testid=map-layers-forbidden]")));
+
+        Assert.Empty(cut.FindAll("[data-testid=map-bases-not-ready]"));
+    }
+
+    [Fact]
+    public void RefreshingAfterTheScanFinishesRemovesTheNotice()
+    {
+        GivenImage();
+        GivenBasesStillBeingScanned();
+        var cut = RenderPane();
+        cut.WaitForAssertion(() => Assert.NotEmpty(cut.FindAll("[data-testid=map-bases-not-ready]")));
+
+        GivenBases(Base(1, "76561198000000001", 10, 20, "Alice")); // the plugin finished
+        cut.Find("[data-testid=map-refresh]").Click();
+
+        cut.WaitForAssertion(() => Assert.Empty(cut.FindAll("[data-testid=map-bases-not-ready]")));
+    }
+
+    [Fact]
+    public void TheHoverHintIsShownWhileTheBasesLayerIsAvailableAndGoneWithoutIt()
+    {
+        GivenImage();
+        var cut = RenderPane();
+        cut.WaitForAssertion(() => Assert.NotEmpty(JSInterop.Invocations["serverMap.draw"]));
+        var hint = cut.Find("[data-testid=map-hover-hint]").TextContent;
+        Assert.Contains("authorized", hint);
+        Assert.Contains("Click or tap", hint); // and how to keep it open
+
+        _client.Setup(c => c.GetBasesAsync(_serverId)).ThrowsAsync(Forbidden);
+        var withoutPermission = RenderPane();
+        withoutPermission.WaitForAssertion(() => Assert.NotEmpty(withoutPermission.FindAll("[data-testid=map-layers-forbidden]")));
+
+        Assert.Empty(withoutPermission.FindAll("[data-testid=map-hover-hint]"));
+    }
 
     [Fact]
     public void ABaseIsLabelledWithTheOwnersResolvedNameEvenWhenTheyAreNotOnTheirOwnCupboard()

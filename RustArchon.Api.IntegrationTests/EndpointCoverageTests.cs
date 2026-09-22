@@ -124,6 +124,11 @@ public class EndpointCoverageTests(ApiFactory factory) : IClassFixture<ApiFactor
         "Organization.Create",
         "Organization.PlanOptions",
         "Organization.Founded",
+
+        // A person's own settings (their language). They belong to the person, not to any organization, so there is no tenant to scope a permission to.
+        // The route names nobody: the person is whoever the request is signed in as, so it can neither read nor change anyone else's.
+        "UserProfile.Get",
+        "UserProfile.Put",
     };
 
     /// <summary>Endpoints authenticated by the shared internal-service key rather than a user token.</summary>

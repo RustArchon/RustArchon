@@ -18,6 +18,38 @@ namespace Oxide.Core
     }
 }
 
+// Mirrors the real Carbon/Oxide types the plugin reads to see whether another plugin is loaded (checked against Carbon.Common.dll on the live server's
+// files: Plugin.Name and Version come from its base, IsLoaded is on Plugin, and RustPlugin.plugins is an Oxide.Core.Libraries.Plugins with Find/Exists).
+namespace Oxide.Core.Plugins
+{
+    public class Plugin
+    {
+        public string Name = "";
+
+        // Real plugins get this from the framework; the tests use whatever the plugin's [Info] says.
+        public Oxide.Core.VersionNumber Version = new Oxide.Core.VersionNumber("0.1.0");
+
+        public bool IsLoaded = true;
+    }
+}
+
+namespace Oxide.Core.Libraries
+{
+    public class Plugins
+    {
+        // Test helper, not part of the real API: the plugins this stand-in says are loaded, by name.
+        public readonly Dictionary<string, Oxide.Core.Plugins.Plugin> Loaded = new Dictionary<string, Oxide.Core.Plugins.Plugin>();
+
+        public Oxide.Core.Plugins.Plugin Find(string name)
+        {
+            Oxide.Core.Plugins.Plugin found;
+            return Loaded.TryGetValue(name, out found) ? found : null;
+        }
+
+        public bool Exists(string name) { return Loaded.ContainsKey(name); }
+    }
+}
+
 namespace Oxide.Plugins
 {
     public class InfoAttribute : Attribute
@@ -67,14 +99,15 @@ namespace Oxide.Plugins
         }
     }
 
-    public class RustPlugin
+    public class RustPlugin : Oxide.Core.Plugins.Plugin
     {
         public readonly List<string> Log = new List<string>();
 
         protected PluginTimers timer = new PluginTimers();
 
-        // Real plugins get this from the framework; the tests use whatever the plugin's [Info] says.
-        public Oxide.Core.VersionNumber Version = new Oxide.Core.VersionNumber("0.1.0");
+        // The framework's registry of loaded plugins (the real field is an Oxide.Core.Libraries.Plugins, with Find and Exists). Public here only
+        // so a test can say which plugins are loaded.
+        public readonly Oxide.Core.Libraries.Plugins plugins = new Oxide.Core.Libraries.Plugins();
 
         protected void Puts(string message) { Log.Add(message); }
         // Recorded so tests can see which hooks are switched on: "+Hook" for Subscribe, "-Hook" for Unsubscribe.

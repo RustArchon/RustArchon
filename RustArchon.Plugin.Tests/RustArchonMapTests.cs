@@ -8,9 +8,9 @@ using ArchonPlugin = Oxide.Plugins.RustArchon;
 namespace RustArchon.Plugin.Tests;
 
 /// <summary>
-/// The map: when a render is allowed (never with players online unless overridden, never over an existing picture unless
-/// asked, never twice at once), that the command replies before the game freezes, what the outcome reports, the automatic
-/// render on load, the monument list, and the <c>map</c> switch. The world, its monuments and the connected players are
+/// The map: when a render is allowed (the manual command never with players online unless overridden, never over an existing
+/// picture unless asked, never twice at once), that the command replies before the game freezes, what the outcome reports, the
+/// automatic render on load (whenever there is no picture yet, whoever is online), the monument list, and the <c>map</c> switch. The world, its monuments and the connected players are
 /// stub statics, so these tests run one at a time.
 /// </summary>
 [Collection("World")]
@@ -310,7 +310,7 @@ public sealed class RustArchonMapTests : IDisposable
     // ---- the automatic render ------------------------------------------------------------------------------------
 
     [Fact]
-    public void ANewWorldWithNobodyOnlineIsRenderedAutomaticallyAfterAShortDelay()
+    public void ANewWorldWithNoPictureIsRenderedAutomaticallyAfterAShortDelay()
     {
         var plugin = Loaded();
 
@@ -332,15 +332,33 @@ public sealed class RustArchonMapTests : IDisposable
         Assert.Empty(Timers(plugin).Once_);
     }
 
+    /// <summary>
+    /// The rule is "no picture yet, so make it": it does not wait for the server to be empty. (A plugin loaded onto a running server
+    /// is the case this is for - that is how a new customer starts.) The guard is on the manual command only.
+    /// </summary>
     [Fact]
-    public void NothingIsRenderedAutomaticallyWithPlayersOnline()
+    public void AMissingPictureIsRenderedAutomaticallyEvenWithPlayersOnline()
     {
         Join(Alice);
         var plugin = Loaded();
 
         Server(plugin);
 
-        Assert.Empty(Timers(plugin).Once_);
+        var once = Assert.Single(Timers(plugin).Once_);
+        Assert.Equal(10f, once.Key);
+    }
+
+    [Fact]
+    public void TheAutomaticRenderStillRunsTheGameCommandOnceItsTimerFiresWithPlayersOnline()
+    {
+        Join(Alice);
+        var calls = new List<string>();
+        var plugin = Loaded(render: c => { calls.Add(c); File.WriteAllBytes(MapFile, new byte[100]); });
+        Server(plugin);
+
+        Assert.Single(Timers(plugin).Once_).Value();
+
+        Assert.Equal(["world.rendermap"], calls);
     }
 
     [Fact]

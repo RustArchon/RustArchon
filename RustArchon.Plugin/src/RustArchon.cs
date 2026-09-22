@@ -23,7 +23,7 @@ using UnityEngine;
 
 namespace Oxide.Plugins
 {
-    [Info("RustArchon", "RustArchon", "0.9.0")]
+    [Info("RustArchon", "RustArchon", "0.10.0")]
     [Description("RustArchon companion plugin. Dormant until the RustArchon panel asks; every command is RCON-only.")]
     public class RustArchon : RustPlugin
     {
@@ -38,7 +38,12 @@ namespace Oxide.Plugins
         // What this build can actually do. A capability is listed only once its code exists, so the panel
         // never enables a feature the installed plugin cannot perform. "recording" and "combat" arrive with
         // their hooks in a later phase; until then only the settings channel itself is offered.
-        private static readonly string[] Capabilities = { "config", "combat", "tcs", "positions", "map", "updates", "updater-update" };
+        private static readonly string[] Capabilities = { "config", "combat", "tcs", "positions", "map", "updates", "updater-update", "thirdparty-update" };
+
+        // Advertised right after "thirdparty-update", and only when the zip reader can actually be resolved at run time (see ArchonZipArchive):
+        // the file is compiled by the game server's own compiler, which may not reference System.IO.Compression, so nothing here depends on it
+        // at compile time. A server that cannot load it keeps every other capability and only loses this one.
+        internal const string ThirdPartyZipCapability = "thirdparty-zip";
 
         // Set by Init unless something (a test) supplied a path first.
         internal string SettingsFilePath;
@@ -75,6 +80,7 @@ namespace Oxide.Plugins
 
             WriteLoadedMarker();
             ResumeUpdaterSwap();
+            ResumeThirdPartySwap();
 
             // Dormant by default: the damage hooks fire for every hit on every entity, so they are only subscribed
             // while the Combat log switch is on (see ApplyCombatSubscription).
@@ -643,6 +649,1194 @@ namespace Oxide.Plugins
             }
         }
 
+        // ---- third-party plugin updates ----------------------------------------------------------------------
+        //
+        // The panel has found a newer version of a plugin that is already installed on this server, downloaded it once itself to check it was a file
+        // this could apply, and recorded its SHA-256 and size. It sends those here; this plugin downloads its OWN copy (the panel never stores or serves
+        // these files), and applies it only if it is byte for byte the file the panel checked. Then the same care as the Updater takes over this
+        // plugin's own file: the old file is kept beside it as <name>.cs.bak, and if the new one does not come up loaded at the version that was
+        // asked for, the old one is put back.
+        //
+        // Only ever an UPDATE of a plugin that is present: it will not install one that is missing. Fails closed like the Updater: a plugin that
+        // cannot vouch for its own file (signed by the panel that manages it) applies nothing on anyone's say-so.
+        //
+        // What "loaded" means here: the framework's own registry (plugins.Find) holds a plugin of that name at that version, and it is not the same
+        // instance that was running before the swap. A plugin that never loads - a compile error, say - never appears, and after ThirdPartyLoadWaitSeconds
+        // the previous file is put back.
+
+        internal const string ThirdPartySwapFileName = "thirdparty-swap.txt";
+        internal const int ThirdPartyLoadWaitSeconds = 90;
+        internal const int ThirdPartyMinimumReloadSeconds = 15;
+
+        internal ArchonThirdParty.State ThirdParty = new ArchonThirdParty.State();
+        internal Func<string, long, byte[]> ThirdPartyDownload = ArchonThirdParty.DefaultDownload;
+
+        // A test can say which plugins are loaded without a framework behind it; at runtime this asks the framework.
+        internal Func<string, ArchonThirdParty.LoadedPlugin> FindLoaded = null;
+
+        // A test can make the zip reader unavailable (or supply one); at runtime this looks System.IO.Compression up by name. Null means "cannot".
+        internal Func<Type> ZipTypeLoader = ArchonZipArchive.DefaultLoadType;
+
+        private Type _zipType;
+        private bool _zipChecked;
+        private List<ArchonZipMapping.Rule> _thirdPartyZipRules;
+        private long _thirdPartyInstallBytes;
+
+        private ArchonThirdParty.Download _thirdPartyDownload;
+        private Timer _thirdPartyTimer;
+        private object _thirdPartyOldInstance;
+
+        // archon.thirdparty.update <class> <version> <sha256> <size> <url>
+        [ConsoleCommand("archon.thirdparty.update")]
+        internal void CmdThirdPartyUpdate(ConsoleSystem.Arg arg)
+        {
+            if (arg.Connection != null) { return; }
+
+            if (!arg.HasArgs(5) || arg.HasArgs(6))
+            {
+                arg.ReplyWith(ArchonJson.Err("usage", "archon.thirdparty.update <class> <version> <sha256> <size> <url>"));
+                return;
+            }
+
+            arg.ReplyWith(BeginThirdPartyUpdate(
+                arg.GetString(0, ""), arg.GetString(1, ""), arg.GetString(2, ""), arg.GetString(3, ""), arg.GetString(4, "")));
+        }
+
+        // archon.thirdparty.zip <class> <version> <sha256> <size> <installBytes> <rules> <url>
+        // The same update for a plugin that ships as a ZIP archive: <size> is the archive's length, <installBytes> the most the files to be installed may
+        // add up to, <rules> the person's folder rules (ZipMapping.Encode on the panel's side).
+        [ConsoleCommand("archon.thirdparty.zip")]
+        internal void CmdThirdPartyZip(ConsoleSystem.Arg arg)
+        {
+            if (arg.Connection != null) { return; }
+
+            if (!arg.HasArgs(7) || arg.HasArgs(8))
+            {
+                arg.ReplyWith(ArchonJson.Err("usage", "archon.thirdparty.zip <class> <version> <sha256> <size> <installBytes> <rules> <url>"));
+                return;
+            }
+
+            arg.ReplyWith(BeginThirdPartyZip(
+                arg.GetString(0, ""), arg.GetString(1, ""), arg.GetString(2, ""), arg.GetString(3, ""), arg.GetString(4, ""), arg.GetString(5, ""), arg.GetString(6, "")));
+        }
+
+        // archon.thirdparty.status - the most recent third-party update this plugin carried out (or is carrying out).
+        [ConsoleCommand("archon.thirdparty.status")]
+        internal void CmdThirdPartyStatus(ConsoleSystem.Arg arg)
+        {
+            if (arg.Connection != null) { return; }
+
+            arg.ReplyWith(ArchonJson.Ok(ThirdParty.ToJson()));
+        }
+
+        internal string BeginThirdPartyUpdate(string className, string version, string sha256, string sizeText, string url)
+        {
+            return BeginThirdParty(false, className, version, sha256, sizeText, url, null, null);
+        }
+
+        internal string BeginThirdPartyZip(string className, string version, string sha256, string sizeText, string installBytesText, string rulesText, string url)
+        {
+            return BeginThirdParty(true, className, version, sha256, sizeText, url, installBytesText, rulesText);
+        }
+
+        private string BeginThirdParty(bool zip, string className, string version, string sha256, string sizeText, string url, string installBytesText, string rulesText)
+        {
+            if (ThirdParty.Phase == ArchonThirdParty.PhaseDownloading || ThirdParty.Phase == ArchonThirdParty.PhaseLoading
+                || ThirdParty.Phase == ArchonThirdParty.PhaseApplying)
+            {
+                return ArchonJson.Err("busy", "a plugin update is already in progress (" + ThirdParty.Phase + ")");
+            }
+
+            if (Integrity.State != "valid" || !ArchonIntegrity.IsStamped(TrustedModulus, TrustedExponent))
+            {
+                return ArchonJson.Err("not_verified", "this plugin does not verify under its own key (" + Integrity.State + "), so it will not install anything");
+            }
+
+            if (!ArchonThirdParty.IsClassName(className) || className == "RustArchon" || className == "RustArchonUpdater")
+            {
+                return ArchonJson.Err("bad_class", "the plugin's class name must be a plain identifier, and not one of RustArchon's own");
+            }
+
+            if (!ArchonThirdParty.IsVersionText(version))
+            {
+                return ArchonJson.Err("bad_version", "the version must be 1 to " + ArchonThirdParty.MaxVersionLength + " letters, digits, dots, dashes or plus signs");
+            }
+
+            if (!ArchonThirdParty.IsSha256(sha256))
+            {
+                return ArchonJson.Err("bad_hash", "the hash must be 64 hexadecimal characters");
+            }
+
+            long size;
+            if (!long.TryParse(sizeText, out size) || size < 1)
+            {
+                return ArchonJson.Err("bad_size", "the size must be a whole number of bytes, at least 1");
+            }
+
+            if (size > ArchonThirdParty.MaxFileBytes)
+            {
+                return ArchonJson.Err("too_large", "a download of more than " + ArchonThirdParty.MaxFileBytes + " bytes is never fetched");
+            }
+
+            Uri uri;
+            if (!ArchonThirdParty.TryParseHttps(url, out uri))
+            {
+                return ArchonJson.Err("bad_url", "the address must be an absolute https address with no credentials in it, at most " + ArchonThirdParty.MaxUrlLength + " characters");
+            }
+
+            long installBytes = 0;
+            List<ArchonZipMapping.Rule> rules = null;
+            if (zip)
+            {
+                if (!long.TryParse(installBytesText, out installBytes) || installBytes < 1)
+                {
+                    return ArchonJson.Err("bad_install_bytes", "the number of bytes to install must be a whole number, at least 1");
+                }
+
+                if (installBytes > ArchonThirdParty.MaxInstallBytes)
+                {
+                    return ArchonJson.Err("too_large", "an archive that unpacks to more than " + ArchonThirdParty.MaxInstallBytes + " bytes is never installed");
+                }
+
+                rules = ArchonZipMapping.Decode(rulesText);
+                if (rules == null || ArchonZipMapping.Resolve(new List<ArchonZipMapping.EntryInfo>(), rules).Problems.Count > 0)
+                {
+                    return ArchonJson.Err("bad_rules", "the folder rules could not be read, or one of them is not one that can be used");
+                }
+
+                if (!ZipSupported())
+                {
+                    return ArchonJson.Err("zip_unsupported", "this server cannot read zip archives (System.IO.Compression could not be loaded)");
+                }
+            }
+
+            if (PluginDirectory == null || !Directory.Exists(PluginDirectory))
+            {
+                return ArchonJson.Err("plugins_folder_unknown", "the plugins folder this plugin lives in could not be found");
+            }
+
+            // Never while the Updater is replacing this plugin or the Updater: each would be watching the other move.
+            if (MainUpdateInProgress() || UpdaterSwap.Phase == ArchonUpdaterSwap.PhaseDownloading || UpdaterSwap.Phase == ArchonUpdaterSwap.PhaseLoading)
+            {
+                return ArchonJson.Err("busy", "an update of the RustArchon plugin or its Updater is in progress");
+            }
+
+            string target;
+            int found;
+            ArchonThirdParty.FindInstalled(PluginDirectory, className, out target, out found);
+            if (found == 0)
+            {
+                return ArchonJson.Err("not_installed", "no plugin file in the plugins folder declares a class named " + className + "; this only updates plugins that are installed");
+            }
+
+            if (found > 1)
+            {
+                return ArchonJson.Err("ambiguous", "more than one plugin file declares a class named " + className);
+            }
+
+            var installed = ArchonThirdParty.ReadInfoVersion(SafeReadText(target)) ?? "";
+            // A zip is never "up to date": the archive holds more than the one file that could be compared, and a person chose to apply it.
+            if (!zip && installed.Length > 0 && ArchonThirdParty.SameVersion(installed, version))
+            {
+                // The same version can still be a different file (an author who republished under it), but that is a person's decision to make, and
+                // the panel asks for it: the request then comes with the hash the person saw. Nothing here can tell it apart from a repeat.
+                if (ArchonThirdParty.Sha256Hex(SafeReadBytes(target)) == sha256.ToLowerInvariant())
+                {
+                    return ArchonJson.Err("up_to_date", "the installed file is already exactly this one");
+                }
+            }
+
+            _thirdPartyOldInstance = null;
+            var current = LookUpLoaded(className);
+            if (current != null) { _thirdPartyOldInstance = current.Instance; }
+
+            ThirdParty = new ArchonThirdParty.State
+            {
+                Phase = ArchonThirdParty.PhaseDownloading,
+                ClassName = className,
+                Target = version,
+                Previous = installed,
+                File = Path.GetFileName(target),
+                Sha256 = sha256.ToLowerInvariant(),
+                Size = size,
+                Kind = zip ? ArchonThirdParty.KindZip : ArchonThirdParty.KindCs,
+                StartedUtc = UtcNow()
+            };
+            _thirdPartyZipRules = rules;
+            _thirdPartyInstallBytes = installBytes;
+            SaveThirdParty();
+
+            var download = new ArchonThirdParty.Download();
+            _thirdPartyDownload = download;
+            var download_url = uri.AbsoluteUri;
+            var download_size = size;
+            RunInBackground(delegate
+            {
+                try
+                {
+                    download.Bytes = ThirdPartyDownload(download_url, download_size);
+                }
+                catch (ArchonThirdParty.ChangedException e)
+                {
+                    download.Changed = e.Message;
+                }
+                catch (Exception e)
+                {
+                    download.Error = e.GetType().Name + ": " + e.Message;
+                }
+                finally
+                {
+                    download.Done = true;
+                }
+            });
+
+            StartThirdPartyTicker();
+            return ArchonJson.Ok("{\"phase\":\"downloading\",\"file\":" + ArchonJson.Quote(ThirdParty.File)
+                + ",\"installedVersion\":" + ArchonJson.Quote(installed) + ",\"targetVersion\":" + ArchonJson.Quote(version)
+                + (zip ? ",\"kind\":\"zip\"" : "") + "}");
+        }
+
+        // Runs once a second, on the game thread, only while a third-party update is in progress.
+        internal void ThirdPartyTick()
+        {
+            if (ThirdParty.Phase == ArchonThirdParty.PhaseDownloading)
+            {
+                TickThirdPartyDownloading();
+            }
+            else if (ThirdParty.Phase == ArchonThirdParty.PhaseLoading)
+            {
+                TickThirdPartyLoading();
+            }
+            else
+            {
+                StopThirdPartyTicker();
+            }
+        }
+
+        private void TickThirdPartyDownloading()
+        {
+            var download = _thirdPartyDownload;
+            if (download == null || !download.Done)
+            {
+                if ((UtcNow() - ThirdParty.StartedUtc).TotalSeconds > ArchonThirdParty.DownloadTimeoutSeconds + 15)
+                {
+                    FailThirdParty("download_timeout", "no answer within " + (ArchonThirdParty.DownloadTimeoutSeconds + 15) + " seconds");
+                }
+                return;
+            }
+
+            if (download.Changed != null)
+            {
+                MismatchThirdParty("", download.Changed);
+                return;
+            }
+
+            if (download.Error != null || download.Bytes == null)
+            {
+                FailThirdParty("download_failed", download.Error ?? "no data");
+                return;
+            }
+
+            VerifyAndApplyThirdParty(download.Bytes);
+        }
+
+        private void VerifyAndApplyThirdParty(byte[] bytes)
+        {
+            // The whole point of the hash: this is the file the panel looked at, or it is not applied. The author changing a file without changing its
+            // version is possible (if bad practice), and the panel decides what to do about it - not this plugin, and not on its own.
+            var actual = ArchonThirdParty.Sha256Hex(bytes);
+            if (actual != ThirdParty.Sha256)
+            {
+                MismatchThirdParty(actual, "the file is not the one the panel checked");
+                return;
+            }
+
+            if (ThirdParty.Kind == ArchonThirdParty.KindZip)
+            {
+                ApplyThirdPartyZip(bytes);
+                return;
+            }
+
+            var text = Encoding.UTF8.GetString(bytes);
+            if (!ArchonThirdParty.DeclaresClass(text, ThirdParty.ClassName))
+            {
+                FailThirdParty("not_that_plugin", "the file does not declare a class named " + ThirdParty.ClassName);
+                return;
+            }
+
+            var offered = ArchonThirdParty.ReadInfoVersion(text);
+            if (offered != null && !ArchonThirdParty.SameVersion(offered, ThirdParty.Target))
+            {
+                FailThirdParty("version_mismatch", "asked for " + ThirdParty.Target + " but the file is " + offered);
+                return;
+            }
+
+            // Somebody may have changed the plugins folder while the download ran.
+            string target;
+            int found;
+            ArchonThirdParty.FindInstalled(PluginDirectory, ThirdParty.ClassName, out target, out found);
+            if (found != 1 || Path.GetFileName(target) != ThirdParty.File)
+            {
+                FailThirdParty("changed", "the installed plugin file was moved, replaced or duplicated while the download ran");
+                return;
+            }
+
+            if (MainUpdateInProgress() || UpdaterSwap.Phase == ArchonUpdaterSwap.PhaseDownloading || UpdaterSwap.Phase == ArchonUpdaterSwap.PhaseLoading)
+            {
+                FailThirdParty("busy", "an update of the RustArchon plugin or its Updater started while the download ran");
+                return;
+            }
+
+            ApplyThirdParty(bytes, target);
+        }
+
+        private void ApplyThirdParty(byte[] bytes, string target)
+        {
+            var temp = target + ".new";
+            var backup = target + ".bak";
+
+            try
+            {
+                File.WriteAllBytes(temp, bytes);
+                File.Copy(target, backup, true);
+                ThirdParty.SwapUtc = UtcNow();
+                ArchonUpdaterSwap.SwapInto(temp, target);
+            }
+            catch (Exception e)
+            {
+                ArchonUpdaterSwap.TryDelete(temp);
+                FailThirdParty("apply_failed", e.GetType().Name + ": " + e.Message);
+                return;
+            }
+
+            ThirdParty.Phase = ArchonThirdParty.PhaseLoading;
+            ThirdParty.Reason = "";
+            SaveThirdParty();
+            Puts("Swapped in " + ThirdParty.File + " " + ThirdParty.Target + "; waiting for it to load.");
+        }
+
+        private void TickThirdPartyLoading()
+        {
+            var loaded = LookUpLoaded(ThirdParty.ClassName);
+            var elapsed = (UtcNow() - ThirdParty.SwapUtc).TotalSeconds;
+
+            // A new instance at the version asked for. When the instance from before the swap is not known (this plugin reloaded meanwhile), the
+            // same-version case - a republished file - can only be told by waiting long enough for a reload to have happened.
+            var newInstance = loaded != null && !ReferenceEquals(loaded.Instance, _thirdPartyOldInstance)
+                && (_thirdPartyOldInstance != null || ThirdParty.Previous.Length == 0
+                    || !ArchonThirdParty.SameVersion(ThirdParty.Previous, ThirdParty.Target) || elapsed >= ThirdPartyMinimumReloadSeconds);
+            if (newInstance && ArchonThirdParty.SameVersion(loaded.Version, ThirdParty.Target))
+            {
+                ThirdParty.Phase = ArchonThirdParty.PhaseSucceeded;
+                ThirdParty.Reason = "";
+                SaveThirdParty();
+                StopThirdPartyTicker();
+                Puts(ThirdParty.File + " " + ThirdParty.Target + " loaded; the plugin update succeeded.");
+                return;
+            }
+
+            if (elapsed > ThirdPartyLoadWaitSeconds)
+            {
+                RollBackThirdParty(loaded == null
+                    ? ThirdParty.ClassName + " did not appear among the loaded plugins within " + ThirdPartyLoadWaitSeconds + " seconds"
+                    : ThirdParty.ClassName + " did not come up at version " + ThirdParty.Target + " within " + ThirdPartyLoadWaitSeconds + " seconds (it is " + loaded.Version + ")");
+            }
+        }
+
+        private void RollBackThirdParty(string reason)
+        {
+            if (ThirdParty.Kind == ArchonThirdParty.KindZip)
+            {
+                RollBackThirdPartyZip(reason);
+                return;
+            }
+
+            string target = null;
+            if (PluginDirectory != null && ThirdParty.File.Length > 0) { target = Path.Combine(PluginDirectory, ThirdParty.File); }
+            var backup = target == null ? null : target + ".bak";
+
+            try
+            {
+                if (backup == null || !File.Exists(backup))
+                {
+                    ThirdParty.Phase = ArchonThirdParty.PhaseFailed;
+                    ThirdParty.Reason = "rollback impossible: no backup found (" + reason + ")";
+                }
+                else
+                {
+                    File.Copy(backup, target, true);
+                    ThirdParty.Phase = ArchonThirdParty.PhaseRolledBack;
+                    ThirdParty.Reason = reason;
+                }
+            }
+            catch (Exception e)
+            {
+                ThirdParty.Phase = ArchonThirdParty.PhaseFailed;
+                ThirdParty.Reason = "rollback failed: " + e.GetType().Name + ": " + e.Message + " (" + reason + ")";
+            }
+
+            SaveThirdParty();
+            StopThirdPartyTicker();
+            Puts("Update of " + ThirdParty.File + " to " + ThirdParty.Target + " " + ThirdParty.Phase + ": " + ThirdParty.Reason);
+        }
+
+        private void FailThirdParty(string code, string detail)
+        {
+            ThirdParty.Phase = ArchonThirdParty.PhaseFailed;
+            ThirdParty.Reason = code + ": " + detail;
+            SaveThirdParty();
+            StopThirdPartyTicker();
+            Puts("Update of " + ThirdParty.File + " to " + ThirdParty.Target + " failed: " + ThirdParty.Reason);
+        }
+
+        // The file is not the one the panel checked (or is not even the size it said). Nothing was written.
+        private void MismatchThirdParty(string actual, string detail)
+        {
+            ThirdParty.Phase = ArchonThirdParty.PhaseMismatch;
+            ThirdParty.ActualSha256 = actual;
+            ThirdParty.Reason = "changed: " + detail;
+            SaveThirdParty();
+            StopThirdPartyTicker();
+            Puts("Update of " + ThirdParty.File + " to " + ThirdParty.Target + " not applied: " + ThirdParty.Reason);
+        }
+
+        // At load: a swap that was made but not yet confirmed when this plugin (re)loaded keeps being watched, so a broken plugin is still put
+        // back; a download that died with the previous instance changed nothing on disk and is only recorded.
+        internal void ResumeThirdPartySwap()
+        {
+            if (PluginDirectory == null && ScriptFilePath != null) { PluginDirectory = Path.GetDirectoryName(ScriptFilePath); }
+            if (DataDirectory == null && SettingsFilePath != null) { DataDirectory = Path.GetDirectoryName(SettingsFilePath); }
+
+            ThirdParty = LoadThirdParty();
+            if (ThirdParty.Phase == ArchonThirdParty.PhaseLoading)
+            {
+                StartThirdPartyTicker();
+            }
+            else if (ThirdParty.Phase == ArchonThirdParty.PhaseDownloading)
+            {
+                ThirdParty.Phase = ArchonThirdParty.PhaseFailed;
+                ThirdParty.Reason = "interrupted: this plugin reloaded during the download";
+                SaveThirdParty();
+            }
+            else if (ThirdParty.Phase == ArchonThirdParty.PhaseApplying)
+            {
+                // Files were being written when this plugin went away: some may be new and some old, so everything goes back from the manifest.
+                DeleteZipStaging(ThirdParty.ClassName);
+                RollBackThirdParty("interrupted: this plugin reloaded while the files were being written");
+            }
+        }
+
+        private void StartThirdPartyTicker()
+        {
+            if (_thirdPartyTimer == null) { _thirdPartyTimer = timer.Every(1f, ThirdPartyTick); }
+        }
+
+        private void StopThirdPartyTicker()
+        {
+            if (_thirdPartyTimer != null) { _thirdPartyTimer.Destroy(); _thirdPartyTimer = null; }
+        }
+
+        private ArchonThirdParty.LoadedPlugin LookUpLoaded(string className)
+        {
+            if (FindLoaded != null) { return FindLoaded(className); }
+
+            var found = plugins.Find(className);
+            if (found == null) { return null; }
+            return new ArchonThirdParty.LoadedPlugin { Instance = found, Version = found.Version.ToString() };
+        }
+
+        private static string SafeReadText(string path)
+        {
+            try { return File.ReadAllText(path); } catch (Exception) { return null; }
+        }
+
+        private static byte[] SafeReadBytes(string path)
+        {
+            try { return File.ReadAllBytes(path); } catch (Exception) { return new byte[0]; }
+        }
+
+        private ArchonThirdParty.State LoadThirdParty()
+        {
+            var state = new ArchonThirdParty.State();
+            try
+            {
+                if (DataDirectory == null) { return state; }
+                var path = Path.Combine(DataDirectory, ThirdPartySwapFileName);
+                if (!File.Exists(path)) { return state; }
+
+                foreach (var line in File.ReadAllLines(path))
+                {
+                    var eq = line.IndexOf('=');
+                    if (eq <= 0) { continue; }
+                    var key = line.Substring(0, eq);
+                    var value = line.Substring(eq + 1);
+                    switch (key)
+                    {
+                        case "phase": state.Phase = value; break;
+                        case "class": state.ClassName = value; break;
+                        case "target": state.Target = value; break;
+                        case "previous": state.Previous = value; break;
+                        case "file": state.File = value; break;
+                        case "sha256": state.Sha256 = value; break;
+                        case "actual": state.ActualSha256 = value; break;
+                        case "reason": state.Reason = value; break;
+                        case "size": long.TryParse(value, out state.Size); break;
+                        case "kind": state.Kind = value == ArchonThirdParty.KindZip ? ArchonThirdParty.KindZip : ArchonThirdParty.KindCs; break;
+                        case "backup": state.BackupDir = value; break;
+                        case "installed": int.TryParse(value, out state.Installed); break;
+                        case "started": state.StartedUtc = ArchonUpdaterSwap.ParseUtc(value); break;
+                        case "swapped": state.SwapUtc = ArchonUpdaterSwap.ParseUtc(value); break;
+                    }
+                }
+            }
+            catch (Exception)
+            {
+                return new ArchonThirdParty.State();
+            }
+            return state;
+        }
+
+        private void SaveThirdParty()
+        {
+            try
+            {
+                if (DataDirectory == null) { return; }
+                Directory.CreateDirectory(DataDirectory);
+                File.WriteAllText(Path.Combine(DataDirectory, ThirdPartySwapFileName), ThirdParty.ToFileText());
+            }
+            catch (Exception)
+            {
+            }
+        }
+
+        // ---- third-party plugin updates: plugins that ship as a zip archive -------------------------------------
+        //
+        // The same request as above, for a plugin that is an archive of several files (the plugin, its default settings, its data, its language files).
+        // The person's folder rules say where each file goes; the panel checked them against the archive and sends them here, but this plugin trusts
+        // neither the archive nor the rules: it reads the archive itself, works out the mapping with its own copy of the algorithm (ArchonZipMapping),
+        // and refuses the whole update if anything about it is wrong. Nothing is written until every file has been unpacked to a staging folder and
+        // checked; then the files that are replaced are copied to a backup with a manifest, every file is written (the plugin's .cs LAST, since that
+        // is what makes the framework reload the plugin, and it should find its settings and data already in place), and the framework's own registry
+        // confirms the new version exactly as for a single file. If it does not, or this plugin dies mid-write, the manifest puts everything back.
+
+        internal const string ZipManifestFileName = "manifest.txt";
+        internal const string ZipStagingFolderName = "thirdparty-staging";
+        internal const string ZipBackupFolderName = "thirdparty-backup";
+
+        // A test can watch (or interrupt) each file about to be written: called with its destination path, on the game thread.
+        internal Action<string> BeforeThirdPartyWrite = null;
+
+        private sealed class ZipItem
+        {
+            public string Path;                     // in the archive
+            public string Role;
+            public string Relative;                 // below the role's folder, with forward slashes
+            public string Destination;              // full path on the server
+            public string Staged;                   // full path in the staging folder
+            public long Size;
+            public bool KeepExisting;
+            public bool IsCode;
+            public bool Existed;
+            public bool Skipped;
+            public ArchonZipArchive.Entry Entry;
+        }
+
+        internal bool ZipSupported()
+        {
+            return ZipArchiveType() != null;
+        }
+
+        private Type ZipArchiveType()
+        {
+            if (!_zipChecked)
+            {
+                try { _zipType = ZipTypeLoader == null ? null : ZipTypeLoader(); }
+                catch (Exception) { _zipType = null; }
+
+                // Only a type that really has everything the reader needs counts.
+                if (_zipType != null && !ArchonZipArchive.CanRead(_zipType)) { _zipType = null; }
+                _zipChecked = true;
+            }
+            return _zipType;
+        }
+
+        private string ZipStagingDirectory(string className)
+        {
+            return System.IO.Path.Combine(System.IO.Path.Combine(DataDirectory, ZipStagingFolderName), className);
+        }
+
+        private string ZipBackupDirectory(string className)
+        {
+            return System.IO.Path.Combine(System.IO.Path.Combine(DataDirectory, ZipBackupFolderName), className);
+        }
+
+        private void DeleteZipStaging(string className)
+        {
+            try
+            {
+                if (DataDirectory == null || !ArchonThirdParty.IsClassName(className)) { return; }
+                var dir = ZipStagingDirectory(className);
+                if (Directory.Exists(dir)) { Directory.Delete(dir, true); }
+
+                // The folder that holds the staging folders goes too once it is empty, so an update leaves nothing behind.
+                var parent = System.IO.Path.GetDirectoryName(dir);
+                if (parent != null && Directory.Exists(parent) && Directory.GetFileSystemEntries(parent).Length == 0) { Directory.Delete(parent, false); }
+            }
+            catch (Exception)
+            {
+            }
+        }
+
+        private void ApplyThirdPartyZip(byte[] bytes)
+        {
+            try
+            {
+                ApplyThirdPartyZipCore(bytes);
+            }
+            catch (Exception e)
+            {
+                // Anything not foreseen. What was written (if anything) is put back; what was not is simply not applied.
+                if (ThirdParty.Phase == ArchonThirdParty.PhaseApplying)
+                {
+                    RollBackThirdParty("apply_failed: " + e.GetType().Name + ": " + e.Message);
+                }
+                else if (ThirdParty.Phase == ArchonThirdParty.PhaseDownloading)
+                {
+                    FailThirdParty("apply_failed", e.GetType().Name + ": " + e.Message);
+                }
+            }
+            finally
+            {
+                DeleteZipStaging(ThirdParty.ClassName);
+            }
+        }
+
+        private void ApplyThirdPartyZipCore(byte[] bytes)
+        {
+            var className = ThirdParty.ClassName;
+            var rules = _thirdPartyZipRules;
+            var zipType = ZipArchiveType();
+            if (zipType == null || rules == null)
+            {
+                FailThirdParty("zip_unsupported", "this server cannot read zip archives");
+                return;
+            }
+
+            if (DataDirectory == null)
+            {
+                FailThirdParty("apply_failed", "this plugin has no data folder to unpack into");
+                return;
+            }
+
+            ArchonZipArchive archive;
+            try
+            {
+                archive = ArchonZipArchive.Open(zipType, bytes);
+            }
+            catch (Exception e)
+            {
+                FailThirdParty("bad_zip", "the file is not a zip archive this server can read (" + e.GetType().Name + ": " + e.Message + ")");
+                return;
+            }
+
+            var plan = new List<ZipItem>();
+            using (archive)
+            {
+                if (archive.TooManyEntries)
+                {
+                    FailThirdParty("too_many_files", "the archive has " + archive.EntryCount + " entries; the most that is unpacked is " + ArchonZipArchive.MaxEntries);
+                    return;
+                }
+
+                // What the archive is and what the rules make of it: worked out here, from the archive itself.
+                var infos = new List<ArchonZipMapping.EntryInfo>();
+                foreach (var file in archive.Files) { infos.Add(new ArchonZipMapping.EntryInfo(file.Name, file.Length)); }
+
+                var mapping = ArchonZipMapping.Resolve(infos, rules);
+                if (mapping.Problems.Count > 0)
+                {
+                    FailThirdParty("bad_mapping", mapping.Problems[0].Code + " " + mapping.Problems[0].Path);
+                    return;
+                }
+
+                long declared = 0;
+                for (var i = 0; i < mapping.Entries.Count; i++)
+                {
+                    var mapped = mapping.Entries[i];
+                    if (mapped.Action != ArchonZipMapping.EntryAction.Install) { continue; }
+
+                    if (mapped.Size < 0 || declared > _thirdPartyInstallBytes - mapped.Size)
+                    {
+                        FailThirdParty("too_large_for_plan", "the files to install add up to more than the " + _thirdPartyInstallBytes + " bytes that were allowed");
+                        return;
+                    }
+                    declared += mapped.Size;
+
+                    string refusal;
+                    var item = PlanZipItem(mapped, archive.Files[i], out refusal);
+                    if (item == null)
+                    {
+                        FailThirdParty("bad_mapping", refusal);
+                        return;
+                    }
+                    plan.Add(item);
+                }
+
+                if (plan.Count == 0)
+                {
+                    FailThirdParty("bad_mapping", "nothing_to_install");
+                    return;
+                }
+
+                // Unpack to the staging folder. An entry that gives more bytes, or fewer, than the archive said it would is a hostile or a broken
+                // archive: nothing is applied.
+                var staging = ZipStagingDirectory(className);
+                DeleteZipStaging(className);
+                Directory.CreateDirectory(staging);
+                long staged = 0;
+                foreach (var item in plan)
+                {
+                    item.Staged = System.IO.Path.Combine(System.IO.Path.Combine(staging, item.Role), ToNativePath(item.Relative));
+                    var problem = ExtractZipEntry(archive, item, _thirdPartyInstallBytes, ref staged);
+                    if (problem != null)
+                    {
+                        FailThirdParty("bad_zip", problem);
+                        return;
+                    }
+                }
+            }
+
+            // The archive is closed; from here on everything is read from the staging folder.
+            // The plugin itself: exactly one staged .cs in the plugins folder declares the class, at the version asked for, and it replaces the file
+            // that is installed (a differently named file would leave two files declaring one class).
+            ZipItem code = null;
+            var declares = 0;
+            string codeText = null;
+            foreach (var item in plan)
+            {
+                if (item.Role != ArchonZipMapping.RolePlugins || !item.IsCode) { continue; }
+                var text = File.ReadAllText(item.Staged);
+                if (ArchonThirdParty.DeclaresClass(text, className))
+                {
+                    declares++;
+                    code = item;
+                    codeText = text;
+                }
+            }
+
+            if (declares != 1)
+            {
+                FailThirdParty("not_that_plugin", declares == 0
+                    ? "no plugin file in the archive declares a class named " + className
+                    : "more than one plugin file in the archive declares a class named " + className);
+                return;
+            }
+
+            var offered = ArchonThirdParty.ReadInfoVersion(codeText);
+            if (offered != null && !ArchonThirdParty.SameVersion(offered, ThirdParty.Target))
+            {
+                FailThirdParty("version_mismatch", "asked for " + ThirdParty.Target + " but the archive's plugin is " + offered);
+                return;
+            }
+
+            if (!string.Equals(code.Relative, ThirdParty.File, StringComparison.Ordinal))
+            {
+                FailThirdParty("not_that_plugin", "the archive's plugin file is " + code.Relative + " but the installed one is " + ThirdParty.File);
+                return;
+            }
+
+            // Somebody may have changed the plugins folder while the download and unpacking ran.
+            string installedPath;
+            int found;
+            ArchonThirdParty.FindInstalled(PluginDirectory, className, out installedPath, out found);
+            if (found != 1 || System.IO.Path.GetFileName(installedPath) != ThirdParty.File)
+            {
+                FailThirdParty("changed", "the installed plugin file was moved, replaced or duplicated while the update was prepared");
+                return;
+            }
+
+            if (MainUpdateInProgress() || UpdaterSwap.Phase == ArchonUpdaterSwap.PhaseDownloading || UpdaterSwap.Phase == ArchonUpdaterSwap.PhaseLoading)
+            {
+                FailThirdParty("busy", "an update of the RustArchon plugin or its Updater started while the update was prepared");
+                return;
+            }
+
+            // What is written: everything not kept. A file that is kept where one already exists is not touched and not backed up.
+            var writes = new List<ZipItem>();
+            foreach (var item in plan)
+            {
+                item.Existed = File.Exists(item.Destination);
+                item.Skipped = item.KeepExisting && item.Existed;
+                if (!item.Skipped && !item.IsCode) { writes.Add(item); }
+            }
+            foreach (var item in plan)
+            {
+                if (!item.Skipped && item.IsCode) { writes.Add(item); }
+            }
+
+            // Folders this update will have to create, so that a rollback removes those and nothing else.
+            var created = new List<string>();
+            foreach (var item in writes)
+            {
+                var dir = System.IO.Path.GetDirectoryName(item.Destination);
+                while (dir != null && !Directory.Exists(dir))
+                {
+                    if (File.Exists(dir))
+                    {
+                        FailThirdParty("bad_mapping", "a file is in the way of the folder " + dir);
+                        return;
+                    }
+                    if (!created.Contains(dir)) { created.Add(dir); }
+                    dir = System.IO.Path.GetDirectoryName(dir);
+                }
+            }
+
+            // One backup per plugin: the previous one goes. The manifest is complete before anything on the server is touched.
+            var backupDir = ZipBackupDirectory(className);
+            try
+            {
+                if (Directory.Exists(backupDir)) { Directory.Delete(backupDir, true); }
+                Directory.CreateDirectory(backupDir);
+
+                var lines = new List<string>();
+                foreach (var item in writes)
+                {
+                    if (item.Existed)
+                    {
+                        var saved = System.IO.Path.Combine(System.IO.Path.Combine(backupDir, item.Role), ToNativePath(item.Relative));
+                        Directory.CreateDirectory(System.IO.Path.GetDirectoryName(saved));
+                        File.Copy(item.Destination, saved, true);
+                        lines.Add("E\t" + item.Destination + "\t" + item.Role + "/" + item.Relative);
+                    }
+                    else
+                    {
+                        lines.Add("N\t" + item.Destination);
+                    }
+                }
+                foreach (var dir in created) { lines.Add("D\t" + dir); }
+                File.WriteAllLines(System.IO.Path.Combine(backupDir, ZipManifestFileName), lines.ToArray());
+            }
+            catch (Exception e)
+            {
+                try { if (Directory.Exists(backupDir)) { Directory.Delete(backupDir, true); } } catch (Exception) { }
+                FailThirdParty("apply_failed", "the backup could not be made: " + e.GetType().Name + ": " + e.Message);
+                return;
+            }
+
+            // Recorded BEFORE the first write: a state left in "applying" means this plugin died part way, and everything goes back.
+            ThirdParty.BackupDir = backupDir;
+            ThirdParty.Installed = 0;
+            ThirdParty.Reason = "";
+            ThirdParty.Phase = ArchonThirdParty.PhaseApplying;
+            SaveThirdParty();
+
+            var written = 0;
+            var stamped = false;
+            try
+            {
+                foreach (var item in writes)
+                {
+                    if (item.IsCode && !stamped)
+                    {
+                        ThirdParty.SwapUtc = UtcNow();
+                        stamped = true;
+                    }
+                    if (BeforeThirdPartyWrite != null) { BeforeThirdPartyWrite(item.Destination); }
+                    WriteZipItem(item);
+                    written++;
+                }
+            }
+            catch (Exception e)
+            {
+                RollBackThirdParty("apply_failed: " + e.GetType().Name + ": " + e.Message);
+                return;
+            }
+
+            if (!stamped) { ThirdParty.SwapUtc = UtcNow(); }
+            ThirdParty.Installed = written;
+            ThirdParty.Phase = ArchonThirdParty.PhaseLoading;
+            ThirdParty.Reason = "";
+            SaveThirdParty();
+            Puts("Unpacked " + className + " " + ThirdParty.Target + " (" + written + " files); waiting for it to load.");
+        }
+
+        private static string ToNativePath(string relative)
+        {
+            return relative.Replace('/', System.IO.Path.DirectorySeparatorChar);
+        }
+
+        // Every file this update writes is checked against the folder it is meant for, again, here: not trusting the archive, and not trusting the
+        // rules either. Returns null (and says why) for a file that must not be written.
+        private ZipItem PlanZipItem(ArchonZipMapping.MappedEntry mapped, ArchonZipArchive.Entry entry, out string refusal)
+        {
+            refusal = null;
+            var role = mapped.Role;
+            var prefix = role + "/";
+            if (!mapped.Destination.StartsWith(prefix, StringComparison.Ordinal))
+            {
+                refusal = "unsafe_path " + mapped.Path;
+                return null;
+            }
+
+            var relative = mapped.Destination.Substring(prefix.Length);
+            var folder = ArchonZipMapping.RoleFolder(role, PluginDirectory);
+            if (folder == null || !ArchonZipMapping.IsSafePath(relative))
+            {
+                refusal = "unsafe_path " + mapped.Path;
+                return null;
+            }
+
+            string destination;
+            try
+            {
+                destination = System.IO.Path.GetFullPath(System.IO.Path.Combine(folder, ToNativePath(relative)));
+            }
+            catch (Exception)
+            {
+                refusal = "unsafe_path " + mapped.Path;
+                return null;
+            }
+
+            if (!ArchonZipMapping.IsInside(folder, destination, StringComparison.Ordinal))
+            {
+                refusal = "unsafe_path " + mapped.Path;
+                return null;
+            }
+
+            // This plugin's own state, and its own files, are not for an archive to overwrite.
+            var fileName = System.IO.Path.GetFileName(destination);
+            if ((DataDirectory != null && ArchonZipMapping.IsInside(DataDirectory, destination, StringComparison.OrdinalIgnoreCase))
+                || (role == ArchonZipMapping.RolePlugins && relative.IndexOf('/') < 0
+                    && (string.Equals(fileName, "RustArchon.cs", StringComparison.OrdinalIgnoreCase)
+                        || string.Equals(fileName, "RustArchonUpdater.cs", StringComparison.OrdinalIgnoreCase))))
+            {
+                refusal = "protected " + mapped.Path;
+                return null;
+            }
+
+            if (Directory.Exists(destination) || ArchonZipMapping.PassesThroughLink(folder, destination))
+            {
+                refusal = "unsafe_destination " + mapped.Path;
+                return null;
+            }
+
+            return new ZipItem
+            {
+                Path = mapped.Path,
+                Role = role,
+                Relative = relative,
+                Destination = destination,
+                Size = mapped.Size,
+                KeepExisting = mapped.KeepExisting,
+                IsCode = mapped.Path.EndsWith(".cs", StringComparison.OrdinalIgnoreCase),
+                Entry = entry
+            };
+        }
+
+        // Streams to disk through one small fixed buffer (an entry is never held in memory) and counts the bytes as they are produced, not as any
+        // header claims them. The bound for an entry is the size the archive declared for it, enforced from both sides; the bound for the whole
+        // archive is the install size (and this plugin's own MaxInstallBytes), so a zip that declares small sizes but supplies far more writes at
+        // most a buffer's worth past the limit, and nothing is applied.
+        private static string ExtractZipEntry(ArchonZipArchive archive, ZipItem item, long installBytes, ref long stagedTotal)
+        {
+            try
+            {
+                var limit = Math.Min(installBytes, ArchonThirdParty.MaxInstallBytes);
+                Directory.CreateDirectory(System.IO.Path.GetDirectoryName(item.Staged));
+                using (var input = archive.OpenEntry(item.Entry))
+                using (var output = new FileStream(item.Staged, FileMode.Create, FileAccess.Write))
+                {
+                    return CopyBounded(input, output, item.Path, item.Size, limit, ref stagedTotal);
+                }
+            }
+            catch (Exception e)
+            {
+                return item.Path + " could not be unpacked: " + e.GetType().Name + ": " + e.Message;
+            }
+        }
+
+        // The copy itself, on plain streams so it can be held to account: at most 16 KB in memory, aborting the moment the entry has produced more
+        // than it declared, or the whole archive more than <limit>. Returns null, or what went wrong.
+        internal static string CopyBounded(Stream input, Stream output, string name, long declared, long limit, ref long stagedTotal)
+        {
+            var buffer = new byte[16384];
+            long total = 0;
+            while (true)
+            {
+                var want = (int)Math.Min(buffer.Length, declared - total + 1);
+                var read = input.Read(buffer, 0, want);
+                if (read <= 0) { break; }
+                total += read;
+                stagedTotal += read;
+                if (total > declared)
+                {
+                    return name + " holds more bytes than the archive declared for it (" + declared + ")";
+                }
+                if (stagedTotal > limit)
+                {
+                    return "the files in the archive unpack to more than the " + limit + " bytes that were allowed";
+                }
+                output.Write(buffer, 0, read);
+            }
+
+            if (total != declared)
+            {
+                return name + " holds " + total + " bytes but the archive declared " + declared;
+            }
+            return null;
+        }
+
+        private static void WriteZipItem(ZipItem item)
+        {
+            Directory.CreateDirectory(System.IO.Path.GetDirectoryName(item.Destination));
+            var temp = item.Destination + "." + Guid.NewGuid().ToString("N").Substring(0, 8) + ".tmp";
+            try
+            {
+                File.Copy(item.Staged, temp, true);
+                if (File.Exists(item.Destination))
+                {
+                    ArchonUpdaterSwap.SwapInto(temp, item.Destination);
+                }
+                else
+                {
+                    File.Move(temp, item.Destination);
+                }
+            }
+            finally
+            {
+                ArchonUpdaterSwap.TryDelete(temp);
+            }
+        }
+
+        // Puts back everything the manifest says was changed: the files that were replaced come back from the backup, the files that were created
+        // are deleted, and the folders this update created go if they are empty. A file that cannot be put back is named in the reason.
+        private void RollBackThirdPartyZip(string reason)
+        {
+            var failures = new List<string>();
+            string impossible = null;
+
+            try
+            {
+                var expected = (DataDirectory == null || !ArchonThirdParty.IsClassName(ThirdParty.ClassName)) ? null : ZipBackupDirectory(ThirdParty.ClassName);
+                var manifest = expected == null ? null : System.IO.Path.Combine(expected, ZipManifestFileName);
+                if (expected == null || ThirdParty.BackupDir != expected || !File.Exists(manifest))
+                {
+                    impossible = "no backup found";
+                }
+                else
+                {
+                    RestoreFromZipManifest(expected, File.ReadAllLines(manifest), failures);
+                }
+            }
+            catch (Exception e)
+            {
+                impossible = "the backup could not be read: " + e.GetType().Name + ": " + e.Message;
+            }
+
+            if (impossible != null)
+            {
+                ThirdParty.Phase = ArchonThirdParty.PhaseFailed;
+                ThirdParty.Reason = "rollback impossible: " + impossible + " (" + reason + ")";
+            }
+            else if (failures.Count > 0)
+            {
+                ThirdParty.Phase = ArchonThirdParty.PhaseFailed;
+                ThirdParty.Reason = "rollback failed: could not restore " + string.Join(", ", failures.ToArray()) + " (" + reason + ")";
+            }
+            else
+            {
+                ThirdParty.Phase = ArchonThirdParty.PhaseRolledBack;
+                ThirdParty.Reason = reason;
+            }
+
+            DeleteZipStaging(ThirdParty.ClassName);
+            SaveThirdParty();
+            StopThirdPartyTicker();
+            Puts("Update of " + ThirdParty.ClassName + " to " + ThirdParty.Target + " " + ThirdParty.Phase + ": " + ThirdParty.Reason);
+        }
+
+        private void RestoreFromZipManifest(string backupDir, string[] lines, List<string> failures)
+        {
+            var folders = new List<string>();
+            var root = ArchonZipMapping.FrameworkRoot(PluginDirectory);
+            if (root != null)
+            {
+                folders.Add(PluginDirectory);
+                folders.Add(System.IO.Path.Combine(root, "data"));
+                folders.Add(System.IO.Path.Combine(root, "lang"));
+                folders.Add(System.IO.Path.Combine(root, "config"));
+                folders.Add(System.IO.Path.Combine(root, "configs"));
+            }
+
+            // The manifest is a file on disk like any other: what it names is only touched if it is inside one of the folders an update can write to.
+            // (A folder this update created may be one of those folders itself, when the folder did not exist before.)
+            Func<string, bool, bool> allowed = delegate (string path, bool orEqual)
+            {
+                if (path == null || path.Length == 0) { return false; }
+                foreach (var folder in folders)
+                {
+                    if (ArchonZipMapping.IsInside(folder, path, StringComparison.Ordinal)) { return true; }
+                    if (orEqual && ArchonZipMapping.SamePath(folder, path)) { return true; }
+                }
+                return false;
+            };
+
+            var directories = new List<string>();
+            var files = new List<string[]>();
+            foreach (var line in lines)
+            {
+                var fields = line.Split('\t');
+                if (fields[0] == "D" && fields.Length == 2) { directories.Add(fields[1]); }
+                else if ((fields[0] == "E" && fields.Length == 3) || (fields[0] == "N" && fields.Length == 2)) { files.Add(fields); }
+            }
+
+            // In the reverse of the order they were written: the plugin's own file first.
+            for (var i = files.Count - 1; i >= 0; i--)
+            {
+                var fields = files[i];
+                var destination = fields[1];
+                if (!allowed(destination, false)) { failures.Add(destination); continue; }
+
+                try
+                {
+                    if (fields[0] == "E")
+                    {
+                        if (!ArchonZipMapping.IsSafePath(fields[2])) { failures.Add(destination); continue; }
+                        var saved = System.IO.Path.Combine(backupDir, ToNativePath(fields[2]));
+                        if (!ArchonZipMapping.IsInside(backupDir, saved, StringComparison.Ordinal) || !File.Exists(saved)) { failures.Add(destination); continue; }
+                        Directory.CreateDirectory(System.IO.Path.GetDirectoryName(destination));
+                        File.Copy(saved, destination, true);
+                    }
+                    else if (File.Exists(destination))
+                    {
+                        File.Delete(destination);
+                    }
+                }
+                catch (Exception)
+                {
+                    failures.Add(destination);
+                }
+            }
+
+            // Only the folders this update made, deepest first, and only if nothing else has come to live in them.
+            directories.Sort(delegate (string a, string b) { return b.Length.CompareTo(a.Length); });
+            foreach (var directory in directories)
+            {
+                try
+                {
+                    if (allowed(directory, true) && Directory.Exists(directory)
+                        && Directory.GetFileSystemEntries(directory).Length == 0)
+                    {
+                        Directory.Delete(directory, false);
+                    }
+                }
+                catch (Exception)
+                {
+                }
+            }
+        }
+
+        // ---- combat log --------------------------------------------------------------------------------------
         // ---- combat log --------------------------------------------------------------------------------------
         //
         // A bounded in-memory record of damage that involves a real player, drained by the Worker over RCON. The two
@@ -1032,8 +2226,9 @@ namespace Oxide.Plugins
         // ---- map ---------------------------------------------------------------------------------------------
         //
         // The game can draw its own map (world.rendermap), the only server-side way to get an image of it. It BLOCKS the
-        // game for about a minute, so it is only ever started when nobody is online (unless the caller says otherwise),
-        // and it is started a moment after the command replies so the Worker gets its answer before the freeze.
+        // game for about a minute. The manual command refuses while players are online unless the caller says override; the
+        // automatic render (a world with no picture yet) does not wait for a quiet moment. Either way it is started a moment
+        // after the command replies so the Worker gets its answer before the freeze.
 
         internal string MapDirectory = null;
         internal Func<uint> WorldSize = delegate { return World.Size; };
@@ -1161,8 +2356,9 @@ namespace Oxide.Plugins
         }
 
         // When the plugin loads (which the game also does for a plugin loaded or updated while running) and the switch is
-        // on: a world with no map yet, and nobody to freeze, gets one. A few seconds' delay lets the other plugins finish
-        // loading first.
+        // on: a world with no map yet gets one - whoever is online. The rule is "no picture yet, so make it", not "only when
+        // it is quiet"; the players-online guard belongs to the manual command (see archon.map.render), where someone can
+        // say override. A few seconds' delay lets the other plugins finish loading first.
         private void OnServerInitialized()
         {
             ConsiderAutoRender();
@@ -1174,9 +2370,9 @@ namespace Oxide.Plugins
 
             string code;
             string message;
-            if (TryScheduleMapRender(false, false, 10f, out code, out message))
+            if (TryScheduleMapRender(false, true, 10f, out code, out message))
             {
-                Puts("No map for this world yet and nobody is online: rendering it shortly.");
+                Puts("No map for this world yet: rendering it shortly (the game pauses for about a minute).");
             }
         }
 
@@ -1458,6 +2654,10 @@ namespace Oxide.Plugins
             {
                 if (i > 0) { sb.Append(','); }
                 sb.Append(ArchonJson.Quote(Capabilities[i]));
+                if (Capabilities[i] == "thirdparty-update" && ZipSupported())
+                {
+                    sb.Append(',').Append(ArchonJson.Quote(ThirdPartyZipCapability));
+                }
             }
             sb.Append("],\"signing\":").Append(Integrity.ToJson());
             sb.Append(",\"settings\":").Append(Settings.ToJson(_settingsPersisted));
@@ -2545,6 +3745,815 @@ namespace Oxide.Plugins
         internal static void TryDelete(string path)
         {
             try { if (File.Exists(path)) { File.Delete(path); } } catch (Exception) { }
+        }
+    }
+
+    // The pure parts of applying a third-party plugin update: phases, the state it keeps, checking what the panel sent, finding the installed file,
+    // reading a plugin's version, and the download.
+    internal static class ArchonThirdParty
+    {
+        internal const string PhaseIdle = "idle";
+        internal const string PhaseDownloading = "downloading";
+        internal const string PhaseLoading = "loading";
+        internal const string PhaseSucceeded = "succeeded";
+        internal const string PhaseFailed = "failed";
+        internal const string PhaseRolledBack = "rolled-back";
+        // The file downloaded is not the one the panel checked: nothing was written.
+        internal const string PhaseMismatch = "mismatch";
+        // Files of a zip are being written to the server. A state found in this phase when the plugin (re)loads means it died mid-write.
+        internal const string PhaseApplying = "applying";
+
+        internal const string KindCs = "cs";
+        internal const string KindZip = "zip";
+
+        internal const int DownloadTimeoutSeconds = 60;
+        internal const int MaxRedirects = 5;
+        internal const int MaxVersionLength = 40;
+        internal const int MaxUrlLength = 500;
+
+        // This plugin's own hard limits, whatever the panel says: a hostile or mistaken size claim must never make the game server allocate or write
+        // without bound. (The same figures the Api enforces; the plugin never relies on the Api's numbers being sane.)
+        internal const long MaxFileBytes = 134217728;          // 128 MiB: one file, or one archive as downloaded
+        internal const long MaxInstallBytes = 536870912;       // 512 MiB: everything a zip may unpack to
+
+        internal sealed class State
+        {
+            public string Phase = PhaseIdle;
+            public string ClassName = "";
+            public string Target = "";
+            public string Previous = "";
+            public string File = "";
+            public string Sha256 = "";
+            public string ActualSha256 = "";
+            public string Reason = "";
+            public long Size;
+            // "cs" (one plugin file) or "zip" (an archive unpacked by the folder rules); for a zip, where the previous files were backed up and how
+            // many files the update wrote.
+            public string Kind = KindCs;
+            public string BackupDir = "";
+            public int Installed;
+            public DateTime StartedUtc = DateTime.MinValue;
+            public DateTime SwapUtc = DateTime.MinValue;
+
+            public string ToJson()
+            {
+                return "{\"phase\":" + ArchonJson.Quote(Phase)
+                    + ",\"kind\":" + ArchonJson.Quote(Kind)
+                    + ",\"installed\":" + Installed
+                    + ",\"class\":" + ArchonJson.Quote(ClassName)
+                    + ",\"targetVersion\":" + ArchonJson.Quote(Target)
+                    + ",\"previousVersion\":" + ArchonJson.Quote(Previous)
+                    + ",\"file\":" + ArchonJson.Quote(File)
+                    + ",\"sha256\":" + ArchonJson.Quote(Sha256)
+                    + ",\"actualSha256\":" + ArchonJson.Quote(ActualSha256)
+                    + ",\"reason\":" + ArchonJson.Quote(Reason) + "}";
+            }
+
+            public string ToFileText()
+            {
+                return "phase=" + Phase + "\nclass=" + ClassName + "\ntarget=" + Target + "\nprevious=" + Previous + "\nfile=" + File
+                    + "\nsha256=" + Sha256 + "\nactual=" + ActualSha256 + "\nsize=" + Size
+                    + "\nkind=" + Kind + "\nbackup=" + BackupDir.Replace('\n', ' ').Replace('\r', ' ') + "\ninstalled=" + Installed
+                    + "\nreason=" + Reason.Replace('\n', ' ').Replace('\r', ' ')
+                    + "\nstarted=" + StartedUtc.ToString("o") + "\nswapped=" + SwapUtc.ToString("o") + "\n";
+            }
+        }
+
+        internal sealed class Download
+        {
+            public volatile bool Done;
+            public byte[] Bytes;
+            public string Error;
+            // Set when what came back is not what the panel described (more bytes than it said): a changed file, not a failed download.
+            public string Changed;
+        }
+
+        // What the framework says about a plugin that is loaded: which instance, and the version it reports.
+        internal sealed class LoadedPlugin
+        {
+            public object Instance;
+            public string Version;
+        }
+
+        internal sealed class ChangedException : Exception
+        {
+            public ChangedException(string message) : base(message) { }
+        }
+
+        // A class name as the panel gives it: a plain identifier, nothing that could be a path or a pattern.
+        internal static bool IsClassName(string text)
+        {
+            if (string.IsNullOrEmpty(text) || text.Length > 100) { return false; }
+            if (!(char.IsLetter(text[0]) || text[0] == '_') || text[0] > 127) { return false; }
+            for (var i = 1; i < text.Length; i++)
+            {
+                var c = text[i];
+                if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_')) { return false; }
+            }
+            return true;
+        }
+
+        internal static bool IsVersionText(string text)
+        {
+            if (string.IsNullOrEmpty(text) || text.Length > MaxVersionLength) { return false; }
+            for (var i = 0; i < text.Length; i++)
+            {
+                var c = text[i];
+                if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '.' || c == '-' || c == '+')) { return false; }
+            }
+            return true;
+        }
+
+        internal static bool IsSha256(string text)
+        {
+            if (text == null || text.Length != 64) { return false; }
+            for (var i = 0; i < text.Length; i++)
+            {
+                var c = text[i];
+                if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F'))) { return false; }
+            }
+            return true;
+        }
+
+        internal static bool TryParseHttps(string text, out Uri uri)
+        {
+            uri = null;
+            if (string.IsNullOrEmpty(text) || text.Length > MaxUrlLength) { return false; }
+            Uri parsed;
+            if (!Uri.TryCreate(text, UriKind.Absolute, out parsed)) { return false; }
+            if (parsed.Scheme != Uri.UriSchemeHttps || parsed.Host.Length == 0 || parsed.UserInfo.Length > 0) { return false; }
+            uri = parsed;
+            return true;
+        }
+
+        internal static string Sha256Hex(byte[] bytes)
+        {
+            using (var sha = SHA256.Create())
+            {
+                var hash = sha.ComputeHash(bytes ?? new byte[0]);
+                var sb = new StringBuilder(hash.Length * 2);
+                for (var i = 0; i < hash.Length; i++) { sb.Append(hash[i].ToString("x2")); }
+                return sb.ToString();
+            }
+        }
+
+        // Every .cs file directly in the plugins folder that declares "class <className> :" and carries an [Info] - the plugin, as the framework
+        // will find it. The two RustArchon files are never candidates. Reports how many there are and, when there is exactly one, which.
+        internal static void FindInstalled(string pluginDirectory, string className, out string path, out int count)
+        {
+            path = null;
+            count = 0;
+            string[] files;
+            try { files = Directory.GetFiles(pluginDirectory, "*.cs", SearchOption.TopDirectoryOnly); }
+            catch (Exception) { return; }
+
+            foreach (var file in files)
+            {
+                var name = Path.GetFileName(file);
+                if (name == "RustArchon.cs" || name == "RustArchonUpdater.cs") { continue; }
+
+                string text;
+                try { text = File.ReadAllText(file); }
+                catch (Exception) { continue; }
+
+                if (text.IndexOf("[Info(", StringComparison.Ordinal) >= 0 && DeclaresClass(text, className))
+                {
+                    count++;
+                    if (count == 1) { path = file; }
+                }
+            }
+
+            if (count != 1) { path = null; }
+        }
+
+        internal static bool DeclaresClass(string text, string className)
+        {
+            if (text == null || !IsClassName(className)) { return false; }
+            return System.Text.RegularExpressions.Regex.IsMatch(text, "\\bclass\\s+" + className + "\\s*:");
+        }
+
+        // [Info("<title>", "<author>", "<version>")] - the version text as the author wrote it.
+        private static readonly System.Text.RegularExpressions.Regex InfoVersion = new System.Text.RegularExpressions.Regex(
+            "\\[Info\\(\\s*\"[^\"]*\"\\s*,\\s*\"[^\"]*\"\\s*,\\s*\"([^\"]*)\"\\s*\\)\\]");
+
+        internal static string ReadInfoVersion(string scriptText)
+        {
+            if (scriptText == null) { return null; }
+            var match = InfoVersion.Match(scriptText);
+            return match.Success ? match.Groups[1].Value : null;
+        }
+
+        // The framework keeps a plugin's version as three numbers, so "1.2" and "1.2.0" are the same version there, and a leading "v" is not part of
+        // it. Anything that is not numbers is compared as written.
+        internal static string NormalizeVersion(string text)
+        {
+            var trimmed = (text ?? "").Trim();
+            if (trimmed.Length > 0 && (trimmed[0] == 'v' || trimmed[0] == 'V')) { trimmed = trimmed.Substring(1); }
+
+            var parts = trimmed.Split('.');
+            if (parts.Length < 1 || parts.Length > 3) { return trimmed; }
+
+            var numbers = new int[3];
+            for (var i = 0; i < parts.Length; i++)
+            {
+                if (!int.TryParse(parts[i], out numbers[i]) || numbers[i] < 0) { return trimmed; }
+            }
+            return numbers[0] + "." + numbers[1] + "." + numbers[2];
+        }
+
+        internal static bool SameVersion(string a, string b)
+        {
+            return string.Equals(NormalizeVersion(a), NormalizeVersion(b), StringComparison.Ordinal);
+        }
+
+        // On a worker thread. Follows up to MaxRedirects redirects by hand so that every hop can be checked to be https; the body is read only up to
+        // the size the panel saw, plus one byte to notice more (a changed file). It is never read without limit, and there is no arbitrary cap: the
+        // panel's own figure is the bound.
+        internal static byte[] DefaultDownload(string url, long expectedSize)
+        {
+            var current = url;
+            for (var hop = 0; hop <= MaxRedirects; hop++)
+            {
+                Uri uri;
+                if (!TryParseHttps(current, out uri)) { throw new IOException("only https addresses are followed"); }
+
+                var request = (HttpWebRequest)WebRequest.Create(uri);
+                request.Timeout = DownloadTimeoutSeconds * 1000;
+                request.ReadWriteTimeout = DownloadTimeoutSeconds * 1000;
+                request.AllowAutoRedirect = false;
+                request.UserAgent = "RustArchon";
+
+                using (var response = (HttpWebResponse)request.GetResponse())
+                {
+                    var code = (int)response.StatusCode;
+                    if (code >= 300 && code < 400 && code != 304)
+                    {
+                        var location = response.Headers["Location"];
+                        Uri next;
+                        if (string.IsNullOrEmpty(location) || !Uri.TryCreate(uri, location, out next)) { throw new IOException("a redirect with no usable address"); }
+                        current = next.AbsoluteUri;
+                        continue;
+                    }
+
+                    if (code != 200) { throw new IOException("the server answered " + code); }
+
+                    // Never sized from what the server says (Content-Length): only from the bytes that actually arrive.
+                    using (var stream = response.GetResponseStream())
+                    {
+                        return ReadBounded(stream, expectedSize);
+                    }
+                }
+            }
+
+            throw new IOException("more than " + MaxRedirects + " redirects");
+        }
+
+        // Reads a stream to its end, holding only what has arrived so far, and gives up the moment more than <expectedSize> bytes have: a stream
+        // that never ends cannot make this allocate more than expectedSize (plus one chunk). A size above this plugin's own limit is never honoured.
+        internal static byte[] ReadBounded(Stream stream, long expectedSize)
+        {
+            if (expectedSize > MaxFileBytes) { expectedSize = MaxFileBytes; }
+
+            using (var buffer = new MemoryStream())
+            {
+                var chunk = new byte[8192];
+                int read;
+                while ((read = stream.Read(chunk, 0, chunk.Length)) > 0)
+                {
+                    buffer.Write(chunk, 0, read);
+                    if (buffer.Length > expectedSize)
+                    {
+                        throw new ChangedException("the download is larger than the " + expectedSize + " bytes the panel checked");
+                    }
+                }
+                return buffer.ToArray();
+            }
+        }
+    }
+
+    // The folder rules of a zip archive: this plugin's OWN copy of RustArchon.Shared.PluginZips.ZipMapping (a plugin is one file and cannot reference
+    // the shared library). The same algorithm, and the plugin's tests hold it to the same answers as the original on every case they can think of and
+    // several hundred generated ones. If one changes, so does the other. It is what makes the plugin independent of the panel: it works out for
+    // itself, from the archive it downloaded, what would be written where, and refuses anything unsafe or ambiguous.
+    internal static class ArchonZipMapping
+    {
+        internal const string RolePlugins = "plugins";
+        internal const string RoleConfig = "config";
+        internal const string RoleData = "data";
+        internal const string RoleLang = "lang";
+        internal const string RoleSkip = "skip";
+
+        internal const string CodeBadRule = "bad_rule";
+        internal const string CodeUnassigned = "unassigned";
+        internal const string CodeUnsafePath = "unsafe_path";
+        internal const string CodeExecutable = "executable";
+        internal const string CodeCollision = "collision";
+        internal const string CodeOutsidePlugins = "cs_outside_plugins";
+
+        internal const int MaxRules = 60;
+        internal const int MaxPathLength = 240;
+        internal const int MaxEncodedLength = 3000;
+
+        internal enum EntryAction { Install, Skip, Unassigned }
+
+        internal sealed class Rule
+        {
+            public bool IsFolder;
+            public string Source = "";
+            public string Role = RoleSkip;
+            public string SubFolder = "";
+            public bool KeepExisting;
+        }
+
+        internal sealed class EntryInfo
+        {
+            public readonly string Path;
+            public readonly long Size;
+            public EntryInfo(string path, long size) { Path = path; Size = size; }
+        }
+
+        internal sealed class MappedEntry
+        {
+            public string Path;
+            public long Size;
+            public EntryAction Action;
+            public string Role;
+            public string Destination;
+            public bool KeepExisting;
+        }
+
+        internal sealed class Problem
+        {
+            public string Code;
+            public string Path;
+        }
+
+        internal sealed class Result
+        {
+            public readonly List<MappedEntry> Entries = new List<MappedEntry>();
+            public readonly List<Problem> Problems = new List<Problem>();
+        }
+
+        private static readonly string[] ExecutableExtensions =
+            { ".dll", ".so", ".dylib", ".exe", ".bat", ".cmd", ".sh", ".ps1", ".msi", ".com", ".scr", ".vbs", ".jar", ".bin" };
+
+        internal static bool IsRole(string role)
+        {
+            return role == RoleSkip || role == RolePlugins || role == RoleConfig || role == RoleData || role == RoleLang;
+        }
+
+        // By its extension: the text after the last dot of the file's own name.
+        internal static bool IsExecutable(string path)
+        {
+            var slash = path.LastIndexOf('/');
+            var name = slash >= 0 ? path.Substring(slash + 1) : path;
+            var dot = name.LastIndexOf('.');
+            if (dot < 0 || dot == name.Length - 1) { return false; }
+            var extension = name.Substring(dot);
+            foreach (var known in ExecutableExtensions)
+            {
+                if (string.Equals(extension, known, StringComparison.OrdinalIgnoreCase)) { return true; }
+            }
+            return false;
+        }
+
+        internal static string NormalizePath(string path)
+        {
+            return path.Replace('\\', '/').TrimStart('/');
+        }
+
+        internal static bool IsSafePath(string path)
+        {
+            if (path.Length == 0 || path.Length > MaxPathLength) { return false; }
+
+            foreach (var segment in path.Split('/'))
+            {
+                if (segment.Length == 0 || segment == "." || segment == ".." || segment[segment.Length - 1] == '.'
+                    || segment[segment.Length - 1] == ' ' || segment[0] == ' ')
+                {
+                    return false;
+                }
+
+                foreach (var c in segment)
+                {
+                    if (c < ' ' || c == '\\' || c == ':' || c == '*' || c == '?' || c == '"' || c == '<' || c == '>' || c == '|' || c == '')
+                    {
+                        return false;
+                    }
+                }
+            }
+            return true;
+        }
+
+        private sealed class Usable
+        {
+            public Rule Rule;
+            public string Source;
+        }
+
+        internal static Result Resolve(IList<EntryInfo> entries, IList<Rule> rules)
+        {
+            var result = new Result();
+            var usable = new List<Usable>();
+
+            if (rules.Count > MaxRules)
+            {
+                result.Problems.Add(new Problem { Code = CodeBadRule, Path = "" });
+            }
+
+            for (var r = 0; r < rules.Count && r < MaxRules; r++)
+            {
+                var rule = rules[r];
+                var source = NormalizePath(rule.Source ?? "");
+                if (rule.IsFolder) { source = source.TrimEnd('/') + "/"; }
+
+                var sub = NormalizePath(rule.SubFolder ?? "").TrimEnd('/');
+                var label = rule.Source ?? "";
+                if (source.Length <= (rule.IsFolder ? 1 : 0) || !IsSafePath(source.TrimEnd('/')))
+                {
+                    result.Problems.Add(new Problem { Code = CodeBadRule, Path = label });
+                }
+                else if (!IsRole(rule.Role))
+                {
+                    result.Problems.Add(new Problem { Code = CodeBadRule, Path = label });
+                }
+                else if (sub.Length > 0 && (rule.Role == RoleSkip || !IsSafePath(sub)))
+                {
+                    result.Problems.Add(new Problem { Code = CodeBadRule, Path = label });
+                }
+                else
+                {
+                    usable.Add(new Usable { Rule = rule, Source = source });
+                }
+            }
+
+            var destinations = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            foreach (var entry in entries)
+            {
+                var path = NormalizePath(entry.Path);
+                if (!IsSafePath(path))
+                {
+                    result.Entries.Add(new MappedEntry { Path = path, Size = entry.Size, Action = EntryAction.Unassigned, Role = "", Destination = "" });
+                    result.Problems.Add(new Problem { Code = CodeUnsafePath, Path = path });
+                    continue;
+                }
+
+                var match = Match(path, usable);
+                if (match == null)
+                {
+                    result.Entries.Add(new MappedEntry { Path = path, Size = entry.Size, Action = EntryAction.Unassigned, Role = "", Destination = "" });
+                    result.Problems.Add(new Problem { Code = CodeUnassigned, Path = path });
+                    continue;
+                }
+
+                var rule = match.Rule;
+                var source = match.Source;
+                if (rule.Role == RoleSkip)
+                {
+                    result.Entries.Add(new MappedEntry { Path = path, Size = entry.Size, Action = EntryAction.Skip, Role = RoleSkip, Destination = "" });
+                    continue;
+                }
+
+                var below = rule.IsFolder ? path.Substring(source.Length) : path.Substring(path.LastIndexOf('/') + 1);
+                var sub = NormalizePath(rule.SubFolder ?? "").TrimEnd('/');
+                var destination = rule.Role + "/" + (sub.Length > 0 ? sub + "/" : "") + below;
+                result.Entries.Add(new MappedEntry
+                {
+                    Path = path, Size = entry.Size, Action = EntryAction.Install, Role = rule.Role, Destination = destination, KeepExisting = rule.KeepExisting
+                });
+
+                if (IsExecutable(path))
+                {
+                    result.Problems.Add(new Problem { Code = CodeExecutable, Path = path });
+                }
+
+                if (path.EndsWith(".cs", StringComparison.OrdinalIgnoreCase) && rule.Role != RolePlugins)
+                {
+                    result.Problems.Add(new Problem { Code = CodeOutsidePlugins, Path = path });
+                }
+
+                if (!IsSafePath(destination))
+                {
+                    result.Problems.Add(new Problem { Code = CodeUnsafePath, Path = path });
+                }
+                else
+                {
+                    string other;
+                    if (destinations.TryGetValue(destination, out other))
+                    {
+                        result.Problems.Add(new Problem { Code = CodeCollision, Path = path });
+                    }
+                    else
+                    {
+                        destinations[destination] = path;
+                    }
+                }
+            }
+
+            return result;
+        }
+
+        // The rule that decides the path: a rule for that exact file (the first one), else the deepest folder rule above it, else none.
+        private static Usable Match(string path, List<Usable> rules)
+        {
+            Usable best = null;
+            foreach (var candidate in rules)
+            {
+                if (!candidate.Rule.IsFolder)
+                {
+                    if (string.Equals(candidate.Source, path, StringComparison.Ordinal)) { return candidate; }
+                    continue;
+                }
+
+                if (path.StartsWith(candidate.Source, StringComparison.Ordinal) && (best == null || candidate.Source.Length > best.Source.Length))
+                {
+                    best = candidate;
+                }
+            }
+            return best;
+        }
+
+        // The rules from the command argument: URL-safe base64 of one line per rule, F|E, source, role, sub folder, 1|0 (tab separated). Null if
+        // it is not that, or has no rules or too many.
+        internal static List<Rule> Decode(string encoded)
+        {
+            if (string.IsNullOrEmpty(encoded) || encoded.Length > MaxEncodedLength) { return null; }
+
+            try
+            {
+                var padded = encoded.Replace('-', '+').Replace('_', '/');
+                padded = padded.PadRight(padded.Length + (4 - padded.Length % 4) % 4, '=');
+                var text = new UTF8Encoding(false, true).GetString(Convert.FromBase64String(padded));
+                var rules = new List<Rule>();
+                foreach (var line in text.Split(new[] { '\n' }, StringSplitOptions.RemoveEmptyEntries))
+                {
+                    var fields = line.Split('\t');
+                    if (fields.Length != 5 || !(fields[0] == "F" || fields[0] == "E") || !(fields[4] == "0" || fields[4] == "1"))
+                    {
+                        return null;
+                    }
+
+                    rules.Add(new Rule { IsFolder = fields[0] == "F", Source = fields[1], Role = fields[2], SubFolder = fields[3], KeepExisting = fields[4] == "1" });
+                }
+
+                return rules.Count > 0 && rules.Count <= MaxRules ? rules : null;
+            }
+            catch (Exception)
+            {
+                return null;
+            }
+        }
+
+        // ---- where the roles are on this server ------------------------------------------------------------
+
+        // The framework's folder: the one the plugins folder is in (oxide or carbon).
+        internal static string FrameworkRoot(string pluginDirectory)
+        {
+            if (string.IsNullOrEmpty(pluginDirectory)) { return null; }
+            var trimmed = pluginDirectory.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+            var root = Path.GetDirectoryName(trimmed);
+            return string.IsNullOrEmpty(root) ? null : root;
+        }
+
+        // plugins: the plugins folder; data and lang: beside it; config: "configs" if that folder exists, else "config" if that does, else "configs"
+        // for Carbon (a folder named carbon) and "config" for anything else (Oxide).
+        internal static string RoleFolder(string role, string pluginDirectory)
+        {
+            var root = FrameworkRoot(pluginDirectory);
+            if (root == null) { return null; }
+
+            switch (role)
+            {
+                case RolePlugins: return pluginDirectory;
+                case RoleData: return Path.Combine(root, "data");
+                case RoleLang: return Path.Combine(root, "lang");
+                case RoleConfig:
+                    var configs = Path.Combine(root, "configs");
+                    var config = Path.Combine(root, "config");
+                    if (Directory.Exists(configs)) { return configs; }
+                    if (Directory.Exists(config)) { return config; }
+                    return string.Equals(Path.GetFileName(root), "carbon", StringComparison.OrdinalIgnoreCase) ? configs : config;
+                default: return null;
+            }
+        }
+
+        private static string Bare(string path)
+        {
+            return Path.GetFullPath(path).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+        }
+
+        internal static bool SamePath(string a, string b)
+        {
+            try { return string.Equals(Bare(a), Bare(b), StringComparison.Ordinal); }
+            catch (Exception) { return false; }
+        }
+
+        // Strictly inside the folder (the folder itself is not).
+        internal static bool IsInside(string folder, string path, StringComparison comparison)
+        {
+            try
+            {
+                var prefix = Bare(folder) + Path.DirectorySeparatorChar;
+                return Path.GetFullPath(path).StartsWith(prefix, comparison);
+            }
+            catch (Exception)
+            {
+                return false;
+            }
+        }
+
+        // A folder between the role's folder and the file, or the file itself, that is a link (symbolic link, junction) could lead out of the folder.
+        internal static bool PassesThroughLink(string folder, string destination)
+        {
+            try
+            {
+                var directory = Path.GetDirectoryName(destination);
+                while (directory != null && IsInside(folder, directory, StringComparison.Ordinal))
+                {
+                    if (Directory.Exists(directory) && (File.GetAttributes(directory) & FileAttributes.ReparsePoint) != 0) { return true; }
+                    directory = Path.GetDirectoryName(directory);
+                }
+
+                return File.Exists(destination) && (File.GetAttributes(destination) & FileAttributes.ReparsePoint) != 0;
+            }
+            catch (Exception)
+            {
+                return true;
+            }
+        }
+    }
+
+    // Reads a zip archive without the plugin depending on System.IO.Compression at COMPILE time: the game server compiles this file itself, and if its
+    // compiler does not reference that assembly a plain "using" would stop the whole plugin from compiling. So the assembly is looked up by name when
+    // it is needed, and everything below is reflection. If it cannot be found the plugin works as before and only loses the zip capability.
+    internal sealed class ArchonZipArchive : IDisposable
+    {
+        internal const int MaxEntries = 2000;
+        private const string Namespace = "System.IO.Compression.";
+
+        internal sealed class Entry
+        {
+            public string Name;
+            public long Length;
+            internal object Raw;
+        }
+
+        private sealed class Members
+        {
+            public System.Reflection.ConstructorInfo Constructor;
+            public object ReadMode;
+            public System.Reflection.PropertyInfo Entries;
+            public System.Reflection.PropertyInfo FullName;
+            public System.Reflection.PropertyInfo Length;
+            public System.Reflection.MethodInfo Open;
+        }
+
+        private readonly MemoryStream _stream;
+        private readonly object _archive;
+        private readonly Members _members;
+
+        // Files only (folder entries are dropped), in archive order. Empty when there are more entries than MaxEntries.
+        internal readonly List<Entry> Files = new List<Entry>();
+        internal int EntryCount;
+        internal bool TooManyEntries;
+
+        private ArchonZipArchive(MemoryStream stream, object archive, Members members)
+        {
+            _stream = stream;
+            _archive = archive;
+            _members = members;
+        }
+
+        // The zip archive type if it can be loaded by name AND has every member this reader needs; otherwise null.
+        internal static Type DefaultLoadType()
+        {
+            Type type = null;
+            try { type = Type.GetType(Namespace + "ZipArchive, System.IO.Compression", false); }
+            catch (Exception) { }
+
+            if (type == null)
+            {
+                try { type = System.Reflection.Assembly.Load("System.IO.Compression").GetType(Namespace + "ZipArchive", false); }
+                catch (Exception) { }
+            }
+
+            return Resolve(type) == null ? null : type;
+        }
+
+        internal static bool CanRead(Type zip)
+        {
+            return Resolve(zip) != null;
+        }
+
+        private static Members Resolve(Type zip)
+        {
+            if (zip == null) { return null; }
+
+            try
+            {
+                var assembly = zip.Assembly;
+                var mode = assembly.GetType(Namespace + "ZipArchiveMode", false);
+                var entry = assembly.GetType(Namespace + "ZipArchiveEntry", false);
+                if (mode == null || entry == null || !mode.IsEnum) { return null; }
+
+                var members = new Members
+                {
+                    Constructor = zip.GetConstructor(new[] { typeof(Stream), mode }),
+                    ReadMode = Enum.Parse(mode, "Read"),
+                    Entries = zip.GetProperty("Entries"),
+                    FullName = entry.GetProperty("FullName"),
+                    Length = entry.GetProperty("Length"),
+                    Open = entry.GetMethod("Open", Type.EmptyTypes)
+                };
+
+                if (members.Constructor == null || members.Entries == null || members.FullName == null || members.Length == null || members.Open == null)
+                {
+                    return null;
+                }
+                return members;
+            }
+            catch (Exception)
+            {
+                return null;
+            }
+        }
+
+        // Throws (IOException and friends) for something that is not a readable zip archive.
+        internal static ArchonZipArchive Open(Type zip, byte[] bytes)
+        {
+            var members = Resolve(zip);
+            if (members == null) { throw new InvalidOperationException("the zip reader is not usable on this server"); }
+
+            var stream = new MemoryStream(bytes, false);
+            try
+            {
+                var archive = members.Constructor.Invoke(new object[] { stream, members.ReadMode });
+                var result = new ArchonZipArchive(stream, archive, members);
+                result.ListEntries();
+                return result;
+            }
+            catch (System.Reflection.TargetInvocationException e)
+            {
+                stream.Dispose();
+                var inner = e.InnerException ?? e;
+                throw new IOException(inner.GetType().Name + ": " + inner.Message);
+            }
+            catch (Exception)
+            {
+                stream.Dispose();
+                throw;
+            }
+        }
+
+        private void ListEntries()
+        {
+            var entries = (System.Collections.IEnumerable)_members.Entries.GetValue(_archive, null);
+
+            // How many, before any of them is looked at.
+            var collection = entries as System.Collections.ICollection;
+            if (collection != null)
+            {
+                EntryCount = collection.Count;
+                if (EntryCount > MaxEntries) { TooManyEntries = true; return; }
+            }
+
+            var seen = 0;
+            foreach (var raw in entries)
+            {
+                seen++;
+                if (seen > MaxEntries)
+                {
+                    EntryCount = seen;
+                    TooManyEntries = true;
+                    Files.Clear();
+                    return;
+                }
+
+                var name = (string)_members.FullName.GetValue(raw, null);
+                if (name == null || name.EndsWith("/", StringComparison.Ordinal)) { continue; }
+                Files.Add(new Entry { Name = name, Length = Convert.ToInt64(_members.Length.GetValue(raw, null)), Raw = raw });
+            }
+            if (collection == null) { EntryCount = seen; }
+        }
+
+        internal Stream OpenEntry(Entry entry)
+        {
+            try
+            {
+                return (Stream)_members.Open.Invoke(entry.Raw, null);
+            }
+            catch (System.Reflection.TargetInvocationException e)
+            {
+                var inner = e.InnerException ?? e;
+                throw new IOException(inner.GetType().Name + ": " + inner.Message);
+            }
+        }
+
+        public void Dispose()
+        {
+            var disposable = _archive as IDisposable;
+            if (disposable != null) { try { disposable.Dispose(); } catch (Exception) { } }
+            _stream.Dispose();
         }
     }
 

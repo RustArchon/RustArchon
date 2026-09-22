@@ -20,6 +20,7 @@ using RustArchon.Api.Data;
 using RustArchon.Api.Infrastructure;
 using RustArchon.Api.Infrastructure.Security;
 using RustArchon.Api.Repositories;
+using RustArchon.Api.Services;
 using RustArchon.Messaging.Contracts;
 using RustArchon.Shared.DTOs;
 
@@ -73,7 +74,8 @@ public class RustServersControllerGetEventsFilteringTests
             Mock.Of<IServerPluginStatusRepository>(),
             Mock.Of<IPluginScriptService>(),
             Mock.Of<IPluginUpdateService>(),
-            subscriptionRepository);
+            subscriptionRepository,
+            Mock.Of<IServerPollService>());
 
         // ControllerBase.User reads through ControllerContext.HttpContext.User - not set by the
         // constructor above at all outside a real MVC request pipeline, so this test wires it up
