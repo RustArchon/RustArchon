@@ -24,8 +24,12 @@ public static class LogRedactor
     // name (containing a secret-ish word), separator, then the value: quoted (may hold spaces) or a run up to a delimiter. A Bearer/Basic
     // scheme in front belongs to the value. Never re-matches an already masked value.
     private static readonly Regex NameValue = new(
-        """(?<name>[\w\-.]{0,64}(?:password|passwd|pwd|secret|token|apikey|api[-_]?key|credential|authorization|connectionstring|key)[\w\-.]{0,64})(?<sep>"?\s*[:=]\s*)(?!"?\[REDACTED\])(?<value>"(?:[^"\\]|\\.)*"|(?:(?:Bearer|Basic)\s+)?[^\s"&;,'}\]]+)""",
+        """(?<name>[\w\-.]{0,64}(?:password|passwd|pwd|secret|token|apikey|api[-_]?key|credential|authorization|connectionstring|pass|cookie|session|signature|sig|auth|private|key)[\w\-.]{0,64})(?<sep>"?\s*[:=]\s*)(?!"?\[REDACTED\])(?<value>"(?:[^"\\]|\\.)*"|(?:(?:Bearer|Basic)\s+)?[^\s"&;,'}\]]+)""",
         Options, MatchTimeout);
+
+    // A Cookie / Set-Cookie header carries several name=value pairs separated by semicolons, so the whole line goes.
+    private static readonly Regex CookieLine = new(
+        """(?<name>\b(?:set-)?cookie)(?<sep>[ \t]*:[ \t]*)(?!\[REDACTED\])(?<value>[^\r\n]+)""", Options, MatchTimeout);
 
     private static readonly Regex BearerScheme = new("""(?<scheme>\bBearer\s+)(?!\[REDACTED\])[\w\-.~+/=]+""", Options, MatchTimeout);
 
@@ -65,6 +69,7 @@ public static class LogRedactor
         try
         {
             var result = PemPrivateKey.Replace(text, Mask);
+            result = CookieLine.Replace(result, m => m.Groups["name"].Value + m.Groups["sep"].Value + Mask);
             result = NameValue.Replace(result, m => m.Groups["name"].Value + m.Groups["sep"].Value + MaskedLike(m.Groups["value"].Value));
             result = BearerScheme.Replace(result, m => m.Groups["scheme"].Value + Mask);
             result = Jwt.Replace(result, Mask);

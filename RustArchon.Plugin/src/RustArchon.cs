@@ -4861,8 +4861,11 @@ namespace Oxide.Plugins
             System.Text.RegularExpressions.RegexOptions.IgnoreCase | System.Text.RegularExpressions.RegexOptions.CultureInvariant;
 
         private static readonly System.Text.RegularExpressions.Regex NameValue = new System.Text.RegularExpressions.Regex(
-            @"(?<name>[\w\-.]{0,64}(?:password|passwd|pwd|secret|token|apikey|api[-_]?key|credential|authorization|connectionstring|key)[\w\-.]{0,64})(?<sep>""?\s*[:=]\s*)(?!""?\[REDACTED\])(?<value>""(?:[^""\\]|\\.)*""|(?:(?:Bearer|Basic)\s+)?[^\s""&;,'}\]]+)",
+            @"(?<name>[\w\-.]{0,64}(?:password|passwd|pwd|secret|token|apikey|api[-_]?key|credential|authorization|connectionstring|pass|cookie|session|signature|sig|auth|private|key)[\w\-.]{0,64})(?<sep>""?\s*[:=]\s*)(?!""?\[REDACTED\])(?<value>""(?:[^""\\]|\\.)*""|(?:(?:Bearer|Basic)\s+)?[^\s""&;,'}\]]+)",
             Options, Timeout);
+
+        private static readonly System.Text.RegularExpressions.Regex CookieLine = new System.Text.RegularExpressions.Regex(
+            @"(?<name>\b(?:set-)?cookie)(?<sep>[ \t]*:[ \t]*)(?!\[REDACTED\])(?<value>[^\r\n]+)", Options, Timeout);
 
         private static readonly System.Text.RegularExpressions.Regex BearerScheme = new System.Text.RegularExpressions.Regex(
             @"(?<scheme>\bBearer\s+)(?!\[REDACTED\])[\w\-.~+/=]+", Options, Timeout);
@@ -4899,6 +4902,7 @@ namespace Oxide.Plugins
             {
                 var result = text.Length > InputLimit ? text.Substring(0, InputLimit) : text;
                 result = PemPrivateKey.Replace(result, Mask);
+                result = CookieLine.Replace(result, delegate (System.Text.RegularExpressions.Match m) { return m.Groups["name"].Value + m.Groups["sep"].Value + Mask; });
                 result = NameValue.Replace(result, delegate (System.Text.RegularExpressions.Match m)
                 {
                     var value = m.Groups["value"].Value;

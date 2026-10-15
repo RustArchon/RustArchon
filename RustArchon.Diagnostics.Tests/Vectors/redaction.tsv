@@ -19,3 +19,11 @@ singleUseTok3n	Sent archon.map.upload https://panel.test/ingest/plugin-map singl
 rc0nP4ssw0rd	WebSocket connecting to ws://10.0.0.5:28016/rc0nP4ssw0rd
 MIIEowIBAAKCAQEA	Loaded key -----BEGIN RSA PRIVATE KEY-----\nMIIEowIBAAKCAQEA\nabc\n-----END RSA PRIVATE KEY-----
 k3Jx9QpLm2VbN7tYcW1RzHdAeGuIoS5fT8qXwZaBnMc	Token minted k3Jx9QpLm2VbN7tYcW1RzHdAeGuIoS5fT8qXwZaBnMc for update
+hunter2z	login with pass=hunter2z now
+c00kieVal	Cookie: sid=c00kieVal; theme=dark
+sessVal123	Set-Cookie: session=sessVal123; Path=/; HttpOnly
+s3ss10n	Resumed session_id=s3ss10n for user
+sigValue99	Request signature=sigValue99 verified
+sigV4lu3	header sig: sigV4lu3 received
+authV4lu3	callback auth=authV4lu3 ok
+privV4lu3	loaded private=privV4lu3 for signing
