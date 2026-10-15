@@ -1911,11 +1911,11 @@ public class ThirdPartyPluginUpdateServiceTests(PostgresFixture postgres) : ICla
 
     // ---- the automatic pass -------------------------------------------------------------------------------------------------
 
-    private ThirdPartyPluginAutoUpdater AutoUpdater(Harness h, bool enabled = true)
+    private ThirdPartyPluginAutoUpdater AutoUpdater(Harness h, bool enabled = true, Microsoft.Extensions.Logging.ILogger<ThirdPartyPluginAutoUpdater>? logger = null)
     {
         var settings = new Mock<IPlatformSettingsCache>();
         settings.Setup(x => x.GetBooleanAsync(PlatformSettingsRegistry.ThirdPartyPluginAutoUpdatesEnabled, true)).ReturnsAsync(enabled);
-        return new ThirdPartyPluginAutoUpdater(new ApiDbContext(postgres.Options), h.Service, settings.Object, NullLogger<ThirdPartyPluginAutoUpdater>.Instance);
+        return new ThirdPartyPluginAutoUpdater(new ApiDbContext(postgres.Options), h.Service, settings.Object, logger ?? NullLogger<ThirdPartyPluginAutoUpdater>.Instance);
     }
 
     // The pass considers every opted-in server in the database; these tests share one, so each pass is judged by what it did to ITS server.
@@ -1931,6 +1931,21 @@ public class ThirdPartyPluginUpdateServiceTests(PostgresFixture postgres) : ICla
 
         Assert.True(SentFor(h, s.ServerId));
         Assert.Equal(PluginUpdateTriggers.Auto, Assert.Single(await UpdatesAsync(s.ServerId)).Trigger);
+    }
+
+    [Fact]
+    public async Task AServerThatHasNotOptedInIsSaidToHaveNotOptedInInTheLog()
+    {
+        var s = await SeedAsync(o => o.OptedIn = false);
+        var h = Build(s);
+        var logger = new RecordingLogger<ThirdPartyPluginAutoUpdater>();
+
+        await AutoUpdater(h, logger: logger).RunPassAsync(T0);
+
+        Assert.False(SentFor(h, s.ServerId));
+        var said = Assert.Single(logger.Entries, e => e.Message.Contains(s.ServerId.ToString()));
+        Assert.Contains("not opted in", said.Message);
+        Assert.True(said.Level >= Microsoft.Extensions.Logging.LogLevel.Information);
     }
 
     [Fact]
