@@ -143,6 +143,37 @@ public class ThirdPartyUpdateDecisionLogTests
     }
 
     [Fact]
+    public void AServerThatHasNotOptedInIsSaidSoOnceAndAgainOnlyAfterItOptedInAndOut()
+    {
+        var logger = new CapturingLogger();
+        var server = NewServer();
+
+        ThirdPartyUpdateDecisionLog.OptIn(logger, server, optedIn: false);
+        ThirdPartyUpdateDecisionLog.OptIn(logger, server, optedIn: false);
+
+        var entry = Assert.Single(logger.Entries);
+        Assert.Equal(LogLevel.Information, entry.Level);
+        Assert.Contains(server.ToString(), entry.Message);
+        Assert.Contains("not opted in", entry.Message);
+        Assert.Equal(server, entry.State["ServerId"]);
+
+        ThirdPartyUpdateDecisionLog.OptIn(logger, server, optedIn: true);
+        ThirdPartyUpdateDecisionLog.OptIn(logger, server, optedIn: false);
+
+        Assert.Equal(2, logger.Entries.Count);
+    }
+
+    [Fact]
+    public void ServerThatIsOptedInSaysNothing()
+    {
+        var logger = new CapturingLogger();
+
+        ThirdPartyUpdateDecisionLog.OptIn(logger, NewServer(), optedIn: true);
+
+        Assert.Empty(logger.Entries);
+    }
+
+    [Fact]
     public void NoKnownOutdatedPluginsIsSaidOnceAndAgainOnlyAfterSomeAppeared()
     {
         var logger = new CapturingLogger();
