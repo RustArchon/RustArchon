@@ -79,6 +79,20 @@ public class ServerThirdPartyUpdatesControllerTests
     }
 
     [Fact]
+    public async Task TheCodeOfWhatIsBlockingAnOfferIsPassedOn()
+    {
+        _notices.Setup(n => n.GetForServerAsync(ServerId)).ReturnsAsync([new PluginUpdateNotice { RustServerId = ServerId, Name = "Kits", NormalizedName = "kits" }]);
+        _updates.Setup(u => u.GetOffersAsync(It.IsAny<RustServer>(), Now)).ReturnsAsync(new Dictionary<string, ThirdPartyUpdateOffer>
+        {
+            ["kits"] = new(ThirdPartyUpdateOfferStates.Ready, "not signed", Sha, false, null, BlockCode: "not_signed_by_this_panel")
+        });
+
+        var result = Assert.IsType<OkObjectResult>((await Controller().Get(ServerId)).Result);
+
+        Assert.Equal("not_signed_by_this_panel", Assert.Single(Assert.IsType<List<ThirdPartyPluginUpdateOfferDto>>(result.Value)).BlockCode);
+    }
+
+    [Fact]
     public async Task EachOfferCarriesThePluginsOwnCapitalizationAndIsListedByName()
     {
         _notices.Setup(n => n.GetForServerAsync(ServerId)).ReturnsAsync(

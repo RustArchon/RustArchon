@@ -169,6 +169,47 @@ public class ServerDetailPluginCardTests : BunitContext
 
     private static string CardText(IRenderedComponent<ServerDetail> cut) => cut.Find(".rustarchon-plugin-card").TextContent;
 
+    // ---- the header says when the plugin is not from this Panel (change 002) ----------------------------------
+
+    [Fact]
+    public void ThePluginSignedByAnotherPanelIsSaidInTheHeaderWithALinkToThePluginsTab()
+    {
+        GivenPluginListed();
+        GivenSigning("valid", matchesThisPanel: false);
+        GivenHandshake();
+
+        var cut = RenderPluginsTab();
+
+        var badge = cut.WaitForElement("[data-testid=plugin-not-signed-badge]");
+        Assert.Contains("not signed by this Panel", badge.TextContent);
+        Assert.EndsWith("?tab=plugins", badge.GetAttribute("href"));
+    }
+
+    [Fact]
+    public void ARevokedKeyIsAlsoSaidInTheHeader()
+    {
+        GivenPluginListed();
+        GivenSigning("valid", matchesThisPanel: false);
+        GivenKeyState("revoked");
+        GivenHandshake();
+
+        Assert.NotNull(RenderPluginsTab().WaitForElement("[data-testid=plugin-not-signed-badge]"));
+    }
+
+    [Fact]
+    public void APluginSignedByThisPanelHasNoBadge()
+    {
+        GivenPluginListed();
+        GivenSigning("valid", matchesThisPanel: true);
+        GivenKeyState("active");
+        GivenHandshake();
+
+        var cut = RenderPluginsTab();
+        cut.WaitForAssertion(() => Assert.Contains("Version", CardText(cut)));
+
+        Assert.Empty(cut.FindAll("[data-testid=plugin-not-signed-badge]"));
+    }
+
     // ---- fail closed ---------------------------------------------------------------------------------------
 
     [Fact]

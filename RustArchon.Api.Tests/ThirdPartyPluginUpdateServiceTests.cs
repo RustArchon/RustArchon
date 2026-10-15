@@ -1184,7 +1184,7 @@ public class ThirdPartyPluginUpdateServiceTests(PostgresFixture postgres) : ICla
 
         Assert.NotNull(offer);
         Assert.Equal((ThirdPartyUpdateOfferStates.Ready, false), (offer.State, offer.CanApply));
-        Assert.Contains("has not reported recently", offer.Detail);
+        Assert.Contains("too old to update other plugins", offer.Detail);
     }
 
     [Fact]
@@ -1196,7 +1196,7 @@ public class ThirdPartyPluginUpdateServiceTests(PostgresFixture postgres) : ICla
 
         Assert.NotNull(offer);
         Assert.False(offer.CanApply);
-        Assert.Contains("has not reported recently", offer.Detail);
+        Assert.Contains("has not been heard from recently", offer.Detail);
     }
 
     [Fact]
@@ -1247,7 +1247,7 @@ public class ThirdPartyPluginUpdateServiceTests(PostgresFixture postgres) : ICla
         Assert.NotNull(offer);
         Assert.False(offer.CanApply);
         Assert.Contains("download_failed", offer.Detail);
-        Assert.Contains("has not reported recently", offer.Detail);
+        Assert.Contains("too old to update other plugins", offer.Detail);
     }
 
     [Fact]
@@ -1275,7 +1275,7 @@ public class ThirdPartyPluginUpdateServiceTests(PostgresFixture postgres) : ICla
 
         Assert.NotNull(offer);
         Assert.False(offer.CanApply);
-        Assert.Contains("has not reported recently", offer.Detail);
+        Assert.Contains("too old to update other plugins", offer.Detail);
         Assert.DoesNotContain("not found a different file", offer.Detail);
     }
 
@@ -1911,11 +1911,11 @@ public class ThirdPartyPluginUpdateServiceTests(PostgresFixture postgres) : ICla
 
     // ---- the automatic pass -------------------------------------------------------------------------------------------------
 
-    private ThirdPartyPluginAutoUpdater AutoUpdater(Harness h, bool enabled = true, Microsoft.Extensions.Logging.ILogger<ThirdPartyPluginAutoUpdater>? logger = null)
+    private ThirdPartyPluginAutoUpdater AutoUpdater(Harness h, bool enabled = true, Microsoft.Extensions.Logging.ILogger<ThirdPartyPluginAutoUpdater>? logger = null, ThirdPartyAutoUpdateStatus? status = null)
     {
         var settings = new Mock<IPlatformSettingsCache>();
         settings.Setup(x => x.GetBooleanAsync(PlatformSettingsRegistry.ThirdPartyPluginAutoUpdatesEnabled, true)).ReturnsAsync(enabled);
-        return new ThirdPartyPluginAutoUpdater(new ApiDbContext(postgres.Options), h.Service, settings.Object, logger ?? NullLogger<ThirdPartyPluginAutoUpdater>.Instance);
+        return new ThirdPartyPluginAutoUpdater(new ApiDbContext(postgres.Options), h.Service, settings.Object, status ?? new ThirdPartyAutoUpdateStatus(), logger ?? NullLogger<ThirdPartyPluginAutoUpdater>.Instance);
     }
 
     // The pass considers every opted-in server in the database; these tests share one, so each pass is judged by what it did to ITS server.
@@ -2074,5 +2074,130 @@ public class ThirdPartyPluginUpdateServiceTests(PostgresFixture postgres) : ICla
         await AutoUpdater(h).RunPassAsync(T0);
 
         Assert.True(SentFor(h, good.ServerId));
+    }
+
+    // ---- the offer says what a start would say (change 002) ---------------------------------------------------------------
+
+    [Theory]
+    [InlineData("server_disabled")]
+    [InlineData("no_handshake")]
+    [InlineData("stale_status")]
+    [InlineData("unsigned")]
+    [InlineData("foreign_key")]
+    [InlineData("key_revoked")]
+    [InlineData("plugin_too_old")]
+    public async Task AServerLevelReasonIsSaidOnTheOfferAndIsTheOneAStartGives(string reason)
+    {
+        var s = await SeedAsync(o => o.Enabled = reason != "server_disabled");
+        var h = reason switch
+        {
+            "no_handshake" => Build(s, noStatus: true),
+            "stale_status" => Build(s, status: st => st.CapturedAtUtc = T0.AddMinutes(-16)),
+            "unsigned" => Build(s, status: st => st.SigningState = "unsigned"),
+            "foreign_key" => Build(s, key: null),
+            "key_revoked" => Build(s, key: PluginKeyState.Revoked),
+            "plugin_too_old" => Build(s, status: st => st.Capabilities = ["config"]),
+            _ => Build(s)
+        };
+        var server = s.Server(enabled: reason != "server_disabled");
+
+        var offer = (await h.Service.GetOffersAsync(server, T0)).GetValueOrDefault(s.Normalized);
+        var started = await h.Service.StartAsync(server, s.Name, PluginUpdateTriggers.Manual, Sha);
+
+        var expected = reason switch { "unsigned" or "foreign_key" => "not_signed_by_this_panel", _ => reason };
+        Assert.NotNull(offer);
+        Assert.False(offer.CanApply);
+        Assert.Equal(expected, offer.BlockCode);
+        Assert.False(started.Started);
+        Assert.Equal(started.Code, offer.BlockCode);
+        Assert.Contains(started.Message, offer.Detail);
+    }
+
+    [Fact]
+    public async Task ThePluginNotBeingSignedByThisPanelSaysWhatToDoAboutIt()
+    {
+        var s = await SeedAsync();
+
+        var offer = await OfferAsync(s, Build(s, key: null));
+
+        Assert.NotNull(offer);
+        Assert.Contains("Admin, Plugin", offer.Detail);
+    }
+
+    [Fact]
+    public async Task AnOfferWithNothingBlockingItHasNoBlockCode()
+    {
+        var offer = await OfferAsync(await SeedAsync());
+
+        Assert.NotNull(offer);
+        Assert.Null(offer.BlockCode);
+    }
+
+    [Fact]
+    public async Task AnUpdateInProgressNamesItsOwnBlockCode()
+    {
+        var s = await SeedAsync();
+        await AddUpdateAsync(s, ThirdPartyPluginUpdateStates.Started, T0.AddMinutes(-1), toVersion: "9.9.9");
+
+        var offer = await OfferAsync(s);
+
+        Assert.NotNull(offer);
+        Assert.Equal("in_progress", offer.BlockCode);
+    }
+
+    [Fact]
+    public async Task TheServerLevelRefusalForAnAutomaticStartAlsoNamesTheOptInAndTheWipeHold()
+    {
+        var s = await SeedAsync(o => o.OptedIn = false);
+        var h = Build(s);
+
+        Assert.Null(await h.Service.GetServerRefusalAsync(s.Server(optedIn: false), T0, automatic: false));
+        Assert.Equal("not_opted_in", (await h.Service.GetServerRefusalAsync(s.Server(optedIn: false), T0, automatic: true))?.Code);
+        Assert.Equal("held_for_wipe", (await Build(s, now: HeldTime).Service.GetServerRefusalAsync(s.Server(), HeldTime, automatic: true))?.Code);
+    }
+
+    [Fact]
+    public async Task ThePlanNotOfferingTheFeatureIsAServerLevelRefusal()
+    {
+        var s = await SeedAsync(o => o.PlanOffers = false);
+
+        var refusal = await Build(s).Service.GetServerRefusalAsync(s.Server(), T0, automatic: false);
+
+        Assert.Equal("plan_does_not_offer", refusal?.Code);
+    }
+
+    [Fact]
+    public async Task AHealthyServerHasNoServerLevelRefusal()
+    {
+        var s = await SeedAsync();
+
+        Assert.Null(await Build(s).Service.GetServerRefusalAsync(s.Server(), T0, automatic: true));
+    }
+
+    [Fact]
+    public async Task APassRecordsWhenItRanAndWhatItDid()
+    {
+        var s = await SeedAsync();
+        var h = Build(s);
+        var status = new ThirdPartyAutoUpdateStatus();
+        Assert.Null(status.Current.LastPassStartedUtc);
+
+        var started = await AutoUpdater(h, status: status).RunPassAsync(T0);
+
+        var snapshot = status.Current;
+        Assert.Equal(T0, snapshot.LastPassStartedUtc);
+        Assert.Equal(T0, snapshot.LastPassFinishedUtc);
+        Assert.True(snapshot.ServersVisited >= 1);
+        Assert.Equal(started, snapshot.UpdatesStarted);
+    }
+
+    [Fact]
+    public void TheNextPassIsRemembered()
+    {
+        var status = new ThirdPartyAutoUpdateStatus();
+
+        status.NextDue(T0.AddMinutes(5));
+
+        Assert.Equal(T0.AddMinutes(5), status.Current.NextPassDueUtc);
     }
 }

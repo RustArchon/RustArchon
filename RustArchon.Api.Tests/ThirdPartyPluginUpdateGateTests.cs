@@ -1,6 +1,7 @@
 // Copyright ©2026 Scott Blomfield
 
 using System;
+using Moq;
 using System.ComponentModel.DataAnnotations;
 using System.Linq;
 using System.Threading.Tasks;
@@ -203,7 +204,9 @@ public class ThirdPartyPluginUpdateGateTests(PostgresFixture postgres) : IClassF
     // ---- the settings endpoint -----------------------------------------------------------------------------------
 
     private static ServerThirdPartyUpdateSettingsController Controller(Org org, TimeProvider clock) =>
-        new(new RustServerRepository(org.Context), new ThirdPartyPluginUpdateGate(org.Context), clock);
+        new(
+            new RustServerRepository(org.Context), new ThirdPartyPluginUpdateGate(org.Context), Mock.Of<IThirdPartyPluginUpdateService>(),
+            Mock.Of<RustArchon.Api.Infrastructure.IPlatformSettingsCache>(), new ThirdPartyAutoUpdateStatus(), clock);
 
     private static T Value<T>(ActionResult<T> result) => Assert.IsType<T>(Assert.IsType<OkObjectResult>(result.Result).Value);
 
