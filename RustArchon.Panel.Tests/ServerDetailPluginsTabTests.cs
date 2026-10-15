@@ -738,6 +738,86 @@ public class ServerDetailPluginsTabTests : BunitContext
         Assert.Single(cut.FindAll("[data-testid=third-party-updates]"));
     }
 
+    // ---- why the automatic updater will or will not act, and the remedy link (change 002) ---------------------------
+
+    [Fact]
+    public void AnEligibleServerSaysTheAutomaticUpdaterWillActAndWhenItLastRanAndNextRuns()
+    {
+        var settings = ThirdParty(enabled: true);
+        settings.AutoState = "eligible";
+        settings.LastPassUtc = new DateTimeOffset(2026, 9, 21, 9, 0, 0, TimeSpan.Zero);
+        settings.NextPassUtc = new DateTimeOffset(2026, 9, 21, 9, 5, 0, TimeSpan.Zero);
+
+        var cut = RenderWithThirdParty(settings);
+
+        Assert.Equal("eligible", cut.Find("[data-testid=third-party-auto-state]").GetAttribute("data-state"));
+        var pass = cut.Find("[data-testid=third-party-pass]").TextContent;
+        Assert.Contains("09:00", pass);
+        Assert.Contains("09:05", pass);
+        Assert.Empty(cut.FindAll("[data-testid=third-party-auto-remedy]"));
+    }
+
+    [Fact]
+    public void AServerTheUpdaterWillNotActOnSaysWhyWithALinkToTheFileWhenThatIsTheRemedy()
+    {
+        var settings = ThirdParty(enabled: true);
+        settings.AutoState = "not_signed_by_this_panel";
+        settings.AutoStateMessage = "The RustArchon plugin on this server was not signed by this Panel.";
+
+        var cut = RenderWithThirdParty(settings);
+
+        Assert.Equal("not_signed_by_this_panel", cut.Find("[data-testid=third-party-auto-state]").GetAttribute("data-state"));
+        Assert.Contains("not signed by this Panel", cut.Find("[data-testid=third-party-auto-state]").TextContent);
+        Assert.Equal("Admin/Plugin", cut.Find("[data-testid=third-party-auto-remedy]").GetAttribute("href"));
+    }
+
+    [Fact]
+    public void AReasonWithNoFileToGetHasNoLink()
+    {
+        var settings = ThirdParty(enabled: true);
+        settings.AutoState = "platform_switch_off";
+        settings.AutoStateMessage = "Switched off for the whole platform.";
+
+        var cut = RenderWithThirdParty(settings);
+
+        Assert.Contains("Switched off", cut.Find("[data-testid=third-party-auto-state]").TextContent);
+        Assert.Empty(cut.FindAll("[data-testid=third-party-auto-remedy]"));
+    }
+
+    [Fact]
+    public void BeforeAnyPassHasRunItSaysSo()
+    {
+        var settings = ThirdParty(enabled: true);
+        settings.NextPassUtc = new DateTimeOffset(2026, 9, 21, 9, 5, 0, TimeSpan.Zero);
+
+        var cut = RenderWithThirdParty(settings);
+
+        Assert.Contains("not run yet", cut.Find("[data-testid=third-party-pass]").TextContent);
+    }
+
+    [Fact]
+    public void AnOfferBlockedBecauseThePluginIsNotFromThisPanelLinksToWhereToGetTheFile()
+    {
+        var offer = Offer(canApply: false, detail: "The RustArchon plugin on this server was not signed by this Panel.");
+        offer.BlockCode = "not_signed_by_this_panel";
+
+        var cut = RenderWithOffer(offer);
+
+        Assert.Contains("not signed by this Panel", cut.Find("[data-testid=plugin-apply-status]").TextContent);
+        Assert.Equal("Admin/Plugin", cut.Find("[data-testid=plugin-apply-remedy]").GetAttribute("href"));
+    }
+
+    [Fact]
+    public void AnOfferBlockedForAnotherReasonHasNoLink()
+    {
+        var offer = Offer(canApply: false, detail: "Another update is in progress on this server.");
+        offer.BlockCode = "in_progress";
+
+        var cut = RenderWithOffer(offer);
+
+        Assert.Empty(cut.FindAll("[data-testid=plugin-apply-remedy]"));
+    }
+
     // ---- applying an update -----------------------------------------------------------------------------------------
 
     private const string OfferSha = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";

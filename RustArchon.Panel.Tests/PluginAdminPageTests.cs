@@ -292,6 +292,74 @@ public class PluginAdminPageTests : BunitContext
         Assert.DoesNotContain(module.Invocations, i => i.Identifier == "downloadBytes");
     }
 
+    // ---- the served plugin, signed for a server that trusts another Panel (change 002) ----------------------
+
+    [Theory]
+    [InlineData("main", "RustArchon.cs")]
+    [InlineData("updater", "RustArchonUpdater.cs")]
+    public void TheServedPluginCanBeDownloadedSignedWithNoReleasePublished(string kind, string fileName)
+    {
+        var module = JSInterop.SetupModule("./js/fileDownload.js");
+        module.SetupVoid("downloadBytes", _ => true).SetVoidResult();
+        _client.Setup(c => c.DownloadServedAsync(kind)).ReturnsAsync(FileResponse(fileName, "// signed served"));
+        var cut = RenderPage();
+
+        cut.Find($"[data-testid=download-served-{kind}]").Click();
+
+        cut.WaitForAssertion(() => Assert.NotEmpty(cut.FindAll("[data-testid=plugin-admin-success]")));
+        var call = Assert.Single(module.Invocations, i => i.Identifier == "downloadBytes");
+        Assert.Equal(fileName, call.Arguments[0]);
+        Assert.Contains("audit log", cut.Find("[data-testid=plugin-admin-success]").TextContent);
+        _client.Verify(c => c.DownloadServedAsync(kind), Times.Once);
+    }
+
+    [Fact]
+    public void TheServedDownloadSaysWhichKeyItIsSignedWithAndThatItIsOneFileForEveryServer()
+    {
+        var note = RenderPage().Find("[data-testid=served-install-note]").TextContent;
+
+        Assert.Contains("1111111111111111", note);
+        Assert.Contains("every server", note);
+        Assert.Contains("once", note);
+    }
+
+    [Fact]
+    public void AServedDownloadThatIsRefusedShowsTheApisSentence()
+    {
+        var module = JSInterop.SetupModule("./js/fileDownload.js");
+        module.SetupVoid("downloadBytes", _ => true).SetVoidResult();
+        _client.Setup(c => c.DownloadServedAsync("main")).ReturnsAsync(new HttpResponseMessage(HttpStatusCode.BadRequest) { Content = new StringContent("No signing key.") });
+        var cut = RenderPage();
+
+        cut.Find("[data-testid=download-served-main]").Click();
+
+        cut.WaitForAssertion(() => Assert.Contains("No signing key.", cut.Find("[data-testid=plugin-admin-error]").TextContent));
+        Assert.DoesNotContain(module.Invocations, i => i.Identifier == "downloadBytes");
+    }
+
+    [Fact]
+    public void WhenTheAutomaticThirdPartyPassLastRanAndNextRunsIsShown()
+    {
+        _releases.ThirdPartyLastPassUtc = new DateTimeOffset(2026, 10, 14, 9, 0, 0, TimeSpan.Zero);
+        _releases.ThirdPartyNextPassUtc = new DateTimeOffset(2026, 10, 14, 9, 5, 0, TimeSpan.Zero);
+
+        var text = RenderPage().Find("[data-testid=third-party-pass-admin]").TextContent;
+
+        Assert.Contains("09:00", text);
+        Assert.Contains("09:05", text);
+    }
+
+    [Fact]
+    public void BeforeTheFirstPassItSaysSo()
+    {
+        _releases.ThirdPartyNextPassUtc = new DateTimeOffset(2026, 10, 14, 9, 5, 0, TimeSpan.Zero);
+
+        var text = RenderPage().Find("[data-testid=third-party-pass-admin]").TextContent;
+
+        Assert.Contains("not run yet", text);
+        Assert.Contains("09:05", text);
+    }
+
     // ---- the audit log names the new actions ------------------------------------------------------------------
 
     [Theory]

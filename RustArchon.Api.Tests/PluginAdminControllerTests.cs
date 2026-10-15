@@ -14,6 +14,7 @@ using Moq;
 using RustArchon.Api.Controllers;
 using RustArchon.Api.Data;
 using RustArchon.Api.Infrastructure;
+using RustArchon.Api.Services;
 using RustArchon.Shared.DTOs;
 
 namespace RustArchon.Api.Tests;
@@ -30,11 +31,12 @@ public class PluginAdminControllerTests(PostgresFixture postgres) : IClassFixtur
     private readonly Mock<IPluginScriptService> _scripts = new();
     private readonly Mock<IPluginAdminAudit> _audit = new();
     private readonly Mock<IPluginRollout> _rollout = new();
+    private readonly ThirdPartyAutoUpdateStatus _autoStatus = new();
 
     private PluginAdminController Create(string? email = "admin@example.com", ApiDbContext? context = null)
     {
         var controller = new PluginAdminController(
-            _keys.Object, _releases.Object, context ?? new ApiDbContext(postgres.Options), _scripts.Object, _audit.Object, _rollout.Object, TimeProvider.System);
+            _keys.Object, _releases.Object, context ?? new ApiDbContext(postgres.Options), _scripts.Object, _audit.Object, _rollout.Object, _autoStatus, TimeProvider.System);
         var identity = new ClaimsIdentity(email is null ? [] : [new Claim(ClaimTypes.Email, email)], "test");
         controller.ControllerContext = new ControllerContext { HttpContext = new DefaultHttpContext { User = new ClaimsPrincipal(identity) } };
         return controller;
@@ -288,6 +290,61 @@ public class PluginAdminControllerTests(PostgresFixture postgres) : IClassFixtur
         _audit.Verify(a => a.RecordAsync(
             PluginAdminEventKind.ReleaseSigned, "Main 9.2.0", "admin@example.com",
             It.Is<string>(d => d.Contains("draft") && d.Contains("82b49184449c98f6"))), Times.Once);
+    }
+
+    [Fact]
+    public async Task TheServedBuiltInPluginCanBeDownloadedSignedWithNoReleasePublishedAndTheDownloadIsRecorded()
+    {
+        _releases.Setup(r => r.ResolveAsync(PluginReleaseKind.Main)).ReturnsAsync(new PluginServedSource("built-in source", "0.11.0", false, null));
+        _scripts.Setup(s => s.SignSourceAsync("built-in source", PluginReleaseKind.Main)).ReturnsAsync(new PluginScript(SignedBytes, "82b49184449c98f6", "0.11.0"));
+
+        var controller = Create();
+        var result = await controller.DownloadServed("main");
+
+        var file = Assert.IsType<FileContentResult>(result);
+        Assert.Equal(SignedBytes, file.FileContents);
+        Assert.Equal("RustArchon.cs", file.FileDownloadName);
+        Assert.Equal("no-store", controller.Response.Headers.CacheControl.ToString());
+        _audit.Verify(a => a.RecordAsync(
+            PluginAdminEventKind.ReleaseSigned, "Main 0.11.0", "admin@example.com",
+            It.Is<string>(d => d.Contains("served") && d.Contains("built-in") && d.Contains("82b49184449c98f6"))), Times.Once);
+    }
+
+    [Fact]
+    public async Task TheServedUpdaterIsNamedAfterTheUpdaterAndAPublishedReleaseIsSaidToBeOne()
+    {
+        _releases.Setup(r => r.ResolveAsync(PluginReleaseKind.Updater)).ReturnsAsync(new PluginServedSource("u source", "0.3.0", true, Guid.NewGuid()));
+        _scripts.Setup(s => s.SignSourceAsync("u source", PluginReleaseKind.Updater)).ReturnsAsync(new PluginScript(SignedBytes, "82b49184449c98f6", "0.3.0"));
+
+        var result = await Create().DownloadServed("updater");
+
+        Assert.Equal("RustArchonUpdater.cs", Assert.IsType<FileContentResult>(result).FileDownloadName);
+        _audit.Verify(a => a.RecordAsync(PluginAdminEventKind.ReleaseSigned, "Updater 0.3.0", It.IsAny<string>(), It.Is<string>(d => d.Contains("published release"))), Times.Once);
+    }
+
+    [Fact]
+    public async Task DownloadingAnUnknownKindIsAPlainSentenceAndSignsNothing()
+    {
+        var result = await Create().DownloadServed("nonsense");
+
+        Assert.IsType<BadRequestObjectResult>(result);
+        _scripts.Verify(s => s.SignSourceAsync(It.IsAny<string>(), It.IsAny<PluginReleaseKind>()), Times.Never);
+        _audit.VerifyNoOtherCalls();
+    }
+
+    [Fact]
+    public async Task TheReleasesListSaysWhenTheAutomaticThirdPartyPassLastRanAndNextRuns()
+    {
+        _releases.Setup(r => r.ResolveAsync(It.IsAny<PluginReleaseKind>())).ReturnsAsync(new PluginServedSource("x", "1.0.0", false, null));
+        _releases.Setup(r => r.ListAsync()).ReturnsAsync([]);
+        var last = new DateTimeOffset(2026, 10, 14, 9, 0, 0, TimeSpan.Zero);
+        _autoStatus.PassStarted(last);
+        _autoStatus.NextDue(last.AddMinutes(5));
+
+        var dto = Assert.IsType<PluginReleasesDto>(Assert.IsType<OkObjectResult>((await Create().ListReleases()).Result).Value);
+
+        Assert.Equal(last, dto.ThirdPartyLastPassUtc);
+        Assert.Equal(last.AddMinutes(5), dto.ThirdPartyNextPassUtc);
     }
 
     [Fact]
