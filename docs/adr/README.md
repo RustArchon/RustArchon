@@ -10,3 +10,4 @@ Older ADRs (0001–0005) predate the current template and use their own layout; 
 | [0004](0004-companion-plugin-rcon-pull-dormant-hooks-signed-updates.md) | Companion plugin: RCON pull, dormant hooks, signed two-plugin updates | Accepted |
 | [0005](0005-dvr-style-map-replay-client-clock-over-windowed-data.md) | DVR-style map replay: client clock over windowed data | Proposed |
 | [0006](0006-worker-log-forwarding-and-diagnostic-log-source-model.md) | Worker log forwarding over MassTransit and a per-source diagnostic log model | Accepted |
+| [0007](0007-diagnostic-views-with-deny-list-attribute-and-catalog.md) | Diagnostic views with a deny-list attribute and a machine-readable catalog | Accepted |

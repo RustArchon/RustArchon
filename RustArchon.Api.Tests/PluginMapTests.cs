@@ -355,19 +355,32 @@ public class PluginMapTests(PostgresFixture postgres) : IClassFixture<PostgresFi
         public readonly Harness H;
         public readonly PluginMapUploadRequester Requester;
 
-        public RequesterKit(Harness h, string baseUrl = "http://192.168.0.46:5200", string reply = "{\"v\":1,\"ok\":true,\"data\":{\"started\":true}}", bool success = true)
+        public RequesterKit(Harness h, string baseUrl = "http://192.168.0.46:5200", string reply = "{\"v\":1,\"ok\":true,\"data\":{\"started\":true}}", bool success = true, Microsoft.Extensions.Logging.ILogger<PluginMapUploadRequester>? logger = null)
         {
             H = h;
             Settings.Setup(s => s.GetStringAsync(PlatformSettingsRegistry.PanelBaseUrl)).ReturnsAsync(baseUrl);
             Client.Setup(c => c.GetResponse<RconCommandResult>(It.IsAny<SendRconCommand>(), It.IsAny<CancellationToken>(), It.IsAny<RequestTimeout>()))
                 .Callback<SendRconCommand, CancellationToken, RequestTimeout>((request, _, _) => Sent.Add(request))
                 .ReturnsAsync(Mock.Of<Response<RconCommandResult>>(r => r.Message == new RconCommandResult(success, reply, null, null, success ? null : "NotConnected")));
-            Requester = new PluginMapUploadRequester(h.Maps, h.Tokens, Settings.Object, Client.Object, h.Clock, NullLogger<PluginMapUploadRequester>.Instance);
+            Requester = new PluginMapUploadRequester(h.Maps, h.Tokens, Settings.Object, Client.Object, h.Clock, logger ?? NullLogger<PluginMapUploadRequester>.Instance);
         }
 
         public void ClientTimesOut() =>
             Client.Setup(c => c.GetResponse<RconCommandResult>(It.IsAny<SendRconCommand>(), It.IsAny<CancellationToken>(), It.IsAny<RequestTimeout>()))
                 .ThrowsAsync(new RequestTimeoutException());
+    }
+
+    [Fact]
+    public async Task AMapUploadReplyThatCannotBeReadIsLoggedWithTheReply()
+    {
+        var h = await CreateAsync();
+        var map = await Report(h, bytes: 24_000_000);
+        var logger = new CapturingLogger<PluginMapUploadRequester>();
+        var kit = new RequesterKit(h, reply: "<html>502 Bad Gateway</html>", logger: logger);
+
+        Assert.False(await kit.Requester.RequestIfNeededAsync(map, "idle"));
+
+        Assert.Contains(logger.Entries, e => e.Level == Microsoft.Extensions.Logging.LogLevel.Warning && e.Message.Contains("could not be read") && e.Message.Contains("502 Bad Gateway"));
     }
 
     [Fact]
