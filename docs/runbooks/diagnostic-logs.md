@@ -65,3 +65,30 @@ Entries are one JSON object per line (`source`, `instance`, `seq`, `ts`, `level`
 
    You get each request it was sent (accepted, or refused with the code), each download/verify/swap step, and the outcome with its reason, including attempts from before the last reload.
 3. Done? **Revoke the token.**
+
+## Reading current state: the views
+
+Logs say what happened; the views say what is true now. They use the same token and the same header (`X-RustArchon-Log-Token`), through the Panel.
+
+```bash
+# The catalog: every view, its parameters and the fields it returns. Start here; it is all a client needs.
+curl -s -H "X-RustArchon-Log-Token: $TOKEN" $BASE/diagnostics/views
+
+# One view. A server's state, why its plugins are or are not updating, what the RustArchon plugin reports, its recent console frames.
+curl -s -H "X-RustArchon-Log-Token: $TOKEN" "$BASE/diagnostics/views/server?serverId=<id>"
+curl -s -H "X-RustArchon-Log-Token: $TOKEN" "$BASE/diagnostics/views/server-updates?serverId=<id>"
+curl -s -H "X-RustArchon-Log-Token: $TOKEN" "$BASE/diagnostics/views/server-plugin?serverId=<id>"
+curl -s -H "X-RustArchon-Log-Token: $TOKEN" "$BASE/diagnostics/views/server-rcon-recent?serverId=<id>&count=50"
+curl -s -H "X-RustArchon-Log-Token: $TOKEN" "$BASE/diagnostics/views/platform-settings"
+curl -s -H "X-RustArchon-Log-Token: $TOKEN" "$BASE/diagnostics/views/plugin-keys"
+```
+
+Every answer is `{ "view", "version", "readAtUtc", "data", "unavailable" }`. A part that could not be read is listed in `unavailable` with its reason, never left as an empty value. Errors are `{ "error": { "code", "message" } }` (`bad_request`, `not_found`, `too_large`, `internal_error`). No token ever created is `404` with no body; a missing or wrong token is a bare `401`.
+
+Recipe addition for "why isn't this server updating its plugins?": read `server-updates` first. `offers[].blockCode` and `detail` say why each plugin is not being applied (the same reason the Plugins tab shows), `automaticUpdater.state` says whether the automatic pass will act on the server and why not, and `server-rcon-recent` shows the replies the plugin actually sent (an unreadable one is also logged by the Api at Warning).
+
+### Adding a view, or a column, safely
+
+- **A new column on an entity a view reads:** if it could be a secret (a password, key, token, hash, encrypted value, billing data) or is bulky, put `[DiagnosticsHidden("why")]` on it. The backstop test (`EntityProjectorTests`) fails the build if a secret-looking name is left unmarked; if a name only looks secret, add it to that test's `KnownSafe` list with a reason. An unmarked column is returned by every view that includes its entity, so decide when you add it.
+- **A new view:** a class implementing `IDiagnosticView` with a static `Definition` (name, version, parameters, parts), registered in `DiagnosticViewRegistrationExtensions.AddDiagnosticViews`. Parts name the entity they come from (its non-hidden properties are returned) plus any computed fields; the runner refuses to send a field the definition does not declare. If the view reads a new entity, add it to `DiagnosticViewEntities.All` so the backstop covers it. Give it a test that seeds a recognisable secret and asserts it never appears.
+- **Never rename or remove a field in place:** add a new view version instead.

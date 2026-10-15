@@ -34,6 +34,7 @@ public class PluginUpdateServiceTests
     private readonly Mock<IRequestClient<SendRconCommand>> _client = new();
     private readonly Mock<IPluginUpdateAttemptRepository> _attempts = new();
     private readonly List<SendRconCommand> _sent = [];
+    private readonly CapturingLogger<PluginUpdateService> _logger = new();
 
     public PluginUpdateServiceTests()
     {
@@ -50,7 +51,7 @@ public class PluginUpdateServiceTests
 
     private PluginUpdateService Create() =>
         new(_statuses.Object, _plugins.Object, _script.Object, _tokens.Object, _settings.Object, _client.Object, _attempts.Object,
-            TimeProvider.System, NullLogger<PluginUpdateService>.Instance);
+            TimeProvider.System, _logger);
 
     private static RustServer Server(bool enabled = true, bool updates = true) =>
         new() { Id = ServerId, TenantId = TenantId, IsEnabled = enabled, PluginUpdatesEnabled = updates };
@@ -310,18 +311,30 @@ public class PluginUpdateServiceTests
         Assert.Equal("updater_refused", result.Code);
     }
 
+    [Fact]
+    public async Task RustsUnknownCommandReplyMeansTheUpdaterIsNotLoaded()
+    {
+        GivenUpdaterReplies("Unknown command: archon.update");
+
+        var result = await Create().StartAsync(Server());
+
+        Assert.False(result.Started);
+        Assert.Equal("updater_missing", result.Code);
+        _tokens.Verify(t => t.RevokeAsync("TOKEN123"), Times.Once);
+    }
+
+    // Changed by change 003: any other non-envelope reply used to be called "the Updater is not loaded", with the reply logged nowhere.
     [Theory]
-    [InlineData("Unknown command: archon.update")]
     [InlineData("")]
     [InlineData("<html>nope</html>")]
-    public async Task AReplyThatIsNotAnEnvelopeMeansTheUpdaterIsNotLoaded(string reply)
+    public async Task AnyOtherReplyThatIsNotAnEnvelopeIsAnUnreadableReplyNotAMissingUpdater(string reply)
     {
         GivenUpdaterReplies(reply);
 
         var result = await Create().StartAsync(Server());
 
         Assert.False(result.Started);
-        Assert.Equal("updater_missing", result.Code);
+        Assert.Equal("unreadable_reply", result.Code);
         _tokens.Verify(t => t.RevokeAsync("TOKEN123"), Times.Once);
     }
 
@@ -707,6 +720,34 @@ public class PluginUpdateServiceTests
         Assert.False(result.Started);
         Assert.Equal(("not_newer", "installed 0.3.0"), (result.Code, result.Message));
         _tokens.Verify(t => t.RevokeAsync("TOKEN123"), Times.Once);
+    }
+
+    [Theory]
+    [InlineData("<html>502 Bad Gateway</html>")]
+    [InlineData("")]
+    public async Task AnUpdaterReplyThatCannotBeReadIsLoggedAndNotCalledTooOld(string reply)
+    {
+        GivenUpdaterScenario();
+        GivenUpdaterReplies(reply);
+
+        var result = await Create().StartUpdaterAsync(Server());
+
+        Assert.Equal("unreadable_reply", result.Code);
+        _tokens.Verify(t => t.RevokeAsync("TOKEN123"), Times.Once);
+        _attempts.Verify(a => a.RecordRefusedAsync(It.IsAny<Guid>(), It.IsAny<Guid>(), It.IsAny<string>(), It.IsAny<string>(), It.IsAny<string>(), It.IsAny<string>(), "unreadable_reply", It.IsAny<DateTimeOffset>()), Times.Never);
+        var warning = Assert.Single(_logger.Entries, e => e.Level == Microsoft.Extensions.Logging.LogLevel.Warning && e.Message.Contains("could not be read"));
+        Assert.Contains("archon.updater.update", warning.Message);
+    }
+
+    [Fact]
+    public async Task AMainPluginUpdateReplyThatCannotBeReadIsLoggedAndNotCalledTooOld()
+    {
+        GivenUpdaterReplies("<html>502 Bad Gateway</html>");
+
+        var result = await Create().StartAsync(Server());
+
+        Assert.Equal("unreadable_reply", result.Code);
+        Assert.Contains(_logger.Entries, e => e.Level == Microsoft.Extensions.Logging.LogLevel.Warning && e.Message.Contains("could not be read") && e.Message.Contains("archon.update"));
     }
 
     [Fact]

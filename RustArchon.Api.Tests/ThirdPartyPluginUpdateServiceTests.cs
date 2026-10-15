@@ -697,6 +697,27 @@ public class ThirdPartyPluginUpdateServiceTests(PostgresFixture postgres) : ICla
         Assert.Empty(await UpdatesAsync(s.ServerId));          // it can be tried again next pass
     }
 
+    [Theory]
+    [InlineData("<html>502 Bad Gateway</html>")]
+    [InlineData("[RustArchon] {\"v\":1,\"ok\":true}")]
+    [InlineData("")]
+    public async Task AReplyThatCannotBeReadIsNotCalledTooOldItIsLoggedWithTheReplyAndNothingIsRecorded(string reply)
+    {
+        var s = await SeedAsync();
+        var h = Build(s);
+        h.Reply = _ => (true, reply);
+
+        var result = await h.Service.StartAsync(s.Server(), s.Name, PluginUpdateTriggers.Manual, Sha);
+
+        Assert.False(result.Started);
+        Assert.Equal("unreadable_reply", result.Code);
+        Assert.DoesNotContain("too old", result.Message, StringComparison.OrdinalIgnoreCase);
+        Assert.Empty(await UpdatesAsync(s.ServerId));
+        var warning = Assert.Single(h.Logger.Entries, e => e.Level == Microsoft.Extensions.Logging.LogLevel.Warning && e.Message.Contains("could not be read"));
+        Assert.Contains(s.ServerId.ToString(), warning.Message);
+        Assert.Contains("archon.thirdparty.update", warning.Message);
+    }
+
     [Fact]
     public async Task ACommandTheServerDoesNotRecogniseMeansItsPluginIsTooOld()
     {
