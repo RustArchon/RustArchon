@@ -87,7 +87,7 @@ public sealed class RustArchonPluginTests : IDisposable
 
         var capabilities = ParseReply(arg).GetProperty("data").GetProperty("capabilities")
             .EnumerateArray().Select(e => e.GetString()).ToList();
-        Assert.Equal(new[] { "config", "combat", "tcs", "positions", "map", "updates", "updater-update", "thirdparty-update", "thirdparty-zip" }, capabilities); // "combat": the damage hooks and the drain command exist; "thirdparty-zip" because the tests run where System.IO.Compression exists
+        Assert.Equal(new[] { "config", "combat", "tcs", "positions", "map", "updates", "updater-update", "thirdparty-update", "thirdparty-zip", "logs" }, capabilities); // "combat": the damage hooks and the drain command exist; "thirdparty-zip" because the tests run where System.IO.Compression exists; "logs": archon.logs.drain exists
     }
 
     [Fact]

@@ -208,6 +208,21 @@ public class ThirdPartyPluginUpdateServiceTests(PostgresFixture postgres) : ICla
 
     // ---- the service, with the game server played by a script ------------------------------------------------------
 
+    /// <summary>Keeps what the service logs, so a refusal can be checked for having said which server, plugin, gate and reason.</summary>
+    private sealed class RecordingLogger<T> : Microsoft.Extensions.Logging.ILogger<T>
+    {
+        public List<(Microsoft.Extensions.Logging.LogLevel Level, string Message)> Entries { get; } = [];
+
+        public IDisposable? BeginScope<TState>(TState state)
+            where TState : notnull => null;
+
+        public bool IsEnabled(Microsoft.Extensions.Logging.LogLevel logLevel) => true;
+
+        public void Log<TState>(
+            Microsoft.Extensions.Logging.LogLevel logLevel, Microsoft.Extensions.Logging.EventId eventId, TState state, Exception? exception,
+            Func<TState, Exception?, string> formatter) => Entries.Add((logLevel, formatter(state, exception)));
+    }
+
     private sealed class Harness
     {
         public ThirdPartyPluginUpdateService Service { get; set; } = null!;
@@ -219,6 +234,7 @@ public class ThirdPartyPluginUpdateServiceTests(PostgresFixture postgres) : ICla
         public required Mock<IServerPollService> ServerPoll { get; init; }
         public Mock<IPluginFileRecheckThrottle> RecheckThrottle { get; set; } = null!;
         public required MutableClock Clock { get; init; }
+        public RecordingLogger<ThirdPartyPluginUpdateService> Logger { get; } = new();
         public List<SendRconCommand> Sent { get; } = [];
         public Func<string, (bool Success, string Message)> Reply { get; set; } = _ => (true, "{\"v\":1,\"ok\":true,\"data\":{\"phase\":\"downloading\"}}");
         public bool TimeOut { get; set; }
@@ -275,7 +291,7 @@ public class ThirdPartyPluginUpdateServiceTests(PostgresFixture postgres) : ICla
         harness.Service = new ThirdPartyPluginUpdateService(
             context, statuses.Object, plugins.Object, script.Object, new PluginDownloadLookupRepository(context), new ThirdPartyPluginUpdateRepository(context),
             new PluginZipMappingRepository(context), new PluginUpdateExclusionRepository(context), new ThirdPartyPluginUpdateGate(context), validation.Object, client.Object,
-            serverPoll.Object, recheckThrottle.Object, clock, NullLogger<ThirdPartyPluginUpdateService>.Instance);
+            serverPoll.Object, recheckThrottle.Object, clock, harness.Logger);
         harness.RecheckThrottle = recheckThrottle;
         return harness;
     }
@@ -340,6 +356,13 @@ public class ThirdPartyPluginUpdateServiceTests(PostgresFixture postgres) : ICla
 
         Assert.False(result.Started);
         Assert.Equal(code, result.Code);
+
+        // Every refusal says which server, which plugin, which gate (the code) and why - at Information or above.
+        var logged = Assert.Single(h.Logger.Entries, e => e.Message.Contains(code) && e.Message.Contains(s.ServerId.ToString()));
+        Assert.True(logged.Level >= Microsoft.Extensions.Logging.LogLevel.Information);
+        Assert.Contains(s.Name, logged.Message);
+        Assert.Contains(result.Message, logged.Message);
+
         Assert.Empty(h.Sent);
         Assert.Empty(await UpdatesAsync(s.ServerId));         // a refusal the Panel makes itself is not an attempt
     }

@@ -60,6 +60,8 @@ public class PlatformSettingsControllerSecretPurposeTests(PostgresFixture postgr
             .Where(s => s.ValueType == RustArchon.Api.Data.PlatformSettingValueType.Secret)
             // Deliberately not editable here: it is rotated on the Plugin admin page (see the test below).
             .Where(s => s.Key != PlatformSettingsRegistry.PluginSigningKey)
+            // Likewise managed on its own page (create / rotate / revoke), refused here (see the test below).
+            .Where(s => s.Key != PlatformSettingsRegistry.DiagnosticLogToken)
             .Select(s => s.Key)
             .ToList();
 
@@ -95,5 +97,26 @@ public class PlatformSettingsControllerSecretPurposeTests(PostgresFixture postgr
         Assert.Contains("Plugin page", refused.Value!.ToString());
         Assert.Equal(before, (await new PlatformSettingRepository(new ApiDbContext(postgres.Options, tenantContext: null))
             .GetByKeyAsync(PlatformSettingsRegistry.PluginSigningKey))!.Value);
+    }
+
+    [Fact]
+    public async Task TheDiagnosticLogTokenCannotBeSetThroughTheGenericSettingsEndpoint()
+    {
+        // It is a hash record created by the Diagnostics page; typing a value here would either lock the endpoint out or install a token nobody saw.
+        var context = new ApiDbContext(postgres.Options, tenantContext: null);
+        await PlatformSettingsRegistry.EnsureDefaultsAsync(
+            context, new Microsoft.Extensions.Configuration.ConfigurationBuilder().Build(), NullLogger.Instance);
+        var repository = new PlatformSettingRepository(context);
+        var before = (await repository.GetByKeyAsync(PlatformSettingsRegistry.DiagnosticLogToken))!.Value;
+        var controller = new PlatformSettingsController(
+            repository, Mock.Of<IPlatformSettingsCache>(), Mock.Of<IAppGenerationCache>(), Mock.Of<IApiKeyProtector>(),
+            Mock.Of<IRequestClient<SendTestEmail>>(), CreateMapper());
+
+        var result = await controller.UpdateValue(PlatformSettingsRegistry.DiagnosticLogToken, new UpdatePlatformSettingValueDto { Value = "junk" });
+
+        var refused = Assert.IsType<BadRequestObjectResult>(result.Result);
+        Assert.Contains("Diagnostics page", refused.Value!.ToString());
+        Assert.Equal(before, (await new PlatformSettingRepository(new ApiDbContext(postgres.Options, tenantContext: null))
+            .GetByKeyAsync(PlatformSettingsRegistry.DiagnosticLogToken))!.Value);
     }
 }
