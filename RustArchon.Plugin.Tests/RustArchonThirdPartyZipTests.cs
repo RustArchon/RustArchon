@@ -194,13 +194,14 @@ public sealed class RustArchonThirdPartyZipTests : IDisposable
 
     private static ArchonThirdParty.LoadedPlugin Running(object instance, string version) => new() { Instance = instance, Version = version };
 
-    /// <summary>Every file and folder under the test root, by relative path, with a hash of the contents (folders: "dir"), except the plugin's own state file.</summary>
+    /// <summary>Every file and folder under the test root, by relative path, with a hash of the contents (folders: "dir"), except the plugin's own state and journal files.</summary>
     private Dictionary<string, string> Snapshot()
     {
         var result = new Dictionary<string, string>();
         foreach (var path in Directory.EnumerateFileSystemEntries(_root, "*", SearchOption.AllDirectories))
         {
-            if (Path.GetFileName(path) == "thirdparty-swap.txt") { continue; }
+            // The plugin's own records of itself: what this test is about is that no PLUGIN or USER file is touched by a refusal.
+            if (Path.GetFileName(path) is "thirdparty-swap.txt" or "update-journal.txt") { continue; }
             result[Path.GetRelativePath(_root, path)] = Directory.Exists(path) ? "dir" : Hex(File.ReadAllBytes(path));
         }
         return result;
@@ -1724,7 +1725,7 @@ public sealed class RustArchonThirdPartyZipTests : IDisposable
     {
         var capabilities = CapabilitiesOf(Loaded());
 
-        Assert.Equal(new[] { "config", "combat", "tcs", "positions", "map", "updates", "updater-update", "thirdparty-update", "thirdparty-zip" }, capabilities);
+        Assert.Equal(new[] { "config", "combat", "tcs", "positions", "map", "updates", "updater-update", "thirdparty-update", "thirdparty-zip", "logs" }, capabilities);
         Assert.Equal(RustArchon.Messaging.Contracts.RustArchonPlugin.ThirdPartyZipCapability, ArchonPlugin.ThirdPartyZipCapability);
     }
 
@@ -1737,7 +1738,7 @@ public sealed class RustArchonThirdPartyZipTests : IDisposable
         var capabilities = CapabilitiesOf(plugin);
 
         Assert.DoesNotContain("thirdparty-zip", capabilities);
-        Assert.Equal(new[] { "config", "combat", "tcs", "positions", "map", "updates", "updater-update", "thirdparty-update" }, capabilities);
+        Assert.Equal(new[] { "config", "combat", "tcs", "positions", "map", "updates", "updater-update", "thirdparty-update", "logs" }, capabilities);
     }
 
     [Fact]

@@ -47,4 +47,9 @@
     <Using Include="Xunit" />
   </ItemGroup>
 
+  <ItemGroup>
+    <!-- The redaction vectors shared with RustArchon.Diagnostics.Tests: the plugin's own redactor is held to the same lines as the server-side one. -->
+    <None Include="..\RustArchon.Diagnostics.Tests\Vectors\redaction.tsv" Link="Vectors\redaction.tsv" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+
 </Project>

@@ -1,0 +1,29 @@
+# Shared by the server-side redactor (RustArchon.Diagnostics) and the plugin's own copy (RustArchon.Plugin), which cannot reference it.
+# Both are tested against every line: the secret (first column) must not survive, and the mask must appear.
+# Format: secret <TAB> text. In the text, \n means a newline and \t a tab.
+abc.DEF-123_xyz	Request sent with header Authorization: Bearer abc.DEF-123_xyz
+eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjMifQ.c2lnbmF0dXJl	Calling api with bearer eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjMifQ.c2lnbmF0dXJl
+hunter2	Connecting with password=hunter2 to host
+hunter2	Connecting with Password: hunter2 to host
+hunter2	Settings {"rconPassword":"hunter2","port":28016}
+with spaces	Settings {"rconPassword":"hunter 2 with spaces","port":28016}
+s3cr3t	Server=db;Port=5432;Database=x;User Id=u;Password=s3cr3t;Pooling=true
+9f8e7d6c5b4a39281706f5e4d3c2b1a0	X-Internal-Api-Key: 9f8e7d6c5b4a39281706f5e4d3c2b1a0
+AbCdEf123456	apikey=AbCdEf123456 used
+tok123456	GET https://example.test/hook?token=tok123456&x=1
+p4ss	Fetching https://user:p4ss@example.test/file.zip
+k3Jx9QpLm2VbN7tYcW1RzHdAeGuIoS5fT8qXwZaBnMc	POST /ingest/reports/3f2504e0-4f89-11d3-9a0c-0305e82c3301/k3Jx9QpLm2VbN7tYcW1RzHdAeGuIoS5fT8qXwZaBnMc
+singleUseTok3n	Sent archon.update 1.2.3 https://panel.test/ingest/plugin singleUseTok3n
+singleUseTok3n	Sent archon.updater.update 1.2.3 https://panel.test/ingest/plugin singleUseTok3n
+singleUseTok3n	Sent archon.map.upload https://panel.test/ingest/plugin-map singleUseTok3n
+rc0nP4ssw0rd	WebSocket connecting to ws://10.0.0.5:28016/rc0nP4ssw0rd
+MIIEowIBAAKCAQEA	Loaded key -----BEGIN RSA PRIVATE KEY-----\nMIIEowIBAAKCAQEA\nabc\n-----END RSA PRIVATE KEY-----
+k3Jx9QpLm2VbN7tYcW1RzHdAeGuIoS5fT8qXwZaBnMc	Token minted k3Jx9QpLm2VbN7tYcW1RzHdAeGuIoS5fT8qXwZaBnMc for update
+hunter2z	login with pass=hunter2z now
+c00kieVal	Cookie: sid=c00kieVal; theme=dark
+sessVal123	Set-Cookie: session=sessVal123; Path=/; HttpOnly
+s3ss10n	Resumed session_id=s3ss10n for user
+sigValue99	Request signature=sigValue99 verified
+sigV4lu3	header sig: sigV4lu3 received
+authV4lu3	callback auth=authV4lu3 ok
+privV4lu3	loaded private=privV4lu3 for signing

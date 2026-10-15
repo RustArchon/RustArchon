@@ -10,6 +10,7 @@
     <File Path="RustArchon.Plugin/src/RustArchonUpdater.cs" />
   </Folder>
   <Folder Name="/Tests/">
+    <Project Path="RustArchon.Diagnostics.Tests/RustArchon.Diagnostics.Tests.csproj" />
     <Project Path="RustArchon.Api.IntegrationTests/RustArchon.Api.IntegrationTests.csproj" />
     <Project Path="RustArchon.Api.Tests/RustArchon.Api.Tests.csproj" />
     <Project Path="RustArchon.Plugin.CompileCheck/RustArchon.Plugin.CompileCheck.csproj" />
@@ -18,6 +19,7 @@
   </Folder>
   <Project Path="JumpStart/JumpStart/JumpStart.csproj" />
   <Project Path="RustArchon.Api/RustArchon.Api.csproj" />
+  <Project Path="RustArchon.Diagnostics/RustArchon.Diagnostics.csproj" />
   <Project Path="RustArchon.Messaging/RustArchon.Messaging.csproj" />
   <Project Path="RustArchon.Panel/RustArchon.Panel.csproj" />
   <Project Path="RustArchon.Rcon/RustArchon.Rcon.csproj" />

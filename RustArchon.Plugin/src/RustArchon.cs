@@ -23,7 +23,7 @@ using UnityEngine;
 
 namespace Oxide.Plugins
 {
-    [Info("RustArchon", "RustArchon", "0.10.0")]
+    [Info("RustArchon", "RustArchon", "0.11.0")]
     [Description("RustArchon companion plugin. Dormant until the RustArchon panel asks; every command is RCON-only.")]
     public class RustArchon : RustPlugin
     {
@@ -38,7 +38,7 @@ namespace Oxide.Plugins
         // What this build can actually do. A capability is listed only once its code exists, so the panel
         // never enables a feature the installed plugin cannot perform. "recording" and "combat" arrive with
         // their hooks in a later phase; until then only the settings channel itself is offered.
-        private static readonly string[] Capabilities = { "config", "combat", "tcs", "positions", "map", "updates", "updater-update", "thirdparty-update" };
+        private static readonly string[] Capabilities = { "config", "combat", "tcs", "positions", "map", "updates", "updater-update", "thirdparty-update", "logs" };
 
         // Advertised right after "thirdparty-update", and only when the zip reader can actually be resolved at run time (see ArchonZipArchive):
         // the file is compiled by the game server's own compiler, which may not reference System.IO.Compression, so nothing here depends on it
@@ -78,6 +78,8 @@ namespace Oxide.Plugins
             }
             Integrity = ArchonIntegrity.CheckFile(ScriptFilePath, TrustedModulus, TrustedExponent);
 
+            // The update journal first, so what an earlier run recorded (an update reloads this plugin) comes before anything this run says.
+            LoadUpdateJournal();
             WriteLoadedMarker();
             ResumeUpdaterSwap();
             ResumeThirdPartySwap();
@@ -88,7 +90,7 @@ namespace Oxide.Plugins
             ApplyTcIndex(Settings.Recording);
             ApplyPositionRecording(Settings.Recording);
 
-            Puts("Init v" + Version + " protocol=" + ProtocolVersion + " settingsPersisted=" + _settingsPersisted
+            Say(2, "lifecycle", "Init v" + Version + " protocol=" + ProtocolVersion + " settingsPersisted=" + _settingsPersisted
                 + " recording=" + Settings.Recording + " combat=" + Settings.Combat
                 + " signature=" + Integrity.State + (Integrity.KeyFingerprint.Length > 0 ? " key=" + Integrity.KeyFingerprint : ""));
         }
@@ -100,6 +102,165 @@ namespace Oxide.Plugins
             if (arg.Connection != null) { return; }
 
             arg.ReplyWith(ArchonJson.Ok(HelloData()));
+        }
+
+        // ---- the plugin's own log (change 001, ADR-0006) -------------------------------------------------------------
+
+        internal const int LogCapacity = 2000;
+        internal const int MaxLogMessageLength = 1000;
+        internal const int JournalKeep = 100;
+        internal const string UpdateJournalFileName = "update-journal.txt";
+
+        // The plugin's own log, read on demand by the panel through archon.logs.drain (the Worker pulls; nothing here pushes or runs on a timer). A fixed
+        // ring, so memory is bounded; once full the oldest entries go and a reader that fell behind is told (lost) rather than given a silent gap.
+        internal ArchonLogBuffer Logs = new ArchonLogBuffer(LogCapacity);
+
+        private int _journalLines;
+        private bool _journalWarned;
+
+        // Says something: to the server console, exactly as Puts always did, and into the bounded log above. Secrets are removed first, so nothing
+        // that reaches either place (or ever leaves this game server) can hold one. Entries in the "update" category are also journaled to disk, because
+        // an update reloads this plugin and would otherwise wipe the record of itself at exactly the moment it matters.
+        // level: 0 trace, 1 debug, 2 information, 3 warning, 4 error, 5 critical (Microsoft.Extensions.Logging's numbers). props: key, value, key, value...
+        internal void Say(int level, string category, string message, params string[] props)
+        {
+            var text = ArchonLogItem.Cut(ArchonRedact.Clean(message), MaxLogMessageLength);
+            var cleaned = new List<string>();
+            if (props != null)
+            {
+                for (var i = 0; i + 1 < props.Length; i += 2)
+                {
+                    cleaned.Add(props[i]);
+                    cleaned.Add(ArchonLogItem.Cut(ArchonRedact.CleanProperty(props[i], props[i + 1]), ArchonLogItem.MaxPropertyLength));
+                }
+            }
+
+            Puts(text);
+            var item = new ArchonLogItem { TimeUtc = UtcNow(), Level = level, Category = category, Message = text, Props = cleaned.ToArray() };
+            Logs.Add(item);
+            if (category == "update") { AppendUpdateJournal(item); }
+        }
+
+        // archon.logs.drain <bootId> <cursor> [max] - the log entries after <cursor>, oldest first, with the same bootId / cursor / lost / reset
+        // contract as the combat and position drains, plus "oldest" (the lowest sequence still held) so the reader can say how many it missed.
+        [ConsoleCommand("archon.logs.drain")]
+        internal void CmdLogsDrain(ConsoleSystem.Arg arg)
+        {
+            if (arg.Connection != null) { return; }
+
+            long bootId;
+            long cursor;
+            if (!arg.HasArgs(2)
+                || !long.TryParse(arg.GetString(0, ""), out bootId)
+                || !long.TryParse(arg.GetString(1, ""), out cursor)
+                || cursor < 0)
+            {
+                arg.ReplyWith(ArchonJson.Err("usage", "archon.logs.drain <bootId> <cursor> [max]"));
+                return;
+            }
+
+            var max = ArchonCombat.DefaultDrainMax;
+            if (arg.HasArgs(3))
+            {
+                int parsed;
+                if (int.TryParse(arg.GetString(2, ""), out parsed) && parsed > 0) { max = parsed; }
+            }
+
+            arg.ReplyWith(ArchonJson.Ok(Logs.DrainJson(bootId, cursor, max, true)));
+        }
+
+        // ---- the update journal --------------------------------------------------------------------------------------------
+        //
+        // One line per update entry, tab separated and escaped, in update-journal.txt next to the other state files. Bounded (the newest JournalKeep
+        // survive), best effort (a disk that cannot be written never stops the plugin or its saying), and read back at load so an update's own record
+        // is there after the reload it caused.
+
+        private string JournalPath()
+        {
+            if (DataDirectory == null && SettingsFilePath != null) { DataDirectory = Path.GetDirectoryName(SettingsFilePath); }
+            return DataDirectory == null ? null : Path.Combine(DataDirectory, UpdateJournalFileName);
+        }
+
+        private void AppendUpdateJournal(ArchonLogItem item)
+        {
+            var path = JournalPath();
+            if (path == null) { return; }
+
+            try
+            {
+                Directory.CreateDirectory(DataDirectory);
+                File.AppendAllText(path, item.ToJournalLine() + "\n");
+                _journalLines++;
+                if (_journalLines > JournalKeep * 2) { TrimJournal(path); }
+            }
+            catch (Exception e)
+            {
+                // Not through Say: that would try the journal again. Once is enough; the entry itself is still in the log above.
+                if (!_journalWarned)
+                {
+                    _journalWarned = true;
+                    var text = ArchonRedact.Clean("Could not write the update journal: " + e.GetType().Name + ": " + e.Message);
+                    Puts(text);
+                    Logs.Add(new ArchonLogItem { TimeUtc = UtcNow(), Level = 3, Category = "diag", Message = text });
+                }
+            }
+        }
+
+        private void TrimJournal(string path)
+        {
+            var lines = File.ReadAllLines(path);
+            var keep = new List<string>();
+            for (var i = Math.Max(0, lines.Length - JournalKeep); i < lines.Length; i++) { keep.Add(lines[i]); }
+            File.WriteAllLines(path, keep.ToArray());
+            _journalLines = keep.Count;
+        }
+
+        // At load, before this run says anything: put what earlier runs journaled back in the log, marked persisted, in their original order.
+        internal void LoadUpdateJournal()
+        {
+            var path = JournalPath();
+            if (path == null || !File.Exists(path)) { return; }
+
+            string[] lines;
+            try
+            {
+                lines = File.ReadAllLines(path);
+            }
+            catch (Exception)
+            {
+                return;
+            }
+
+            _journalLines = lines.Length;
+            var items = new List<ArchonLogItem>();
+            foreach (var line in lines)
+            {
+                ArchonLogItem item;
+                if (ArchonLogItem.TryParseJournalLine(line, out item)) { items.Add(item); }
+            }
+
+            for (var i = Math.Max(0, items.Count - JournalKeep); i < items.Count; i++)
+            {
+                var item = items[i];
+                var props = new List<string>(item.Props);
+                props.Add("persisted");
+                props.Add("true");
+                item.Props = props.ToArray();
+                Logs.Add(item);
+            }
+        }
+
+        // The one place an update request's answer is recorded: accepted, or refused with the code and sentence the panel was given.
+        private void LogUpdateRequest(string what, string reply)
+        {
+            if (reply != null && reply.StartsWith("{\"v\":1,\"ok\":true"))
+            {
+                Say(2, "update", what + " accepted.");
+            }
+            else
+            {
+                Say(3, "update", what + " refused: " + reply);
+            }
         }
 
         // archon.config get
@@ -155,7 +316,7 @@ namespace Oxide.Plugins
             var isNew = UpdateNotices.Record(name, currentVersion, latestVersion, url, marketplace, NowMs());
             if (isNew)
             {
-                Puts("Update available (reported by UpdateChecker): " + ArchonUpdates.Clean(name, ArchonUpdates.MaxNameLength)
+                Say(2, "updatechecker", "Update available (reported by UpdateChecker): " + ArchonUpdates.Clean(name, ArchonUpdates.MaxNameLength)
                     + " " + ArchonUpdates.Clean(currentVersion, ArchonUpdates.MaxVersionLength)
                     + " -> " + ArchonUpdates.Clean(latestVersion, ArchonUpdates.MaxVersionLength)
                     + " marketplace=" + ArchonUpdates.Clean(marketplace, ArchonUpdates.MaxMarketplaceLength)
@@ -207,10 +368,13 @@ namespace Oxide.Plugins
             if (!arg.HasArgs(3) || arg.HasArgs(4))
             {
                 arg.ReplyWith(ArchonJson.Err("usage", "archon.updater.update <version> <url> <token>"));
+                LogUpdateRequest("Updater update request", ArchonJson.Err("usage", "archon.updater.update <version> <url> <token>"));
                 return;
             }
 
-            arg.ReplyWith(BeginUpdaterUpdate(arg.GetString(0, ""), arg.GetString(1, ""), arg.GetString(2, "")));
+            var reply = BeginUpdaterUpdate(arg.GetString(0, ""), arg.GetString(1, ""), arg.GetString(2, ""));
+            LogUpdateRequest("Updater update request for version " + arg.GetString(0, ""), reply);
+            arg.ReplyWith(reply);
         }
 
         // archon.updater.status
@@ -426,7 +590,7 @@ namespace Oxide.Plugins
             UpdaterSwap.Phase = ArchonUpdaterSwap.PhaseLoading;
             UpdaterSwap.Reason = "";
             SaveUpdaterSwap();
-            Puts("Swapped in RustArchonUpdater " + UpdaterSwap.Target + "; waiting for it to load.");
+            Say(2, "update", "Swapped in RustArchonUpdater " + UpdaterSwap.Target + "; waiting for it to load.");
         }
 
         private void TickUpdaterLoading()
@@ -438,7 +602,7 @@ namespace Oxide.Plugins
                 UpdaterSwap.Reason = "";
                 SaveUpdaterSwap();
                 StopUpdaterTicker();
-                Puts("RustArchonUpdater " + UpdaterSwap.Target + " loaded; Updater update succeeded.");
+                Say(2, "update", "RustArchonUpdater " + UpdaterSwap.Target + " loaded; Updater update succeeded.");
                 return;
             }
 
@@ -482,7 +646,7 @@ namespace Oxide.Plugins
 
             SaveUpdaterSwap();
             StopUpdaterTicker();
-            Puts("Updater update " + UpdaterSwap.Target + " " + UpdaterSwap.Phase + ": " + UpdaterSwap.Reason);
+            Say(3, "update", "Updater update " + UpdaterSwap.Target + " " + UpdaterSwap.Phase + ": " + UpdaterSwap.Reason);
         }
 
         private void FailUpdaterSwap(string code, string detail)
@@ -491,7 +655,7 @@ namespace Oxide.Plugins
             UpdaterSwap.Reason = code + ": " + detail;
             SaveUpdaterSwap();
             StopUpdaterTicker();
-            Puts("Updater update " + UpdaterSwap.Target + " failed: " + UpdaterSwap.Reason);
+            Say(3, "update", "Updater update " + UpdaterSwap.Target + " failed: " + UpdaterSwap.Reason);
         }
 
         // At load: an Updater swap that was made but not yet confirmed when this plugin (re)loaded keeps being watched, so a broken
@@ -695,11 +859,14 @@ namespace Oxide.Plugins
             if (!arg.HasArgs(5) || arg.HasArgs(6))
             {
                 arg.ReplyWith(ArchonJson.Err("usage", "archon.thirdparty.update <class> <version> <sha256> <size> <url>"));
+                LogUpdateRequest("Plugin update request", ArchonJson.Err("usage", "archon.thirdparty.update <class> <version> <sha256> <size> <url>"));
                 return;
             }
 
-            arg.ReplyWith(BeginThirdPartyUpdate(
-                arg.GetString(0, ""), arg.GetString(1, ""), arg.GetString(2, ""), arg.GetString(3, ""), arg.GetString(4, "")));
+            var reply = BeginThirdPartyUpdate(
+                arg.GetString(0, ""), arg.GetString(1, ""), arg.GetString(2, ""), arg.GetString(3, ""), arg.GetString(4, ""));
+            LogUpdateRequest("Plugin update request for " + arg.GetString(0, "") + " " + arg.GetString(1, ""), reply);
+            arg.ReplyWith(reply);
         }
 
         // archon.thirdparty.zip <class> <version> <sha256> <size> <installBytes> <rules> <url>
@@ -713,11 +880,14 @@ namespace Oxide.Plugins
             if (!arg.HasArgs(7) || arg.HasArgs(8))
             {
                 arg.ReplyWith(ArchonJson.Err("usage", "archon.thirdparty.zip <class> <version> <sha256> <size> <installBytes> <rules> <url>"));
+                LogUpdateRequest("Plugin archive update request", ArchonJson.Err("usage", "archon.thirdparty.zip <class> <version> <sha256> <size> <installBytes> <rules> <url>"));
                 return;
             }
 
-            arg.ReplyWith(BeginThirdPartyZip(
-                arg.GetString(0, ""), arg.GetString(1, ""), arg.GetString(2, ""), arg.GetString(3, ""), arg.GetString(4, ""), arg.GetString(5, ""), arg.GetString(6, "")));
+            var reply = BeginThirdPartyZip(
+                arg.GetString(0, ""), arg.GetString(1, ""), arg.GetString(2, ""), arg.GetString(3, ""), arg.GetString(4, ""), arg.GetString(5, ""), arg.GetString(6, ""));
+            LogUpdateRequest("Plugin archive update request for " + arg.GetString(0, "") + " " + arg.GetString(1, ""), reply);
+            arg.ReplyWith(reply);
         }
 
         // archon.thirdparty.status - the most recent third-party update this plugin carried out (or is carrying out).
@@ -1012,7 +1182,7 @@ namespace Oxide.Plugins
             ThirdParty.Phase = ArchonThirdParty.PhaseLoading;
             ThirdParty.Reason = "";
             SaveThirdParty();
-            Puts("Swapped in " + ThirdParty.File + " " + ThirdParty.Target + "; waiting for it to load.");
+            Say(2, "update", "Swapped in " + ThirdParty.File + " " + ThirdParty.Target + "; waiting for it to load.");
         }
 
         private void TickThirdPartyLoading()
@@ -1031,7 +1201,7 @@ namespace Oxide.Plugins
                 ThirdParty.Reason = "";
                 SaveThirdParty();
                 StopThirdPartyTicker();
-                Puts(ThirdParty.File + " " + ThirdParty.Target + " loaded; the plugin update succeeded.");
+                Say(2, "update", ThirdParty.File + " " + ThirdParty.Target + " loaded; the plugin update succeeded.");
                 return;
             }
 
@@ -1077,7 +1247,7 @@ namespace Oxide.Plugins
 
             SaveThirdParty();
             StopThirdPartyTicker();
-            Puts("Update of " + ThirdParty.File + " to " + ThirdParty.Target + " " + ThirdParty.Phase + ": " + ThirdParty.Reason);
+            Say(3, "update", "Update of " + ThirdParty.File + " to " + ThirdParty.Target + " " + ThirdParty.Phase + ": " + ThirdParty.Reason);
         }
 
         private void FailThirdParty(string code, string detail)
@@ -1086,7 +1256,7 @@ namespace Oxide.Plugins
             ThirdParty.Reason = code + ": " + detail;
             SaveThirdParty();
             StopThirdPartyTicker();
-            Puts("Update of " + ThirdParty.File + " to " + ThirdParty.Target + " failed: " + ThirdParty.Reason);
+            Say(3, "update", "Update of " + ThirdParty.File + " to " + ThirdParty.Target + " failed: " + ThirdParty.Reason);
         }
 
         // The file is not the one the panel checked (or is not even the size it said). Nothing was written.
@@ -1097,7 +1267,7 @@ namespace Oxide.Plugins
             ThirdParty.Reason = "changed: " + detail;
             SaveThirdParty();
             StopThirdPartyTicker();
-            Puts("Update of " + ThirdParty.File + " to " + ThirdParty.Target + " not applied: " + ThirdParty.Reason);
+            Say(3, "update", "Update of " + ThirdParty.File + " to " + ThirdParty.Target + " not applied: " + ThirdParty.Reason);
         }
 
         // At load: a swap that was made but not yet confirmed when this plugin (re)loaded keeps being watched, so a broken plugin is still put
@@ -1557,7 +1727,7 @@ namespace Oxide.Plugins
             ThirdParty.Phase = ArchonThirdParty.PhaseLoading;
             ThirdParty.Reason = "";
             SaveThirdParty();
-            Puts("Unpacked " + className + " " + ThirdParty.Target + " (" + written + " files); waiting for it to load.");
+            Say(2, "update", "Unpacked " + className + " " + ThirdParty.Target + " (" + written + " files); waiting for it to load.");
         }
 
         private static string ToNativePath(string relative)
@@ -1752,7 +1922,7 @@ namespace Oxide.Plugins
             DeleteZipStaging(ThirdParty.ClassName);
             SaveThirdParty();
             StopThirdPartyTicker();
-            Puts("Update of " + ThirdParty.ClassName + " to " + ThirdParty.Target + " " + ThirdParty.Phase + ": " + ThirdParty.Reason);
+            Say(3, "update", "Update of " + ThirdParty.ClassName + " to " + ThirdParty.Target + " " + ThirdParty.Phase + ": " + ThirdParty.Reason);
         }
 
         private void RestoreFromZipManifest(string backupDir, string[] lines, List<string> failures)
@@ -2352,7 +2522,7 @@ namespace Oxide.Plugins
             var ok = error == null && bytes > 0;
             MapLastRenderJson = "{\"ok\":" + (ok ? "true" : "false") + ",\"ms\":" + millis + ",\"bytes\":" + (bytes < 0 ? 0 : bytes)
                 + ",\"atMs\":" + NowMs() + (error == null ? "" : ",\"error\":" + ArchonJson.Quote(error)) + "}";
-            Puts("Map render " + (ok ? "finished" : "did not produce a file") + " in " + millis + " ms (" + MapFileName() + ")");
+            Say(2, "map", "Map render " + (ok ? "finished" : "did not produce a file") + " in " + millis + " ms (" + MapFileName() + ")");
         }
 
         // When the plugin loads (which the game also does for a plugin loaded or updated while running) and the switch is
@@ -2372,7 +2542,7 @@ namespace Oxide.Plugins
             string message;
             if (TryScheduleMapRender(false, true, 10f, out code, out message))
             {
-                Puts("No map for this world yet: rendering it shortly (the game pauses for about a minute).");
+                Say(2, "map", "No map for this world yet: rendering it shortly (the game pauses for about a minute).");
             }
         }
 
@@ -3178,7 +3348,7 @@ namespace Oxide.Plugins
 
         // {"format":1,"bootId":..,"head":..,"cursor":..,"lost":..,"reset":..,"<items>":[..]}. cursor is the last
         // sequence number in this reply (or the one asked for, if there was nothing new): send it back next time.
-        public string DrainJson(long bootId, long cursor, int max)
+        public string DrainJson(long bootId, long cursor, int max, bool includeOldest = false)
         {
             var reset = bootId != BootId;
             if (reset) { cursor = 0; }
@@ -3205,6 +3375,7 @@ namespace Oxide.Plugins
 
             return "{\"format\":1,\"bootId\":" + BootId + ",\"head\":" + Head + ",\"cursor\":" + last
                 + ",\"lost\":" + (lost ? "true" : "false") + ",\"reset\":" + (reset ? "true" : "false")
+                + (includeOldest ? ",\"oldest\":" + oldest : "")
                 + ",\"" + _itemsName + "\":[" + sb + "]}";
         }
 
@@ -4554,6 +4725,225 @@ namespace Oxide.Plugins
             var disposable = _archive as IDisposable;
             if (disposable != null) { try { disposable.Dispose(); } catch (Exception) { } }
             _stream.Dispose();
+        }
+    }
+
+    // One entry in the plugin's own log. Props are key, value, key, value... (already redacted). Single-threaded like the other rings: written on the
+    // game thread and read by a console command on it.
+    internal sealed class ArchonLogItem : IArchonRingItem
+    {
+        public const int MaxPropertyLength = 200;
+
+        public long Seq { get; set; }
+        public DateTime TimeUtc;
+        public int Level;
+        public string Category = "";
+        public string Message = "";
+        public string[] Props = new string[0];
+
+        // {"s":seq,"t":"<round-trip UTC time>","l":level,"c":category,"m":message,"p":{key:value,...}} - short names keep a reply small.
+        public string ToJson()
+        {
+            var sb = new StringBuilder(160);
+            sb.Append("{\"s\":").Append(Seq);
+            sb.Append(",\"t\":").Append(ArchonJson.Quote(TimeUtc.ToString("o", System.Globalization.CultureInfo.InvariantCulture)));
+            sb.Append(",\"l\":").Append(Level);
+            sb.Append(",\"c\":").Append(ArchonJson.Quote(Category));
+            sb.Append(",\"m\":").Append(ArchonJson.Quote(Message));
+            sb.Append(",\"p\":{");
+            for (var i = 0; i + 1 < Props.Length; i += 2)
+            {
+                if (i > 0) { sb.Append(','); }
+                sb.Append(ArchonJson.Quote(Props[i])).Append(':').Append(ArchonJson.Quote(Props[i + 1]));
+            }
+            sb.Append("}}");
+            return sb.ToString();
+        }
+
+        public static string Cut(string text, int max)
+        {
+            if (text == null) { return ""; }
+            return text.Length <= max ? text : text.Substring(0, max) + " ...[truncated]";
+        }
+
+        // time, level, category, message, then key, value pairs: tab separated, each field escaped so a tab or a newline inside one cannot break a line.
+        public string ToJournalLine()
+        {
+            var fields = new List<string>
+            {
+                TimeUtc.ToString("o", System.Globalization.CultureInfo.InvariantCulture),
+                Level.ToString(System.Globalization.CultureInfo.InvariantCulture),
+                Category,
+                Message
+            };
+            fields.AddRange(Props);
+            for (var i = 0; i < fields.Count; i++) { fields[i] = Escape(fields[i]); }
+            return string.Join("\t", fields.ToArray());
+        }
+
+        // A line that is not a journal line (a half-written one, a hand edit) is skipped, never an error.
+        public static bool TryParseJournalLine(string line, out ArchonLogItem item)
+        {
+            item = null;
+            if (string.IsNullOrEmpty(line)) { return false; }
+
+            var fields = line.Split('\t');
+            if (fields.Length < 4 || (fields.Length - 4) % 2 != 0) { return false; }
+
+            DateTime time;
+            int level;
+            if (!DateTime.TryParse(Unescape(fields[0]), System.Globalization.CultureInfo.InvariantCulture, System.Globalization.DateTimeStyles.RoundtripKind, out time)
+                || !int.TryParse(fields[1], System.Globalization.NumberStyles.None, System.Globalization.CultureInfo.InvariantCulture, out level)
+                || level < 0 || level > 5)
+            {
+                return false;
+            }
+
+            var props = new string[fields.Length - 4];
+            for (var i = 4; i < fields.Length; i++) { props[i - 4] = Unescape(fields[i]); }
+
+            item = new ArchonLogItem
+            {
+                TimeUtc = time.Kind == DateTimeKind.Utc ? time : time.ToUniversalTime(),
+                Level = level,
+                Category = Unescape(fields[2]),
+                Message = Unescape(fields[3]),
+                Props = props
+            };
+            return true;
+        }
+
+        private static string Escape(string value)
+        {
+            if (value == null) { return ""; }
+            return value.Replace("\\", "\\\\").Replace("\t", "\\t").Replace("\n", "\\n").Replace("\r", "\\r");
+        }
+
+        private static string Unescape(string value)
+        {
+            var sb = new StringBuilder(value.Length);
+            for (var i = 0; i < value.Length; i++)
+            {
+                var c = value[i];
+                if (c != '\\' || i + 1 >= value.Length) { sb.Append(c); continue; }
+
+                i++;
+                switch (value[i])
+                {
+                    case 't': sb.Append('\t'); break;
+                    case 'n': sb.Append('\n'); break;
+                    case 'r': sb.Append('\r'); break;
+                    case '\\': sb.Append('\\'); break;
+                    default: sb.Append('\\').Append(value[i]); break;
+                }
+            }
+            return sb.ToString();
+        }
+    }
+
+    internal sealed class ArchonLogBuffer : ArchonRing<ArchonLogItem>
+    {
+        public ArchonLogBuffer(int capacity) : base(capacity, "logs") { }
+    }
+
+    // Takes secret-looking values out of text before it is kept or sent. Pattern based, so it cannot be proven complete: it errs towards masking too
+    // much, keeps the name so a line stays readable, and is idempotent. This is a small copy of RustArchon.Diagnostics.LogRedactor (the plugin is one
+    // compiled file and cannot reference a library); both are tested against the same vectors (RustArchon.Diagnostics.Tests/Vectors/redaction.tsv).
+    internal static class ArchonRedact
+    {
+        public const string Mask = "[REDACTED]";
+        public const string Failed = "[REDACTION FAILED]";
+
+        // Log lines are cut to a thousand characters anyway, so there is no reason to run the patterns over more than a few times that.
+        private const int InputLimit = 8192;
+        private static readonly TimeSpan Timeout = TimeSpan.FromMilliseconds(250);
+        private const System.Text.RegularExpressions.RegexOptions Options =
+            System.Text.RegularExpressions.RegexOptions.IgnoreCase | System.Text.RegularExpressions.RegexOptions.CultureInvariant;
+
+        private static readonly System.Text.RegularExpressions.Regex NameValue = new System.Text.RegularExpressions.Regex(
+            @"(?<name>[\w\-.]{0,64}(?:password|passwd|pwd|secret|token|apikey|api[-_]?key|credential|authorization|connectionstring|pass|cookie|session|signature|sig|auth|private|key)[\w\-.]{0,64})(?<sep>""?\s*[:=]\s*)(?!""?\[REDACTED\])(?<value>""(?:[^""\\]|\\.)*""|(?:(?:Bearer|Basic)\s+)?[^\s""&;,'}\]]+)",
+            Options, Timeout);
+
+        private static readonly System.Text.RegularExpressions.Regex CookieLine = new System.Text.RegularExpressions.Regex(
+            @"(?<name>\b(?:set-)?cookie)(?<sep>[ \t]*:[ \t]*)(?!\[REDACTED\])(?<value>[^\r\n]+)", Options, Timeout);
+
+        private static readonly System.Text.RegularExpressions.Regex BearerScheme = new System.Text.RegularExpressions.Regex(
+            @"(?<scheme>\bBearer\s+)(?!\[REDACTED\])[\w\-.~+/=]+", Options, Timeout);
+
+        private static readonly System.Text.RegularExpressions.Regex Jwt = new System.Text.RegularExpressions.Regex(
+            @"\beyJ[\w\-]+\.[\w\-]+\.[\w\-]*", Options, Timeout);
+
+        private static readonly System.Text.RegularExpressions.Regex PemPrivateKey = new System.Text.RegularExpressions.Regex(
+            @"-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----", Options, Timeout);
+
+        private static readonly System.Text.RegularExpressions.Regex UrlUserInfo = new System.Text.RegularExpressions.Regex(
+            @"(?<scheme>://)[^/\s:@]+:[^/\s@]+(?=@)", Options, Timeout);
+
+        private static readonly System.Text.RegularExpressions.Regex TokenInPath = new System.Text.RegularExpressions.Regex(
+            @"(?<prefix>/ingest/(?:reports|plugin)/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/)(?!\[REDACTED\])[^\s/?#]+", Options, Timeout);
+
+        private static readonly System.Text.RegularExpressions.Regex UpdateCommandToken = new System.Text.RegularExpressions.Regex(
+            @"(?<prefix>\barchon\.(?:updater\.)?update[ \t]+\S+[ \t]+\S+[ \t]+)(?!\[REDACTED\])\S+", Options, Timeout);
+
+        private static readonly System.Text.RegularExpressions.Regex MapUploadToken = new System.Text.RegularExpressions.Regex(
+            @"(?<prefix>\barchon\.map\.upload[ \t]+\S+[ \t]+)(?!\[REDACTED\])\S+", Options, Timeout);
+
+        private static readonly System.Text.RegularExpressions.Regex WebRconPassword = new System.Text.RegularExpressions.Regex(
+            @"(?<prefix>\bwss?://[^/\s]+/)(?!\[REDACTED\])\S+", Options, Timeout);
+
+        private static readonly System.Text.RegularExpressions.Regex OpaqueRun = new System.Text.RegularExpressions.Regex(
+            @"(?<![\w\-])[A-Za-z0-9_\-]{40,}(?![\w\-])", Options, Timeout);
+
+        public static string Clean(string text)
+        {
+            if (string.IsNullOrEmpty(text)) { return ""; }
+
+            try
+            {
+                var result = text.Length > InputLimit ? text.Substring(0, InputLimit) : text;
+                result = PemPrivateKey.Replace(result, Mask);
+                result = CookieLine.Replace(result, delegate (System.Text.RegularExpressions.Match m) { return m.Groups["name"].Value + m.Groups["sep"].Value + Mask; });
+                result = NameValue.Replace(result, delegate (System.Text.RegularExpressions.Match m)
+                {
+                    var value = m.Groups["value"].Value;
+                    return m.Groups["name"].Value + m.Groups["sep"].Value + (value.StartsWith("\"") ? "\"" + Mask + "\"" : Mask);
+                });
+                result = BearerScheme.Replace(result, delegate (System.Text.RegularExpressions.Match m) { return m.Groups["scheme"].Value + Mask; });
+                result = Jwt.Replace(result, Mask);
+                result = UrlUserInfo.Replace(result, delegate (System.Text.RegularExpressions.Match m) { return m.Groups["scheme"].Value + Mask; });
+                result = TokenInPath.Replace(result, delegate (System.Text.RegularExpressions.Match m) { return m.Groups["prefix"].Value + Mask; });
+                result = UpdateCommandToken.Replace(result, delegate (System.Text.RegularExpressions.Match m) { return m.Groups["prefix"].Value + Mask; });
+                result = MapUploadToken.Replace(result, delegate (System.Text.RegularExpressions.Match m) { return m.Groups["prefix"].Value + Mask; });
+                result = WebRconPassword.Replace(result, delegate (System.Text.RegularExpressions.Match m) { return m.Groups["prefix"].Value + Mask; });
+                result = OpaqueRun.Replace(result, delegate (System.Text.RegularExpressions.Match m) { return LooksLikeToken(m.Value) ? Mask : m.Value; });
+                return result;
+            }
+            catch (System.Text.RegularExpressions.RegexMatchTimeoutException)
+            {
+                // A fully masked line is safe; an unmasked one is not.
+                return Failed;
+            }
+        }
+
+        // The name may be what marks a value as secret (a property called Password), so redact them together and keep only the value part.
+        public static string CleanProperty(string key, string value)
+        {
+            var redacted = Clean(key + "=" + value);
+            return redacted.StartsWith(key + "=", StringComparison.Ordinal) ? redacted.Substring(key.Length + 1) : redacted;
+        }
+
+        private static bool LooksLikeToken(string run)
+        {
+            var hasLetter = false;
+            var hasDigit = false;
+            var allHex = true;
+            foreach (var c in run)
+            {
+                hasLetter |= char.IsLetter(c);
+                hasDigit |= char.IsDigit(c);
+                allHex &= Uri.IsHexDigit(c);
+            }
+            return hasLetter && hasDigit && !allHex;
         }
     }
 
